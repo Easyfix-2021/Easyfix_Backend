@@ -41,6 +41,19 @@ const MOBILE_FIELDS = new Set([
   // The raw column `efr_no` would already match above, but the alias
   // bypasses it — list both so neither path leaks.
   'easyfixer_mobile',
+  /*
+   * The assigned technician's mobile on GET /admin/jobs/:id/header (2026-09-16),
+   * aliased off the same ef.efr_no as easyfixer_mobile above. A technician
+   * number — never customer-owned — so it is NOT in CUSTOMER_MOBILE_FIELDS and
+   * stays masked even with the customer-visibility flag on, exactly as the
+   * offers list's `mobile` does.
+   *
+   * Side effect, and a welcome one: /admin/clients/:id/tech-mapping has shipped
+   * `efr_mobile` RAW since it was written, because nothing listed the name. The
+   * CRM declares it in TechMappingTab's type but never renders it, so masking it
+   * there changes no screen and closes a technician-number leak.
+   */
+  'efr_mobile',
   'tech_mobile',
   'tech_no',
   'alternate_no',

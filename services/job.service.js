@@ -1396,6 +1396,258 @@ async function resolveClientPrimarySpoc(clientId, conn) {
   return head?.user_id ?? null;
 }
 
+/*
+ * ─── THE TWO MANAGER NAMES A JOB CARRIES ──────────────────────────────────
+ *
+ * Neither is a column on tbl_job. A job INHERITS both — the Project Manager
+ * from its CLIENT, the Zonal Manager from the CITY of its address — which is
+ * why they are resolved rather than projected, and why either can be null for a
+ * perfectly ordinary job.
+ *
+ * ⚠ BOTH READ THE SOURCE THEIR LIST FILTER COMPARES AGAINST, and that is the
+ * whole point of putting them here rather than in the caller. A panel showing
+ * "Project Manager: X" beside a grid whose `projectManagerId=X` filter would not
+ * return that job is worse than showing nothing, because it looks authoritative.
+ * The two filters live in list() a few hundred lines below; keep this function
+ * beside them, and change both together or neither.
+ *
+ * PROJECT MANAGER — tbl_vertical_mapping (client_id = the job's client,
+ * user_type = 1), joined to tbl_user. Exactly the rows the `projectManagerId`
+ * filter's EXISTS matches, and exactly the set the CRM's own picker offers
+ * (/api/shared/lookup/project-managers?userType=1, which PendingToStartView
+ * calls with that literal). ⚠ user_type here is tbl_vertical_mapping's, NOT
+ * tbl_user.user_type_id — see lookup.service.js's note; and note that
+ * client-verticals.service.js calls user_type 1 "Head" and 2 "Project Manager".
+ * The CRM's Project Manager FILTER is 1, so 1 is what this must answer with, or
+ * the name and the filter describe different people.
+ *
+ * WHICH ONE, when a client has several. The mapping is per (client, vertical)
+ * and a job has no vertical of its own, so there is no per-job way to choose —
+ * the same problem, with the same answer, as the job-owner snapshot. So the pick
+ * IS resolveClientPrimarySpoc above: active-only, latest-wins, explicitly
+ * ordered, and NULL rather than the next-latest when the chosen mapping points
+ * at a user that no longer exists. Reusing it costs one small indexed query and
+ * buys the property that the PM this panel names is the same person the job's
+ * owner columns were stamped from. Re-ordering these rows a second time here is
+ * exactly the two-copies-that-disagree bug that docblock records.
+ *
+ * ZONAL MANAGER — tbl_city.state_user, the city's owner, joined to tbl_user.
+ * The `zonalManagerId` filter is `ci.state_user IN (…)` on the job's address
+ * city (see its note in list()), and lookup.zonalManagers() walks the identical
+ * chain job → address → city.state_user → tbl_user.
+ *
+ * NULL IS A REAL ANSWER for both — no client mapping, no address/city, a NULL
+ * state_user, or a mapping/owner pointing at a deleted tbl_user row.
+ *
+ * BOTH ARMS REACH tbl_user THROUGH A *LEFT* JOIN, which is how every other
+ * reader of these two columns in this repo does it (job-export.service.js's
+ * `stateUser`, pincode.service.js's `zm`, lookup.service.js). The zonal arm used
+ * an inner JOIN; as a one-column scalar subquery that produced the same NULL
+ * either way, so this is a consistency fix rather than a behaviour change — but
+ * an inner join is one added column away from dropping the row instead of the
+ * name, and that failure would be silent. The project arm reaches tbl_user
+ * inside resolveClientPrimarySpoc, which already LEFT JOINs for the same reason.
+ *
+ * ⚠ AND WHEN THE ZONAL NAME COMES BACK NULL, THE USUAL CAUSE IS NOT A BUG HERE.
+ * It is tbl_city.state_user simply not being set on that city — the same gap
+ * pincode.service.js documents when it sorts its Zonal Manager column
+ * (NULLs last, because plenty of rows have none). That is client data for the
+ * business to fill in, not something this code should paper over: inventing a
+ * fallback owner would put a name against a city nobody actually owns.
+ */
+async function getJobManagerNames({ clientId, cityId } = {}, conn) {
+  const db = conn || pool;
+  const pmUserId = await resolveClientPrimarySpoc(clientId, conn);
+  // 0 for an absent id: it matches no row, so both arms answer NULL without
+  // needing a branch per arm (user_id / city_id are positive PKs).
+  const [[row]] = await db.query(
+    `SELECT
+       (SELECT pmu.user_name FROM tbl_user pmu WHERE pmu.user_id = ?) AS project_manager_name,
+       (SELECT zmu.user_name
+          FROM tbl_city zci
+          LEFT JOIN tbl_user zmu ON zmu.user_id = zci.state_user
+         WHERE zci.city_id = ? LIMIT 1) AS zonal_manager_name`,
+    [pmUserId ?? 0, cityId ?? 0],
+  );
+  return {
+    projectManagerName: row?.project_manager_name ?? null,
+    zonalManagerName:   row?.zonal_manager_name   ?? null,
+  };
+}
+
+/*
+ * ─── THE CONSOLE HEADER'S CLIENT-SIDE EXTRAS ──────────────────────────────
+ *
+ * Names the console's Client card and Job age tile need that are not columns
+ * on the row the header is built from, in ONE round trip of scalar subqueries:
+ *
+ * EASYFIX SPOC — tbl_job.job_client_owner → tbl_user.user_name. The same user
+ * the jobs list's "Easyfix SPOC" column prints (listColumns' `uo` join).
+ *
+ * VERTICAL — tbl_client.vertical_id → tbl_vertical.vertical_name.
+ *
+ * PRIMARY / SECONDARY SPOC — the client's tbl_vertical_mapping rows with
+ * user_type 1 / 2, filtered and ordered exactly as resolveClientPrimarySpoc
+ * picks the primary (active mapping, newest first, the USER's id so a deleted
+ * user yields NULL). The same lookup therefore names the same Primary SPOC
+ * that job_primary_spoc / job_client_owner were stamped from.
+ *
+ * ESCALATION — the latest tbl_easyfixer_rating_by_customer row for the job,
+ * picked exactly as escalationJoin() picks it (MAX(table_id)). `is_escalated =
+ * 1` in SQL, never the raw column: a bit(1) Buffer reads truthy for 0.
+ *
+ * THE ASSIGNED TECHNICIAN'S TRACK RECORD (2026-09-17) — for the console's
+ * Technician card, all null when the job has no technician:
+ *   completed 7d  jobs Completed (status 3 / 5) with a check-out in the last
+ *                 7 days (rolling, not the calendar week — ops' call)
+ *   open jobs     jobs in status 1 (pending start), 2 or 20 (in progress)
+ *   rating        AVG(customer_rating) over ratings WITH a comment, ROUND(…, 2)
+ *                 — the same definition AND rounding Manage Easyfixers' Avg
+ *                 Rating column uses (the CRM shows both with toFixed(1)), so a
+ *                 4.245 average reads 4.3 on both screens, not 4.2 on one
+ *
+ * NULL-tolerant like its siblings: a job with no owner, vertical, mapping or
+ * rating row answers nulls, never a dropped header.
+ */
+async function getJobConsoleExtras({ jobId, clientOwnerId, clientId, verticalId, efrId } = {}, conn) {
+  const db = conn || pool;
+  const orderBy = (await hasVerticalMappingInsertedOnColumn())
+    ? 'vm.inserted_on DESC, vm.id DESC'
+    : 'vm.id DESC';
+  const spocSql = (userType) => `(SELECT u.user_name
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id
+        WHERE vm.client_id = ? AND vm.user_type = ${userType}
+          AND (vm.status IS NULL OR vm.status = 1)
+        ORDER BY ${orderBy}
+        LIMIT 1)`;
+  const [[row]] = await db.query(
+    `SELECT
+       (SELECT spu.user_name FROM tbl_user spu WHERE spu.user_id = ?) AS easyfix_spoc_name,
+       (SELECT vt.vertical_name FROM tbl_vertical vt WHERE vt.vertical_id = ?) AS vertical_name,
+       ${spocSql(1)} AS primary_spoc_name,
+       ${spocSql(2)} AS secondary_spoc_name,
+       (SELECT COUNT(*) FROM tbl_job tj
+         WHERE tj.fk_easyfixter_id = ? AND tj.job_status IN (3, 5)
+           AND tj.checkout_date_time >= ?) AS efr_completed_7d,
+       (SELECT COUNT(*) FROM tbl_job oj
+         WHERE oj.fk_easyfixter_id = ? AND oj.job_status IN (1, 2, 20)) AS efr_open_jobs,
+       (SELECT ROUND(AVG(rr.customer_rating), 2) FROM tbl_easyfixer_rating_by_customer rr
+         WHERE rr.easyfixer_id = ? AND rr.comment IS NOT NULL) AS efr_avg_rating,
+       esc.is_escalated = 1 AS is_escalated,
+       esc.no_of_escalations, esc.escalated_time, esc.escalated_comments,
+       escu.user_name AS escalated_by_name
+     FROM (SELECT 1) one
+     LEFT JOIN tbl_easyfixer_rating_by_customer esc ON esc.table_id = (
+       SELECT MAX(e2.table_id) FROM tbl_easyfixer_rating_by_customer e2 WHERE e2.job_id = ?)
+     LEFT JOIN tbl_user escu ON escu.user_id = esc.escalated_by`,
+    [clientOwnerId || 0, verticalId || 0, clientId || 0, clientId || 0,
+      // "Last 7 days" as a BOUND JS Date, not SQL NOW(): the pool serialises it
+      // as the IST wall clock checkout_date_time is written in (see
+      // eslint.config.mjs "SQL clock functions").
+      efrId || 0, new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), efrId || 0, efrId || 0, jobId || 0],
+  );
+  const hasEfr = !!efrId;
+  return {
+    easyfixSpocName:   row?.easyfix_spoc_name ?? null,
+    verticalName:      row?.vertical_name ?? null,
+    primarySpocName:   row?.primary_spoc_name ?? null,
+    secondarySpocName: row?.secondary_spoc_name ?? null,
+    isEscalated:       Number(row?.is_escalated ?? 0) === 1 ? 1 : 0,
+    noOfEscalations:   row?.no_of_escalations != null ? Number(row.no_of_escalations) : null,
+    escalatedTime:     row?.escalated_time ?? null,
+    escalatedByName:   row?.escalated_by_name ?? null,
+    escalatedComments: row?.escalated_comments ?? null,
+    efrCompleted7d:    hasEfr && row?.efr_completed_7d != null ? Number(row.efr_completed_7d) : null,
+    efrOpenJobs:       hasEfr && row?.efr_open_jobs != null ? Number(row.efr_open_jobs) : null,
+    efrAvgRating:      hasEfr && row?.efr_avg_rating != null ? Number(row.efr_avg_rating) : null,
+  };
+}
+
+/*
+ * ─── THE JOB TIMELINE'S ACTORS ────────────────────────────────────────────
+ *
+ * Three names/instants a job-timeline view needs and cannot read off tbl_job:
+ * two of them are user ids that have to be resolved, and the third is not on
+ * tbl_job at all. The DATES beside them (ticket_created_date_time,
+ * original_scheduling_date_time, checkin_date_time) are plain columns and are
+ * projected straight from the row by the caller — only the parts that need a
+ * lookup are here.
+ *
+ * FIRST SCHEDULED BY — tbl_job.first_scheduled_by → tbl_user.user_name. Written
+ * COALESCE-style on the first assign (SCHEMA.md's assign flow), so it is the
+ * person who first put a technician on this job, and it does NOT move on a
+ * later reassignment. The Jobs export resolves it the same way
+ * (job-export.service.js's `TBU` join, aliased firstScheduleBY).
+ *
+ * CHECKED IN BY — tbl_job.fk_checkin_by → tbl_user.user_name. ⚠ That column is
+ * a tbl_user.user_id, NOT an efr_id, despite the technician being the one who
+ * checks in: MEASURED on the live schema (tests/admin-ops-checkin.test.js) at
+ * 348,619 populated rows, 223,012 of them equal to tbl_easyfixer.user_id and 29
+ * to an efr_id. The legacy CRM's own reader joins it to tbl_user and prints a
+ * user_name (JobDaoImpl:1712), which is the shape reproduced here. Those 29
+ * legacy rows will resolve to whoever holds that user_id, or to nobody — a
+ * known, bounded wart of the column, not of this join.
+ *
+ * ACCEPTED — NOT ON tbl_job. Acceptance lives on the offer: the tbl_job_offer
+ * row at offer_status = ACCEPTED carries `responded_at` (when the technician
+ * took it) and names the technician through fk_easyfixter_id. listOffers()
+ * deliberately EXCLUDES accepted rows — by the time one exists the job has left
+ * the Schedule & Assign modal — so this reads that row separately rather than
+ * widening the modal's own query, which would put an accepted offeree into a
+ * list whose whole purpose is showing who has NOT taken the job.
+ *
+ * Every arm is a LEFT/NULL-tolerant lookup: a dangling user id or efr id yields
+ * a NULL NAME, never a dropped row. And on a job with no accepted offer — which
+ * is every job the console opens, since accepting sets fk_easyfixter_id and
+ * evicts the job from the unassigned bucket — both accepted fields are simply
+ * null. That is the normal answer, not a failure.
+ *
+ * ONE ROUND TRIP: scalar subqueries rather than joins onto tbl_job, so the
+ * caller does not have to own a `j` alias and this composes anywhere. The two
+ * offer arms read the same row twice; both seek idx_job_offer_job_status
+ * (job_id, offer_status), which is the index that exists for exactly this shape.
+ */
+async function getJobTimelineActors({ jobId, firstScheduledBy, checkinBy } = {}, conn) {
+  const db = conn || pool;
+  /*
+   * Same memoised probe that turns the offer projection into NULL aliases and
+   * the offerState filter into a no-op. On a deploy without tbl_job_offer the
+   * two accepted fields are NULL rather than an unknown-table 500 — the header
+   * must render on an un-migrated environment like everything else does.
+   */
+  const hasOffers = await jobOfferTableExists();
+  // ORDER BY, never a bare LIMIT 1: a job should hold at most one accepted
+  // offer, but an unordered pick from a set that turned out not to be unique
+  // returns a different answer on different days, which reads as a data bug.
+  const acceptedCols = hasOffers
+    ? `,
+       (SELECT ao.responded_at FROM tbl_job_offer ao
+         WHERE ao.job_id = ? AND ao.offer_status = ${OFFER_STATUS.ACCEPTED}
+         ORDER BY ao.job_offer_id DESC LIMIT 1) AS accepted_date_time,
+       (SELECT aef.efr_name FROM tbl_job_offer ao2
+          LEFT JOIN tbl_easyfixer aef ON aef.efr_id = ao2.fk_easyfixter_id
+         WHERE ao2.job_id = ? AND ao2.offer_status = ${OFFER_STATUS.ACCEPTED}
+         ORDER BY ao2.job_offer_id DESC LIMIT 1) AS accepted_efr_name`
+    : `, NULL AS accepted_date_time, NULL AS accepted_efr_name`;
+  // 0 for an absent id — matches no row, so each arm answers NULL on its own
+  // without a branch per arm (user_id is a positive PK).
+  const params = [firstScheduledBy || 0, checkinBy || 0];
+  if (hasOffers) params.push(jobId || 0, jobId || 0);
+  const [[row]] = await db.query(
+    `SELECT
+       (SELECT fsu.user_name FROM tbl_user fsu WHERE fsu.user_id = ?) AS first_scheduled_by_name,
+       (SELECT cbu.user_name FROM tbl_user cbu WHERE cbu.user_id = ?) AS checkin_by_name${acceptedCols}`,
+    params,
+  );
+  return {
+    firstScheduledByName: row?.first_scheduled_by_name ?? null,
+    checkinByName:        row?.checkin_by_name         ?? null,
+    acceptedDateTime:     row?.accepted_date_time      ?? null,
+    acceptedEfrName:      row?.accepted_efr_name       ?? null,
+  };
+}
+
 async function stampJobPrimarySpoc(jobId, clientId, conn) {
   if (!jobId || !(await hasJobPrimarySpocColumn())) return;
   const db = conn || pool;
@@ -2052,6 +2304,34 @@ function offerStateSql(state, { bind = true, alias = 'jos', expiry = true } = {}
 }
 
 /*
+ * THE BUCKET LADDER — `offer_state` as a single expression.
+ *
+ * Extracted from offerColumns (where it was written inline) the moment a SECOND
+ * surface needed it: the Pending-for-Scheduling TAB COUNTS group rows by this
+ * expression, so a tab's number and the chip on the row it lists are produced by
+ * the same CASE, not by two ladders that happen to agree today.
+ *
+ * Exclusive top-down, which is what makes it identical to the three filter
+ * fragments offerStateSql emits (see the canonical docblock above):
+ *   live                      → 'offered'
+ *   ¬live ∧ accepted          → 'none'      (documented anomaly; no filter matches it)
+ *   ¬live ∧ ¬accepted ∧ dead  → 'expired'
+ *   otherwise                 → 'pending'
+ *
+ * Constants are INLINED (bind: false) — this is a projection / GROUP BY key, and
+ * both call sites append it to a query whose params are positional and already
+ * built, so it must contribute none. The three aliases are the caller's to
+ * choose so two uses in one statement cannot collide; `j` must be in scope.
+ */
+function offerStateCaseSql(expiryEnabled, [a1, a2, a3]) {
+  const e = { bind: false, expiry: expiryEnabled, now: new Date() };
+  return `CASE WHEN ${offerRowExists('live', a1, e).sql} THEN 'offered'`
+       + `     WHEN ${offerRowExists('accepted', a2, e).sql} THEN 'none'`
+       + `     WHEN ${offerRowExists('dead', a3, e).sql} THEN 'expired'`
+       + `     ELSE 'pending' END`;
+}
+
+/*
  * `expiryEnabled` is passed in by list() so ONE property read serves both the
  * projection and the filter in a request (they must describe the same regime or
  * the chip and the filter disagree again). Defaulted for standalone callers.
@@ -2071,12 +2351,8 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    * implementation is what let the chip and the filter disagree (a rejected-only
    * job listed under the Expired filter but rendered a different chip).
    *
-   * The CASE ladder is exclusive top-down, which makes it identical to the three
-   * filter fragments:
-   *   live                      → 'offered'
-   *   ¬live ∧ accepted          → 'none'      (documented anomaly; no filter matches it)
-   *   ¬live ∧ ¬accepted ∧ dead  → 'expired'
-   *   otherwise                 → 'pending'
+   * The ladder itself is offerStateCaseSql above — shared with the
+   * Pending-for-Scheduling tab counts, which GROUP BY it.
    *
    * The counts stay for the FE tooltips only — offered_count feeds "Offered to N
    * technicians", expired/total feed the Expired tooltip. They now use the SAME
@@ -2091,8 +2367,6 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
    */
   const e        = { bind: false, expiry: expiryEnabled, now: new Date() };
   const live     = (a) => offerRowExists('live', a, e).sql;
-  const accepted = (a) => offerRowExists('accepted', a, e).sql;
-  const dead     = (a) => offerRowExists('dead', a, e).sql;
   const where    = (kind, a) => offerRowWhere(kind, a, false, expiryEnabled, e.now).sql;
   return `, (${live('jo')}) AS is_offered`
        + `, (SELECT ef2.efr_name FROM tbl_job_offer jo2 JOIN tbl_easyfixer ef2 ON ef2.efr_id = jo2.fk_easyfixter_id`
@@ -2101,10 +2375,7 @@ function offerColumns(tableExists, expiryEnabled = offerExpiryEnabled()) {
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo3 WHERE ${where('live', 'jo3')}) AS offered_count`
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo4 WHERE ${where('any', 'jo4')}) AS total_offer_count`
        + `, (SELECT COUNT(*) FROM tbl_job_offer jo5 WHERE ${where('dead', 'jo5')}) AS expired_offer_count`
-       + `, (CASE WHEN ${live('jo6')} THEN 'offered'`
-       + `        WHEN ${accepted('jo7')} THEN 'none'`
-       + `        WHEN ${dead('jo8')} THEN 'expired'`
-       + `        ELSE 'pending' END) AS offer_state`;
+       + `, (${offerStateCaseSql(expiryEnabled, ['jo6', 'jo7', 'jo8'])}) AS offer_state`;
 }
 
 /*
@@ -2166,14 +2437,128 @@ const OFFER_STATE_VALUES = Object.freeze(['pending', 'offered', 'expired']);
  */
 const APP_REQUEST_VALUES = Object.freeze(['any', 'cancel', 'reschedule']);
 
+/*
+ * The two app-request FLAG tests, spelt once. appRequestClause and the
+ * Pending-to-Start buckets (ptsStateSql below) both read them, so "is a cancel
+ * pending" cannot mean one thing to the Technician Requests filter and another
+ * to the Cancellation tab. The alias is a code constant ('j' for list(), 'J'
+ * for the XLSX export's where()), never input.
+ */
+function appRequestFlagSql(alias = 'j') {
+  return {
+    cancel: `COALESCE(${alias}.is_cancelled_by_app, 0) = 1`,
+    resched: `COALESCE(${alias}.is_rescheduled_by_app, 0) = 1`,
+  };
+}
+
 function appRequestClause(appRequest) {
   if (!APP_REQUEST_VALUES.includes(appRequest)) return null;
-  const cancel = 'COALESCE(j.is_cancelled_by_app, 0) = 1';
-  const resched = 'COALESCE(j.is_rescheduled_by_app, 0) = 1';
+  const { cancel, resched } = appRequestFlagSql('j');
   const flag = appRequest === 'cancel' ? cancel
     : appRequest === 'reschedule' ? resched
       : `(${cancel} OR ${resched})`;
   return { sql: `(j.job_status = ? AND ${flag})`, params: [STATUS.SCHEDULED] };
+}
+
+/*
+ * ═══════════ PENDING TO START — six exclusive tabs (2026-09-16) ═══════════
+ *
+ * The CRM's Pending-to-Start page replaces its four overlapping sections with
+ * tabs that PARTITION status-1 jobs: every accepted job sits in exactly one.
+ * `all` is the page; the five below are its buckets, decided in this priority
+ * order when a job could qualify for several:
+ *
+ *   cancel      the technician's pending ask is to CANCEL
+ *   reschedule  the pending ask is to RESCHEDULE, and there is no cancel ask
+ *   missed      no pending ask, appointment before today 00:00:00 IST
+ *               — OR no appointment at all (see below)
+ *   today       no pending ask, appointment within today, IST
+ *   future      no pending ask, appointment from tomorrow 00:00:00 IST
+ *
+ * WHY AN ASK OUTRANKS THE DATE. A technician asking to cancel a job that is
+ * also overdue is a cancellation first: acting on the date (chasing the visit)
+ * would be acting against what the person doing the job has just said. And
+ * cancel outranks reschedule for the reason appRequestOf gives in the CRM — it
+ * is the ask that stops work, and it supersedes whatever appointment a
+ * reschedule was arguing about.
+ *
+ * ⚠ `cancel` IS appRequest=cancel VERBATIM — same flag, same status pin, same
+ * params, asserted in a test. `reschedule` is NOT appRequest=reschedule: that
+ * filter (the Technician Requests section) matches the reschedule flag alone,
+ * so a job carrying BOTH flags appears in it while the CRM renders it as a
+ * cancellation. Tabs must be exclusive, so this one excludes the cancel flag.
+ * appRequest itself is deliberately left as it is — changing it would silently
+ * move rows on a live screen.
+ *
+ * NULL requested_date_time GOES TO `missed`. A pending-to-start job with no
+ * appointment has no date to wait for, so nothing about it will resolve itself:
+ * it needs an operator, which is what `missed` is for. Parking it in `future`
+ * (where a NULL would otherwise go by elimination) would hide it behind jobs
+ * that are merely early. None exist on QA today (0 of 432) — this is the rule
+ * for when one does.
+ *
+ * THE STATUS PIN IS INSIDE EVERY FRAGMENT, as appRequestClause's is. So
+ * ptsState never needs the caller's status=1 to be right, and a caller that
+ * pins a DIFFERENT status gets an empty set — the honest answer, and the same
+ * behaviour appRequest has always had — rather than a 400.
+ *
+ * IST DAY BOUNDS are computed server-side from utils/ist-calendar (todayIst +
+ * shiftYmd), the repo's one IST calendar, once per request and bound as
+ * parameters. requested_date_time is a DATETIME holding IST wall-clock, and
+ * DATETIME comparisons ignore the session timezone, so an IST-literal bound is
+ * exact. "≤ today 23:59:59" is written `< tomorrow 00:00:00`: identical for a
+ * second-precision column, and it cannot miss a fractional second if one ever
+ * appears.
+ */
+const PTS_STATE_VALUES = Object.freeze(['cancel', 'reschedule', 'missed', 'today', 'future']);
+
+/* Today's and tomorrow's 00:00:00 in IST, as DATETIME literals. */
+function istDayBounds(now = new Date()) {
+  const { todayIst, shiftYmd } = require('../utils/ist-calendar');
+  const today = todayIst(now);
+  return { todayStart: `${today} 00:00:00`, tomorrowStart: `${shiftYmd(today, 1)} 00:00:00` };
+}
+
+/*
+ * One bucket as a WHERE fragment. Returns { sql, params } or null for an unknown
+ * state. The five are mutually exclusive and, over status-1 jobs, exhaustive —
+ * which is what lets ptsStateCaseSql below be nothing but these five in order.
+ */
+function ptsStateSql(state, { todayStart, tomorrowStart }, alias = 'j') {
+  const { cancel, resched } = appRequestFlagSql(alias);
+  const pinned = `${alias}.job_status = ?`;
+  const appt = `${alias}.requested_date_time`;
+  const noAsk = `NOT (${cancel} OR ${resched})`;
+  const S = STATUS.SCHEDULED;
+  switch (state) {
+    case 'cancel':
+      return { sql: `(${pinned} AND ${cancel})`, params: [S] };
+    case 'reschedule':
+      return { sql: `(${pinned} AND ${resched} AND NOT (${cancel}))`, params: [S] };
+    case 'missed':
+      return { sql: `(${pinned} AND ${noAsk} AND (${appt} IS NULL OR ${appt} < ?))`, params: [S, todayStart] };
+    case 'today':
+      return { sql: `(${pinned} AND ${noAsk} AND ${appt} >= ? AND ${appt} < ?)`, params: [S, todayStart, tomorrowStart] };
+    case 'future':
+      return { sql: `(${pinned} AND ${noAsk} AND ${appt} >= ?)`, params: [S, tomorrowStart] };
+    default:
+      return null;
+  }
+}
+
+/*
+ * The bucket as a GROUP BY key: a CASE whose WHEN arms ARE the five filter
+ * fragments, verbatim, in priority order. Because the fragments partition
+ * status-1 jobs, the first matching arm is the only matching arm — so a job's
+ * count bucket and the tab that lists it are the same SQL, not two definitions
+ * kept in step. Params come out in placeholder order.
+ */
+function ptsStateCaseSql(bounds, alias = 'j') {
+  const arms = PTS_STATE_VALUES.map((s) => ({ state: s, frag: ptsStateSql(s, bounds, alias) }));
+  return {
+    sql: `CASE ${arms.map((a) => `WHEN ${a.frag.sql} THEN '${a.state}'`).join(' ')} END`,
+    params: arms.flatMap((a) => a.frag.params),
+  };
 }
 
 function offerStateClause(offerState, expiryEnabled = offerExpiryEnabled()) {
@@ -2363,6 +2748,13 @@ async function list({
    * job_status itself.
    */
   appRequest,
+  /*
+   * `ptsState` (2026-09-16) — cancel | reschedule | missed | today | future.
+   * One of the Pending-to-Start page's exclusive tabs. Pins job_status = 1
+   * itself (as appRequest does), so a caller pinning another status gets an
+   * empty set. '' / unknown = no filter. See ptsStateSql above.
+   */
+  ptsState,
   startDate, endDate,
   scope,
   allowedStages,             // Job Stage Access — { mode:'all'|'list', stages }
@@ -2383,6 +2775,37 @@ async function list({
    * that has to be kept in step by hand, and it was not.
    */
   countOnly = false,
+  /*
+   * `groupByOfferState` (2026-09-16) — countOnly's sibling for the
+   * Pending-for-Scheduling TAB STRIP. Returns { rows: [], total, counts } and
+   * skips the data query; `counts` is one number per offer sub-state, produced
+   * by ONE GROUP BY over this function's own WHERE.
+   *
+   * Same reasoning as countOnly, one step further. Four tabs over one bucket
+   * could have been four countOnly calls, or (worse) a second copy of the
+   * bucket's predicates in a hand-written COUNT — the shape that already
+   * desynchronised the client portal's Order History badge. Instead the rows are
+   * bucketed by offerStateCaseSql, the SAME ladder the list projects as each
+   * row's `offer_state` chip and the same algebra offerStateClause filters on,
+   * so a tab's number, the rows that tab lists and the chips on them cannot
+   * describe different populations.
+   *
+   * ⚠ Do NOT combine with `offerState`: that filter would narrow the population
+   * BEFORE the grouping, so three of the four numbers would come back 0. The
+   * counts caller (getPendingSchedulingCounts) forwards an explicit parameter
+   * list that has no offerState in it, which is what makes that structural
+   * rather than a rule to remember.
+   */
+  groupByOfferState = false,
+  /*
+   * `groupByPtsState` (2026-09-16) — the Pending-to-Start tab strip's counts,
+   * the same idea as groupByOfferState: ONE GROUP BY over this function's own
+   * WHERE, keyed on ptsStateCaseSql, whose arms ARE the ptsState filter
+   * fragments. Returns { rows: [], total, counts }. Do NOT combine with
+   * `ptsState` — getPendingStartCounts' explicit parameter list makes that
+   * structural.
+   */
+  groupByPtsState = false,
   limit = 50, offset = 0,
 } = {}) {
   logger.info('List jobs · status=' + (status ?? statuses ?? 'any') + ' · clientId=' + (clientId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-') + ' · limit=' + limit + ' · offset=' + offset);
@@ -2558,6 +2981,20 @@ async function list({
   if (appRequest) {
     const ac = appRequestClause(appRequest);
     if (ac) { clauses.push(ac.sql); params.push(...ac.params); }
+  }
+  /*
+   * The IST day bounds, computed ONCE for this request and shared by the
+   * ptsState filter and the groupByPtsState counts below, so a request that
+   * straddles midnight cannot filter against one day and count against another.
+   */
+  const ptsBounds = (ptsState || groupByPtsState) ? istDayBounds() : null;
+  /*
+   * `ptsState` — one Pending-to-Start tab. The same AND-ed, narrowing shape as
+   * appRequest above; every column is on `j`, so no join and no COUNT drift.
+   */
+  if (ptsState) {
+    const pc = ptsStateSql(ptsState, ptsBounds);
+    if (pc) { clauses.push(pc.sql); params.push(...pc.params); }
   }
   /*
    * Booked-No-Services filter (2026-05-28). Forces both job_status = 0
@@ -3128,6 +3565,90 @@ async function list({
     return { rows: [], total };
   }
 
+  /*
+   * The offer-sub-state TAB COUNTS — one GROUP BY over the WHERE built above,
+   * so they cannot disagree with the list they sit on top of. See the parameter
+   * note for why this is not four calls.
+   *
+   * `all` is the SUM OF THE THREE, not COUNT(*), and the difference is the
+   * 'none' carve-out: a job holding an ACCEPTED offer but no technician. The
+   * accept path sets fk_easyfixter_id in the same write, which evicts the job
+   * from this bucket, so 'none' should be unreachable here — but if data ever
+   * produces one, no offerState filter matches it either (see offerStateSql), so
+   * counting it in a tab would advertise a row that tab cannot show. It is
+   * logged instead of being folded into a state it is not in.
+   */
+  if (groupByOfferState) {
+    const counts = { all: 0, pending: 0, offered: 0, expired: 0 };
+    /*
+     * tbl_job_offer absent on this deploy — the same memoised probe that turns
+     * the offer PROJECTION into NULL aliases and the offerState FILTER into a
+     * no-op. Nothing has ever been offered, so the whole bucket is 'pending'
+     * and the un-migrated environment gets an honest strip instead of a 500 on
+     * an unknown table.
+     */
+    if (!hasJobOffer) {
+      const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${countJoin} ${where}`, params);
+      logger.info('Counted ' + total + ' jobs by offer state (tbl_job_offer absent — all pending)');
+      return { rows: [], total, counts: { ...counts, all: total, pending: total } };
+    }
+    // Aliases of this fragment's own, disjoint from the count joins (cu/ad/ci/
+    // cl/ef/ow) and from the filter's `jos*`, so nothing can shadow anything.
+    const bucket = offerStateCaseSql(offerExpiry, ['josc', 'josc2', 'josc3']);
+    const [groups] = await pool.query(
+      `SELECT ${bucket} AS offer_state, COUNT(*) AS c ${countJoin} ${where} GROUP BY offer_state`,
+      params
+    );
+    let total = 0;
+    for (const g of groups) {
+      const c = Number(g.c) || 0;
+      total += c;
+      if (OFFER_STATE_VALUES.includes(g.offer_state)) counts[g.offer_state] += c;
+    }
+    counts.all = counts.pending + counts.offered + counts.expired;
+    if (total !== counts.all) {
+      logger.warn('Offer-state counts exclude ' + (total - counts.all)
+        + ' job(s) holding an accepted offer with no technician — no tab can list them');
+    }
+    logger.info('Counted jobs by offer state · all=' + counts.all + ' pending=' + counts.pending
+      + ' offered=' + counts.offered + ' expired=' + counts.expired);
+    return { rows: [], total, counts };
+  }
+
+  /*
+   * The Pending-to-Start TAB COUNTS — one GROUP BY over the WHERE built above,
+   * keyed on ptsStateCaseSql, whose WHEN arms are the ptsState filter fragments
+   * verbatim. The CASE's params are placeholders in the SELECT, so they bind
+   * BEFORE the WHERE's; that order is the whole reason they are kept separate.
+   *
+   * `all` is the SUM OF THE FIVE. Over status-1 jobs the five partition the set,
+   * so it equals COUNT(*); a NULL group (a row the CASE could not place — which
+   * requires a status other than 1, and the counts caller pins 1) is logged
+   * rather than silently counted in a tab that could not list it.
+   */
+  if (groupByPtsState) {
+    const counts = { all: 0, cancel: 0, reschedule: 0, missed: 0, today: 0, future: 0 };
+    const bucket = ptsStateCaseSql(ptsBounds);
+    const [groups] = await pool.query(
+      `SELECT ${bucket.sql} AS pts_state, COUNT(*) AS c ${countJoin} ${where} GROUP BY pts_state`,
+      [...bucket.params, ...params]
+    );
+    let total = 0;
+    for (const g of groups) {
+      const c = Number(g.c) || 0;
+      total += c;
+      if (PTS_STATE_VALUES.includes(g.pts_state)) counts[g.pts_state] += c;
+    }
+    counts.all = PTS_STATE_VALUES.reduce((sum, s) => sum + counts[s], 0);
+    if (total !== counts.all) {
+      logger.warn('Pending-to-start counts left ' + (total - counts.all) + ' job(s) in no tab');
+    }
+    logger.info('Counted pending-to-start jobs · all=' + counts.all + ' cancel=' + counts.cancel
+      + ' reschedule=' + counts.reschedule + ' missed=' + counts.missed
+      + ' today=' + counts.today + ' future=' + counts.future);
+    return { rows: [], total, counts };
+  }
+
   // Run COUNT and data query in parallel — they're independent, no reason to
   // serialize. Roughly halves wall-clock time on cold caches.
   const dataParams = [...params, Number(limit), Number(offset)];
@@ -3185,6 +3706,91 @@ async function list({
     }
   }
   return { rows, total };
+}
+
+/*
+ * ─── My Orders → Pending for Scheduling: the TAB STRIP counts ─────────────
+ *
+ * Four tabs over ONE bucket — All / Not offered / Offered-waiting / No takers —
+ * which are exactly the four `offerState` values the list already accepts:
+ *   ''        all        the bucket, unfiltered
+ *   'pending' not offered        nobody has been asked yet
+ *   'offered' offered-waiting    ≥1 EFFECTIVELY OPEN offer (within the TTL)
+ *   'expired' no takers          offers exist, none open (expired or rejected)
+ * so a tab's count and the page that tab opens are the same question asked
+ * twice. They are answered by ONE definition: this delegates to list(), which
+ * builds the bucket pins, the RBAC scope, the stage access and every filter
+ * clause exactly once (see `groupByOfferState`).
+ *
+ * THE BUCKET IS PINNED HERE, NOT TAKEN FROM THE CALLER. status = 0 BOOKED +
+ * unassigned IS Pending-for-Scheduling (the list route receives it as
+ * status=0&assigned=false); an endpoint named for the bucket that let the
+ * caller choose a different one would be free to return counts for a page
+ * nobody is looking at.
+ *
+ * COST SHAPE (not measured on production data — stated so the next reader knows
+ * what to measure). The grouping evaluates three correlated EXISTS per row, the
+ * same three the LIST projection already evaluates for every row it returns —
+ * but over the whole bucket rather than one page of it. The bucket is
+ * job_status = 0 AND fk_easyfixter_id IS NULL, i.e. the work not yet scheduled,
+ * which is the small end of tbl_job (the status-0 tab measured in the hundreds
+ * when the list's own EXPLAIN work was done); the joins are only the ones the
+ * caller's filters actually reference, since this shares list()'s alias
+ * sniffing. Each EXISTS seeks idx_job_offer_job_status (job_id, offer_status) —
+ * the index added FOR this predicate shape in
+ * migrations/executed/2026-07-31-index-tbl-job-offer-job-status.sql, whose note
+ * on folding offered_at into it applies here for the same reason. If the bucket
+ * ever grows into the tens of thousands, this is the query to EXPLAIN.
+ *
+ * THE FILTERS ARE AN EXPLICIT LIST, NOT A SPREAD. Every one of them is the FE's
+ * own filter card on that page, forwarded verbatim so the strip narrows with
+ * the grid. Naming them is what makes `offerState` (which would collapse three
+ * of the four numbers to 0) and a stray `status` / `assigned` structurally
+ * unable to arrive — the route's schema strips them, and this signature would
+ * drop them even if it did not.
+ */
+async function getPendingSchedulingCounts({
+  q, categoryId, cityId, clientId, zonalManagerId, scope, allowedStages,
+} = {}) {
+  logger.info('Compute pending-for-scheduling offer-state counts · clientId=' + (clientId ?? '-')
+    + ' cityId=' + (cityId ?? '-') + ' categoryId=' + (categoryId ?? '-')
+    + ' zonalManagerId=' + (zonalManagerId ?? '-') + ' q=' + (q ? 'yes' : '-'));
+  const { counts } = await list({
+    q, categoryId, cityId, clientId, zonalManagerId, scope, allowedStages,
+    status: STATUS.BOOKED, assigned: false,
+    groupByOfferState: true,
+  });
+  return counts;
+}
+
+/*
+ * ─── My Orders → Pending to Start: the TAB STRIP counts (2026-09-16) ───────
+ *
+ * { all, cancel, reschedule, missed, today, future } — one count per exclusive
+ * tab, `all` the sum of the five. Delegates to list() exactly as
+ * getPendingSchedulingCounts does, so the bucket pin, RBAC scope, Job Stage
+ * Access and every filter clause are built once and shared with the grid.
+ *
+ * THE STATUS IS PINNED HERE (status = 1, "Pending to Start"), not taken from
+ * the caller; ptsState's own fragments pin it again, which is harmless.
+ *
+ * THE FILTERS ARE AN EXPLICIT LIST: the grid's filter card on that page, plus
+ * ownerId (the page's "My Orders" scoping — j.job_client_owner, as list()
+ * reads it). Naming them is what keeps ptsState — which would collapse four
+ * of five numbers to zero — and a stray status structurally unable to arrive.
+ */
+async function getPendingStartCounts({
+  q, categoryId, cityId, clientId, zonalManagerId, ownerId, scope, allowedStages,
+} = {}) {
+  logger.info('Compute pending-to-start tab counts · clientId=' + (clientId ?? '-')
+    + ' cityId=' + (cityId ?? '-') + ' categoryId=' + (categoryId ?? '-')
+    + ' zonalManagerId=' + (zonalManagerId ?? '-') + ' ownerId=' + (ownerId ?? '-') + ' q=' + (q ? 'yes' : '-'));
+  const { counts } = await list({
+    q, categoryId, cityId, clientId, zonalManagerId, ownerId, scope, allowedStages,
+    status: STATUS.SCHEDULED,
+    groupByPtsState: true,
+  });
+  return counts;
 }
 
 // ─── Detail ─────────────────────────────────────────────────────────
@@ -3329,6 +3935,55 @@ function bitTrue(v) {
 }
 
 /*
+ * THE LIST's APP-REQUEST FIELDS, rebuilt from a DETAIL row (2026-09-16).
+ *
+ * The CRM's appRequestOf() (src/lib/job-app-request.ts) reads seven snake_case
+ * fields off a /admin/jobs LIST row. A surface that loads ONE job (the Schedule
+ * & Assign console header) wants to call that same function on its object,
+ * unchanged — so it needs those seven fields under the SAME names and with the
+ * SAME values the LIST projection gives them. getByIdCore's row carries the
+ * raw columns, but not in list shape:
+ *
+ *   is_cancelled_by_app      raw bit(1) → a Buffer, and every Buffer is truthy.
+ *   is_rescheduled_by_app    The LIST projects `(COALESCE(flag, 0) = 1)`, i.e.
+ *                            the integer 0 or 1. So this does too — bitTrue, then
+ *                            1 / 0. Shipping the Buffer would serialise as
+ *                            {"type":"Buffer",…} and read as a pending ask on
+ *                            every job.
+ *   app_request_reason       not on the detail row at all. The LIST resolves it
+ *                            as COALESCE(cancel reason IF cancel flag, reschedule
+ *                            reason IF reschedule flag); the detail row has both
+ *                            reasons resolved separately (app_cancel_reason_name,
+ *                            app_reschedule_reason_name), so the COALESCE is
+ *                            reproduced here IN THE SAME ORDER — a cancel flag
+ *                            with no cancel reason falls through to the
+ *                            reschedule reason, exactly as the SQL does.
+ *   job_status, cancel_date_time, reschedule_at_app, reschedule_date_time_app
+ *                            plain columns, passed through as the LIST does.
+ *
+ * NOT status-gated, like the LIST projection it mirrors: the gate is
+ * appRequestOf's own `job_status === 1` test, and job_status ships here so it
+ * can apply it. A test pins these names against LIST_COLUMNS' aliases so the two
+ * cannot drift.
+ */
+function appRequestListFields(job) {
+  const row = job || {};
+  const cancel = bitTrue(row.is_cancelled_by_app);
+  const resched = bitTrue(row.is_rescheduled_by_app);
+  const numericStatus = Number(row.job_status);
+  return {
+    job_status: row.job_status == null || !Number.isFinite(numericStatus) ? (row.job_status ?? null) : numericStatus,
+    is_cancelled_by_app: cancel ? 1 : 0,
+    is_rescheduled_by_app: resched ? 1 : 0,
+    reschedule_date_time_app: row.reschedule_date_time_app ?? null,
+    cancel_date_time: row.cancel_date_time ?? null,
+    reschedule_at_app: row.reschedule_at_app ?? null,
+    app_request_reason: (cancel ? row.app_cancel_reason_name ?? null : null)
+      ?? (resched ? row.app_reschedule_reason_name ?? null : null),
+  };
+}
+
+/*
  * Which ask, if any, is in flight on this job row.
  *
  * The flags are bit(1) → Buffer, and every Buffer is truthy, so reading them
@@ -3383,7 +4038,15 @@ async function getById(jobId) {
       // row, not js.total_charge which is often 0, so the app showed every order as
       // "Free"/blank). Existing columns — incl. js.total_charge the CRM reads — are
       // unchanged, so the CRM Job Transaction view is unaffected.
-      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge,
+      // ADDITIVE (2026-09-16): js.total_cost — the LINE total (unit price ×
+      // quantity). js.total_charge is the price of ONE unit despite its name
+      // (utils/rate-card-calc.js writes Math.round(unitPrice) into it), so a
+      // qty-2 ₹1,000 line read ₹1,000 on Schedule & Assign while Edit Services
+      // showed ₹2,000. Measured on QA: of 8,437 active qty>1 rows, total_charge
+      // equals the unit price on 7,894 and unit × qty on 7; total_cost equals
+      // unit × qty on 7,898. So the line total was always stored — it just was
+      // not selected.
+      `SELECT js.job_service_id, js.service_id, js.quantity, js.total_charge, js.total_cost,
               js.job_service_status, js.service_category_id, js.service_type_id,
               st.service_type_name, sc.service_catg_name,
               CR.crc_ratecard_name AS service_name,
@@ -7079,6 +7742,28 @@ async function listOffers(jobId, { sweep = true } = {}) {
    * do not.
    */
   if (sweep) await expireStaleOffers(OFFER_TTL_MINUTES, jobId);
+  /*
+   * WHY an offer closed — beside the EXPIRED chip, which says only THAT it did.
+   *
+   * offer_status = 3 is written by EIGHT distinct code paths and only one of
+   * them is the 30-minute timeout; the rest fire when the job is assigned,
+   * rescheduled, released, withdrawn, re-offered, or when a sibling technician
+   * accepts. So the chip alone cannot answer the question this modal is opened
+   * to ask — "did this technician ignore the job?" — and on job 538177 it
+   * answered it wrongly. tbl_job_offer.closed_reason was added to record the
+   * difference, and until now nothing read it back.
+   *
+   * THE PROBE IS THE SHARED ONE, never a fourth copy: services/
+   * offer-closed-reason.js owns this column and memoises ONE answer for every
+   * reader and writer (its docblock explains why three copies would be three
+   * memos that can disagree). Column absent ⇒ a NULL alias, so the row shape is
+   * identical on a deploy predating
+   * migrations/2026-09-10-job-offer-closed-reason.sql.
+   */
+  const closedReason = require('./offer-closed-reason');
+  const closedReasonSelect = (await closedReason.hasOfferClosedReasonCol())
+    ? 'jo.closed_reason'
+    : 'NULL AS closed_reason';
   // Latest offer row PER technician — a re-offer can leave more than one row for
   // the same (job, tech), so MAX(job_offer_id) picks the current one. Surfaced
   // states: OFFERED (live), REJECTED, EXPIRED — the Schedule & Assign modal shows
@@ -7088,7 +7773,7 @@ async function listOffers(jobId, { sweep = true } = {}) {
   const [rows] = await pool.query(
     `SELECT jo.fk_easyfixter_id AS efr_id, ef.efr_name, jo.offered_at, jo.responded_at,
             jo.offer_status, jo.offer_status_label, jo.offer_count, jo.offer_source,
-            jo.reject_reason,
+            jo.reject_reason, ${closedReasonSelect},
             -- efr_no is the canonical technician mobile; the mask-mobile
             -- middleware redacts it in transit, and click-to-call re-resolves
             -- the real number server-side from efr_id, so the FE never holds it.
@@ -7108,6 +7793,22 @@ async function listOffers(jobId, { sweep = true } = {}) {
                jo.offered_at DESC`,
     [jobId],
   );
+  /*
+   * The human label beside the raw value, never instead of it. The FE renders
+   * the label under the chip; the raw token is what a report, a filter or a
+   * future bug hunt keys on, and it is the value the writer actually stored.
+   *
+   * NULLS ARE PRESERVED, and the distinction matters: on an EXPIRED row NULL
+   * means "closed before this column existed", not "unknown cause" — every
+   * current writer sets it. An unrecognised token (a value a newer deploy
+   * wrote and this one has no label for) also yields a null LABEL rather than
+   * echoing the raw token dressed up as prose.
+   */
+  for (const r of rows) {
+    r.closed_reason_label = r.closed_reason == null
+      ? null
+      : (closedReason.OFFER_CLOSED_REASON_LABEL[r.closed_reason] ?? null);
+  }
   logger.info('Found ' + rows.length + ' offers (live+rejected+expired) · jobId=' + jobId);
   return rows;
 }
@@ -7701,7 +8402,26 @@ module.exports = {
   // tbl_job.client_services CSV in sync after the customer's self-submit
   // mutates tbl_job_services. Single source of truth, one helper.
   recomputeClientServicesCsv,
-  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  // The tbl_job_services audit-column probe create() stamps with — exported so
+  // the one-list services editor stamps new rows the same way.
+  jobServicesCreatedByColumn,
+  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  /*
+   * The job's inherited Project Manager / Zonal Manager display names. Exported
+   * because they are DERIVED, not columns — every surface that shows either one
+   * must read it from the same place its list filter compares against, and that
+   * place is this function. See its docblock.
+   */
+  getJobManagerNames,
+  /*
+   * The job timeline's ACTORS — the two user ids that need resolving and the
+   * acceptance that is not on tbl_job at all. Exported for the same reason:
+   * "who first scheduled this", "who checked in" and "who accepted the offer"
+   * must have one answer, not one per surface that asks. See its docblock.
+   */
+  getJobTimelineActors,
+  // The console header's client-side extras (SPOCs, vertical, escalation) — see its docblock.
+  getJobConsoleExtras,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
@@ -7766,8 +8486,22 @@ module.exports = {
    * rather than a comment.
    */
   OFFER_STATE_VALUES, offerStateClause, offerColumns,
+  /*
+   * The bucket ladder itself, exported for the tab-count tests: the counts GROUP
+   * BY it and the list projects it, so "a tab's number and the chips on the rows
+   * it lists come from one expression" is a checked property too.
+   */
+  offerStateCaseSql,
   // The validator imports the vocabulary so the two sides cannot drift.
   APP_REQUEST_VALUES, appRequestClause,
+  /*
+   * Pending-to-Start's exclusive tabs. PTS_STATE_VALUES is the ONE list of
+   * literals the validator derives valid() from; ptsStateSql / istDayBounds are
+   * exported so the XLSX export emits the SAME bucket predicate (bound to its
+   * `J` alias) and the tests can execute it; ptsStateCaseSql for the tests that
+   * assert the counts' CASE arms ARE the filter fragments.
+   */
+  PTS_STATE_VALUES, ptsStateSql, ptsStateCaseSql, istDayBounds,
   /*
    * The app-REQUEST pair, exported for the same reason offerColumns is: the
    * LIST projection and the DETAIL decode are two answers to one question
@@ -7776,6 +8510,9 @@ module.exports = {
    * a bare `if` silently reports EVERY job as having a pending request.
    */
   LIST_COLUMNS, buildAppRequest,
+  // The LIST's seven app-request fields rebuilt from a detail row, so a
+  // one-job surface can hand its object to the CRM's appRequestOf() unchanged.
+  appRequestListFields,
   /*
    * `job.offer_expiry.enabled` — exported so the tests can pin BOTH regimes
    * (expiry on ⇒ a stale OFFERED row reads Expired; expiry off ⇒ it stays
