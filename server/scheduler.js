@@ -1316,17 +1316,23 @@ Note: only runs automatically if easyfix_properties "plivo.transcription.enabled
     id: 'transcription-cost-backfill',
     name: 'Transcription Cost Backfill',
     description:
-`What this task does: Records what Plivo charged for call transcripts that were stored before the cost was captured, so Plivo spend can be reported per call.
+`What this task does: A once-a-day safety net that records what Plivo charged for any call transcript whose cost was not stored when the transcript was saved.
+
+Normally nothing to do: every transcript stores its own Plivo charge at the moment it is saved. This task only picks up what that missed — transcripts stored before the cost was captured, or while the database column was not yet added.
 
 Step by step:
-  1. Every 30 minutes it looks for call-log rows that have a transcript but no stored cost.
+  1. Once a day at 03:10 IST it looks for call-log rows that have a transcript but no stored cost.
   2. If there are none, it stops there and calls nothing — no Plivo requests at all.
   3. Otherwise it reads Plivo's transcription list (newest first) and saves each matching transcript's charge on its call-log row.
   4. It stops once it is past the oldest row that was missing a cost.
   5. A call Plivo has no transcription for is remembered and skipped until the next server restart, so the list is never re-read for it.
+  6. Use Trigger Now if you need it sooner than the nightly run.
 
 This task never REQUESTS a transcript, so it cannot add to the Plivo bill, and it runs whether or not "plivo.transcription.enabled" is on. New transcripts record their own cost when they are stored.`,
-    cron: '15,45 * * * *',
+    // DAILY, not every 30 min (owner, 2026-09-18): a transcript records its own
+    // cost as it is saved, so this only ever catches a miss. 03:10 IST keeps it
+    // clear of the 02:20 / 03:45 nightly jobs.
+    cron: '10 3 * * *',
     cooperativeCancel: true,
     runner: async () => {
       const result = await callTranscriptionCron.backfillTranscriptionCosts({
@@ -1345,7 +1351,7 @@ This task never REQUESTS a transcript, so it cannot add to the Plivo bill, and i
       { timezone: TZ },
     );
     transcriptionCostJob.registered = true;
-    logger.info('Transcription-cost-backfill cron registered (every 30 min IST, independent of plivo.transcription.enabled).');
+    logger.info('Transcription-cost-backfill cron registered (daily 03:10 IST, independent of plivo.transcription.enabled).');
   }
 
   // ── Call-metrics (Amazon Transcribe Call Analytics) — start + retrieve jobs

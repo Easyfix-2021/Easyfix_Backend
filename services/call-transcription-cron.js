@@ -54,7 +54,9 @@ async function saveTranscript(jobCallerInfoId, tx) {
  * 20 a page, carries call_uuid + transcription_cost) and matches call_uuid to
  * tbl_job_caller_info.unique_id — one pass over the history, not one GET per row.
  *
- * Runs from its OWN scheduler job, not from the transcript cron, because it is
+ * Runs from its OWN scheduler job — once a day, because a transcript stores its
+ * own cost as it is saved and this only catches a miss — and not from the
+ * transcript cron, because it is
  * independent of plivo.transcription.enabled: a charge Plivo already made
  * belongs on the row even when new transcription is switched off. It only READS
  * Plivo's list — it never requests a transcript, so it cannot spend anything.
