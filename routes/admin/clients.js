@@ -30,6 +30,7 @@
 
 const router = require('express').Router();
 const multer = require('multer');
+const Joi = require('joi'); // Client Material Rates (sub-project C) — inline schemas below
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
@@ -38,6 +39,7 @@ const verticalsSvc = require('../../services/client-verticals.service');
 const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
+const materialRatesSvc = require('../../services/client-material-rates.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
 // Same module the client portal's Performance book judges against — see the
 // GET /:clientId/targets handler for why this is a passthrough, not a copy.
@@ -1631,6 +1633,120 @@ router.delete(
       logger.info('Client rate card removed · clientServiceId=' + id);
       modernOk(res, { deleted: true });
     } catch (e) { next(e); }
+  },
+);
+
+/* ─── Client Material Rates (Material Management phase 2, sub-project C) ──
+ *
+ * Client-specific material price overrides on top of the material master
+ * (services/material.service.js). The client card is a curated exception
+ * list — everything not listed here quotes at the master price via
+ * services/material-price-resolver.js. See
+ * docs/superpowers/specs/2026-09-18-client-material-rates-design.md.
+ *
+ * GET    /:clientId/material-rates              → client view (any authed admin)
+ * GET    /:clientId/material-rates/options       → client view
+ * PUT    /:clientId/material-rates/:materialId   → isClientEdit (full replace; also the Add path)
+ * DELETE /:clientId/material-rates/:materialId   → isClientEdit
+ * POST   /:clientId/material-rates/:materialId/accept-master → isClientEdit
+ *
+ * No new action keys (design Decision 4) — reuses the same requireClientEdit
+ * gate and loadAndGuardClient scope-guard as the rest of this file.
+ */
+
+const clientMaterialStateEntry = Joi.object({
+  price: Joi.number().greater(0).required(),
+  state_ids: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+});
+const clientMaterialGroupEntry = Joi.object({
+  price: Joi.number().greater(0).required(),
+  brand_ids: Joi.array().items(Joi.number().integer().positive()).default([]),
+  states: Joi.array().items(clientMaterialStateEntry).default([]),
+});
+const clientMaterialRatesBody = Joi.object({
+  groups: Joi.array().items(clientMaterialGroupEntry).min(1).required(),
+});
+
+// materialId is a path segment shared with :clientId — validated inline
+// (rather than via the `validate()` Joi middleware) so a schema scoped to
+// this one field can't strip req.params.clientId via stripUnknown.
+function invalidMaterialId(req, res) {
+  const materialId = Number(req.params.materialId);
+  if (!Number.isInteger(materialId) || materialId <= 0) {
+    modernError(res, 400, 'invalid materialId');
+    return true;
+  }
+  return false;
+}
+
+router.get('/:clientId/material-rates', async (req, res, next) => {
+  try {
+    logger.info('List client material rates · clientId=' + req.params.clientId);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const items = await materialRatesSvc.list(req.params.clientId);
+    logger.info('Found ' + items.length + ' client material-rate materials');
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+router.get('/:clientId/material-rates/options', async (req, res, next) => {
+  try {
+    logger.info('List client material-rate options · clientId=' + req.params.clientId);
+    if (!(await loadAndGuardClient(req, res))) return;
+    const items = await materialRatesSvc.options(req.params.clientId);
+    modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+router.put(
+  '/:clientId/material-rates/:materialId',
+  requireClientEdit,
+  validate(clientMaterialRatesBody),
+  async (req, res, next) => {
+    try {
+      if (invalidMaterialId(req, res)) return;
+      logger.info('Save client material rate · clientId=' + req.params.clientId + ' materialId=' + req.params.materialId);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const out = await materialRatesSvc.replace(req.params.clientId, req.params.materialId, req.body, { userId: req.user && req.user.user_id });
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) { logger.warn('Save client material rate failed · ' + e.message); return modernError(res, e.status, e.message); }
+      next(e);
+    }
+  },
+);
+
+router.delete(
+  '/:clientId/material-rates/:materialId',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      if (invalidMaterialId(req, res)) return;
+      logger.info('Remove client material rate · clientId=' + req.params.clientId + ' materialId=' + req.params.materialId);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const out = await materialRatesSvc.remove(req.params.clientId, req.params.materialId);
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.post(
+  '/:clientId/material-rates/:materialId/accept-master',
+  requireClientEdit,
+  async (req, res, next) => {
+    try {
+      if (invalidMaterialId(req, res)) return;
+      logger.info('Accept master price · clientId=' + req.params.clientId + ' materialId=' + req.params.materialId);
+      if (!(await loadAndGuardClient(req, res))) return;
+      const out = await materialRatesSvc.acceptMaster(req.params.clientId, req.params.materialId, { userId: req.user && req.user.user_id });
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
   },
 );
 

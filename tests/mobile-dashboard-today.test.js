@@ -145,8 +145,10 @@ test('Home counts the statuses Bookings lists, and each tile uses its chip\'s ru
   assert.match(overdue, /requested_date_time < \?/, 'late is keyed on the appointment, against a bound `now`');
   assert.match(overdue, /job_status NOT IN \(2, 10, 20\)/,
     'begun work is not late: in progress, pending to close, a revisit already worked');
-  assert.match(overdue, /NOT \(job_status = 15 AND checkin_date_time IS NOT NULL\)/,
-    'an estimate pending WITH a check-in is the technician on site, not late');
+  // 16 "Pending for Material" carries the same carve-out as 15: the quote is
+  // with EasyFix, and a technician who has checked in is on site, not late.
+  assert.match(overdue, /NOT \(job_status IN \(15, 16\) AND checkin_date_time IS NOT NULL\)/,
+    'an estimate or material quote pending WITH a check-in is the technician on site, not late');
 });
 
 test('the two source lists merge with started jobs first and no duplicates', () => {

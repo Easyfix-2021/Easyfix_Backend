@@ -6,6 +6,7 @@ const requireSpocAuth = require('../../middleware/client-auth');
 const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
+const { isEstimateApprovable } = require('../../services/job-estimate-approval');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const otpAttempts = require('../../services/otp-attempts.service');
@@ -387,6 +388,12 @@ router.get('/action-queue', async (req, res, next) => {
           * the row a different type, which is why the label below is DERIVED
           * rather than hardcoded. (No backticks in this comment: it lives
           * inside a JS template literal, where one would end the string.)
+          *
+          * 16 (Pending for Material, 2026-09-18) is DELIBERATELY excluded —
+          * unlike 15, it is not something the client can act on yet (the PM
+          * hasn't reviewed the quote), and the design says a status-16 job
+          * shows the client a View Details action only. This filter already
+          * excludes it by naming 15 alone; nothing to add.
           */
          AND J.job_status = 15
        GROUP BY J.job_id
@@ -409,10 +416,14 @@ router.get('/action-queue', async (req, res, next) => {
        * today. It is still DERIVED rather than hardcoded on purpose: if that
        * filter is ever loosened, the labels stay honest by construction
        * instead of every row silently reading "Estimate approval" again —
-       * which is exactly the bug this replaced.
+       * which is exactly the bug this replaced. Uses the SAME
+       * isEstimateApprovable() the approve/reject routes gate on (Material
+       * Management phase 2, sub-project D, 2026-09-18) — a 16 (Pending for
+       * Material) row must never offer Approve, and one shared definition
+       * is how that stays true if this WHERE is ever loosened to admit it.
        */
-      type: Number(r.job_status) === 15 ? 'approval' : 'open',
-      approvable: Number(r.job_status) === 15,
+      type: isEstimateApprovable(r.job_status) ? 'approval' : 'open',
+      approvable: isEstimateApprovable(r.job_status),
       jobStatus: Number(r.job_status),
       jobId: Number(r.job_id),
       reference: r.job_reference_id || r.client_ref_id || null,
@@ -422,7 +433,7 @@ router.get('/action-queue', async (req, res, next) => {
       estimateValue: r.estimate_value == null ? null : Number(r.estimate_value),
       // The action that clears this row, so the FE does not hard-code a mapping
       // from type to endpoint.
-      action: Number(r.job_status) === 15
+      action: isEstimateApprovable(r.job_status)
         ? { label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve` }
         // GET, not PATCH: there is nothing to clear. The card opens the job
         // drawer either way, but a row that offers to approve something the
@@ -1038,6 +1049,20 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
 // Estimate approve/reject — legacy stored in approve_job_doc workflow.
 // Refuse approval on terminal states (cancelled / completed) and on
 // estimates already responded to. Mirrors legacy idempotency guards.
+//
+// Material Management phase 2, sub-project D (2026-09-18): a 15 the client
+// sees today only ever arrived via a PM's material-review approve (see
+// routes/admin/jobs.js POST /:id/material-review) — send-for-approval no
+// longer sets 15 directly. So the client's decision now ALSO moves the
+// status, through jobService.setStatus() so webhooks fire like every other
+// transition: approve → 1 (SCHEDULED), KEEPING fk_easyfixter_id — setStatus's
+// default branch (no dedicated STATUS.SCHEDULED handling) never touches that
+// column, so "same technician stays assigned" holds without extra code;
+// reject → 2 (IN_PROGRESS) — canonical member of the "2/20 Pending to Close
+// on App" pair the design's flow returns to (mirrors the existing hold/
+// release precedent of a fixed target rather than trying to recall which of
+// 2/20 the job was in before 16 overwrote it — no column stores that).
+// See docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
 router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
   try {
     logger.info('SPOC approve estimate · id=' + req.params.id);
@@ -1055,9 +1080,20 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
       logger.warn('Estimate-approve blocked · already rejected · id=' + job.job_id);
       return modernError(res, 409, 'estimate already rejected; cannot approve');
     }
+    // Owner rule (design "Flow"): a status-16 job has not been PM-reviewed
+    // yet — the client sees it (View Details) but must not be able to
+    // approve/reject it.
+    if (!isEstimateApprovable(job.job_status)) {
+      logger.warn('Estimate-approve blocked · not yet PM-reviewed · id=' + job.job_id + ' status=' + job.job_status);
+      return modernError(res, 409, 'This estimate is still being reviewed by EasyFix.');
+    }
     await pool.query(
       'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
       [req.spoc.id, new Date(), job.job_id]);
+    // Legacy stamps cancel_by/etc with the SPOC's linked USER — same
+    // resolution as the client cancel route above.
+    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+    await jobService.setStatus(job.job_id, { status: 1 }, { user_id: link?.user_id ?? null });
     logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }
@@ -1080,9 +1116,18 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
       logger.warn('Estimate-reject blocked · already rejected · id=' + job.job_id);
       return modernError(res, 409, 'estimate already rejected');
     }
+    // Owner rule (design "Flow"): a status-16 job has not been PM-reviewed
+    // yet — the client sees it (View Details) but must not be able to
+    // approve/reject it.
+    if (!isEstimateApprovable(job.job_status)) {
+      logger.warn('Estimate-reject blocked · not yet PM-reviewed · id=' + job.job_id + ' status=' + job.job_status);
+      return modernError(res, 409, 'This estimate is still being reviewed by EasyFix.');
+    }
     await pool.query(
       'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
       [req.body.reason, new Date(), job.job_id]);
+    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+    await jobService.setStatus(job.job_id, { status: 2 }, { user_id: link?.user_id ?? null });
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
     logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
@@ -1094,7 +1139,8 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
 const STAGE_LABEL = {
   0: 'Unconfirmed', 1: 'Scheduled', 2: 'Pending To Start', 3: 'Completed',
   5: 'Completed', 6: 'Cancelled', 7: 'Enquiry', 9: 'Booked',
-  10: 'Under Audit', 15: 'Awaiting Approval', 20: 'Pending To Start', 21: 'On Hold',
+  10: 'Under Audit', 15: 'Awaiting Approval', 16: 'Pending for Material',
+  20: 'Pending To Start', 21: 'On Hold',
 };
 
 /**
@@ -2739,7 +2785,10 @@ router.get('/dashboard-summary', async (req, res, next) => {
           *
           * awaitingYou is status 15 — an estimate sent and not yet decided.
           * It is the ONLY state no EasyFix action can clear, which is what
-          * "pending with you" means.
+          * "pending with you" means. 16 (Pending for Material, 2026-09-18) is
+          * deliberately NOT included — it is awaiting the PM's review, not
+          * the client's, so it belongs in openTotal (already true — it is
+          * not in the NOT IN list below) but not in awaitingYou.
           */
          SUM(CASE WHEN j.job_status NOT IN (3, 5, 6, 7)                 THEN 1 ELSE 0 END) AS openTotal,
          SUM(CASE WHEN j.job_status = 15                                THEN 1 ELSE 0 END) AS awaitingYou
@@ -2972,6 +3021,9 @@ router.get('/dashboard-summary', async (req, res, next) => {
 
     // Actionable order buckets for "Needs attention" — team-scoped.
     //   estimatePending : status 15 — estimate awaiting the client's approval
+    //                     (16 Pending for Material deliberately excluded —
+    //                     it is awaiting the PM's review, not the client's;
+    //                     see the awaitingYou comment above for the same call)
     //   noResponse      : call_later = 1 — customer not reachable / call not picked
     //   onHold          : status 21 — fulfilment on hold (items/parts/approval pending)
     //   revisit         : completed (3,5) with a revisit created, not yet billed
@@ -3682,6 +3734,9 @@ router.get('/client-delay/counts', async (req, res, next) => {
     `;
 
     const [[row]] = await pool.query(
+      // approveEstimate: status 15 only — 16 (Pending for Material) is
+      // deliberately excluded, same call as awaitingYou/estimatePending
+      // above: it awaits the PM's review, not the client's.
       `SELECT
          SUM(CASE WHEN j.job_status = 15 AND ${scope.sql}
                   THEN 1 ELSE 0 END) AS approveEstimate,

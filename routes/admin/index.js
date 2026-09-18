@@ -74,6 +74,7 @@ router.use('/tools',              require('./tools'));
 // Settings › Manage Materials — Material Master + Brand Master (RBAC via requireAction, see
 // migrations/2026-09-17-manage-materials.sql for the 12 seeded action keys).
 router.use('/materials',          require('./materials'));
+router.use('/material-requests',  require('./material-requests'));
 router.use('/brands',             require('./brands'));
 router.use('/rate-cards-b2b',     require('./rate-cards-b2b'));
 router.use('/rate-cards-b2c',     require('./rate-cards-b2c'));

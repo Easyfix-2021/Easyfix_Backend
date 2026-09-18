@@ -778,9 +778,18 @@ async function loadLifecycleCounts(efrId, executor = pool) {
  *                                 and it is what a fulfilment hold RELEASES to
  *                                 (routes/admin/jobs.js POST /jobs/:id/hold/release)
  *                                 — a second visit still owed, still assigned.
- *   15  ESTIMATE_PENDING_APPROVAL the TECHNICIAN moves the job here themselves
- *                                 (mobile-job-estimate.service.js sendForApproval)
+ *   15  ESTIMATE_PENDING_APPROVAL reached ONLY via a PM's material-review
+ *                                 approve since 2026-09-18 (routes/admin/jobs.js
+ *                                 POST /:id/material-review) — sendForApproval
+ *                                 no longer sets 15 directly (see 16 below) —
  *                                 and resumes it once the SPOC decides.
+ *   16  PENDING_FOR_MATERIAL      the TECHNICIAN moves the job here themselves
+ *                                 (mobile-job-estimate.service.js
+ *                                 materialRequired / sendForApproval,
+ *                                 2026-09-18) while building or awaiting PM
+ *                                 review of a material estimate — same
+ *                                 "technician's own job, must not vanish from
+ *                                 their list" reasoning as 15's entry above.
  *   21  ON_HOLD                   fulfilment hold with a future full_fillment_time
  *                                 (routes/admin/jobs.js PUT /jobs/:id/hold);
  *                                 fk_easyfixter_id is left untouched, so the job
@@ -807,7 +816,7 @@ async function loadLifecycleCounts(efrId, executor = pool) {
  * Positive `IN` list on an indexed equality — no NOT IN, so the NULL-swallows-
  * every-row trap does not apply here.
  */
-const OPEN_JOB_STATUSES = Object.freeze([1, 2, 10, 15, 20, 21]);
+const OPEN_JOB_STATUSES = Object.freeze([1, 2, 10, 15, 16, 20, 21]);
 
 async function countOpenJobs(efrId, executor = pool) {
   const [[row]] = await executor.query(

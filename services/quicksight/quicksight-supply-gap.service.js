@@ -789,6 +789,7 @@ async function jobDetail(jobId) {
         WHEN TJ.job_status = 6 THEN 'Cancelled'
         WHEN TJ.job_status = 10 THEN 'Under Audit'
         WHEN TJ.job_status = 15 THEN 'Estimate Approval Pending'
+        WHEN TJ.job_status = 16 THEN 'Pending for Material'
         WHEN TJ.job_status = 21 THEN 'FOH'
         ELSE 'NA'
       END AS job_status_description,
@@ -1187,8 +1188,11 @@ const ACTIONS_BY_STATUS = {
   4: [],
 };
 
-/* Legacy isCompleteEnabled: a Job ID gap may only be closed once its job is. */
-const JOB_STATUSES_THAT_ALLOW_COMPLETE = new Set([3, 5, 6, 7, 10, 15, 21]);
+/* Legacy isCompleteEnabled: a Job ID gap may only be closed once its job is.
+ * 16 (Pending for Material, 2026-09-18) joins 15 here — both are only
+ * reachable once a technician is already on the job, so the supply gap this
+ * set answers ("does it still need allocation") is already resolved. */
+const JOB_STATUSES_THAT_ALLOW_COMPLETE = new Set([3, 5, 6, 7, 10, 15, 16, 21]);
 
 // Best-effort mirror of legacy's tbl_efr_invite audit row. Never throws.
 async function logEfrInvite({ name, mobile, remarks, inviteStatus, supplyId, userId }) {
