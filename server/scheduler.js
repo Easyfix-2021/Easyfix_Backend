@@ -1274,7 +1274,7 @@ Step by step:
   4. Calls whose recording isn't ready yet are left pending and retried on a later run.
   5. It logs how many were eligible / completed / not-available / pending / failed (visible below under Last Run).
   6. Calls shorter than 15 seconds are skipped — Plivo bills every transcript as at least one full minute.
-  7. Each stored transcript also records its Plivo charge (transcription_cost_usd). Once per server start, the first run also fills that cost for older transcripts from Plivo's transcription list (Last Run → costBackfill).
+  7. Each stored transcript also records its Plivo charge (transcription_cost_usd). Older transcripts are filled in by the separate "Transcription Cost Backfill" task.
 
 Note: only runs automatically if easyfix_properties "plivo.transcription.enabled" = "true" (checked once at server start — restart after flipping). Trigger Now still works for manual testing. Transcriptions are customer PII — ensure a retention policy.`,
     cron: '*/30 * * * *',
@@ -1305,6 +1305,47 @@ Note: only runs automatically if easyfix_properties "plivo.transcription.enabled
     );
     transcriptionBackfillJob.registered = true;
     logger.info('Transcription-backfill cron registered (plivo.transcription.enabled=true, every 30 min IST).');
+  }
+
+  // ── Transcription COST backfill — fills transcription_cost_usd for transcripts
+  //    stored before the cost was captured. Deliberately NOT gated on
+  //    plivo.transcription.enabled: it only READS Plivo's transcription list, and
+  //    a charge Plivo already made belongs on the row even when transcription is
+  //    switched off (as it is on Production since 2026-09-17). ──
+  const transcriptionCostJob = registerJob({
+    id: 'transcription-cost-backfill',
+    name: 'Transcription Cost Backfill',
+    description:
+`What this task does: Records what Plivo charged for call transcripts that were stored before the cost was captured, so Plivo spend can be reported per call.
+
+Step by step:
+  1. Every 30 minutes it looks for call-log rows that have a transcript but no stored cost.
+  2. If there are none, it stops there and calls nothing — no Plivo requests at all.
+  3. Otherwise it reads Plivo's transcription list (newest first) and saves each matching transcript's charge on its call-log row.
+  4. It stops once it is past the oldest row that was missing a cost.
+  5. A call Plivo has no transcription for is remembered and skipped until the next server restart, so the list is never re-read for it.
+
+This task never REQUESTS a transcript, so it cannot add to the Plivo bill, and it runs whether or not "plivo.transcription.enabled" is on. New transcripts record their own cost when they are stored.`,
+    cron: '15,45 * * * *',
+    cooperativeCancel: true,
+    runner: async () => {
+      const result = await callTranscriptionCron.backfillTranscriptionCosts({
+        shouldStop: () => isCancelRequested('transcription-cost-backfill'),
+      });
+      logger.info('Transcription-cost-backfill cron · ' + JSON.stringify(result));
+      return result;
+    },
+  });
+  if (cronDisabled) {
+    transcriptionCostJob.skipReason = 'CRON_DISABLED=true';
+  } else {
+    transcriptionCostJob.task = cron.schedule(
+      transcriptionCostJob.cron,
+      () => invokeJob(transcriptionCostJob, 'cron'),
+      { timezone: TZ },
+    );
+    transcriptionCostJob.registered = true;
+    logger.info('Transcription-cost-backfill cron registered (every 30 min IST, independent of plivo.transcription.enabled).');
   }
 
   // ── Call-metrics (Amazon Transcribe Call Analytics) — start + retrieve jobs
