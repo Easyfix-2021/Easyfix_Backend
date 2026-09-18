@@ -55,6 +55,7 @@ const {
   PROOF_AFTER_CATEGORIES,
 } = require('../utils/job-image-buckets');
 const { deleteJobImage } = require('./job-image.service');
+const { resolveMaterialPrice } = require('./material-price-resolver');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
@@ -133,16 +134,133 @@ async function getRateCard(jobId, efrId) {
   };
 }
 
+/*
+ * Job's service category + state, for the material picker and price
+ * resolution (sub-project B). Kept as its OWN query rather than folded into
+ * jobForTech: jobForTech's SQL text is pinned verbatim by
+ * tests/mobile-job-estimate-timestamps.test.js, so it must not change shape.
+ *
+ * state_id comes from the job's service address (tbl_address.city_id →
+ * tbl_city.state_id) — the same path services/job.service.js LIST_JOIN uses
+ * for every other state-scoped read in this codebase. No row (job / address /
+ * city missing) degrades to nulls rather than throwing — resolveMaterialPrice
+ * already treats a missing stateId as "skip the state-price steps".
+ */
+async function jobEstimateContext(jobId) {
+  const [[row]] = await pool.query(
+    `SELECT j.fk_service_catg_id, ci.state_id
+       FROM tbl_job j
+       LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+       LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+      WHERE j.job_id = ? LIMIT 1`,
+    [jobId],
+  );
+  return row || { fk_service_catg_id: null, state_id: null };
+}
+
+/* ─── Estimate material picker (Material Management phase 2, sub-project B) ─
+ * Master-list materials for THIS job's service category, each priced via
+ * resolveMaterialPrice() (sub-project C) for the job's client + state — the
+ * app never computes a price itself. See
+ * docs/superpowers/specs/2026-09-18-app-estimate-material-picker-design.md.
+ *
+ * A material with no brand rows (tbl_material_price_group_brand) is a
+ * "No Brand" material — resolved once, top-level `price`/`price_source`.
+ * A material WITH brand rows returns one entry per brand under `brands[]`
+ * instead (top-level price/price_source are null — the app picks a brand
+ * first).
+ *
+ * Returns { items: [{ material_id, material_name, uom_name, pricing_type,
+ *                      brands: [{ brand_id, brand_name, price, price_source }],
+ *                      price, price_source }] }
+ */
+async function getJobMaterials(jobId, efrId, { search } = {}) {
+  logger.info('Get job materials · jobId=' + jobId + ' · search=' + (search || ''));
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Get job materials failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+
+  const ctx = await jobEstimateContext(jobId);
+
+  const where = ['m.status = 1', 'm.service_catg_id = ?'];
+  const params = [ctx.fk_service_catg_id];
+  if (search) { where.push('m.material_name LIKE ?'); params.push('%' + search + '%'); }
+
+  const [materials] = await pool.query(
+    `SELECT m.material_id, m.material_name, m.pricing_type, u.uom_name
+       FROM tbl_material_master m
+       LEFT JOIN tbl_uom_master u ON u.uom_id = m.uom_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY m.material_name ASC`,
+    params,
+  );
+  if (materials.length === 0) return { items: [] };
+
+  const [brandRows] = await pool.query(
+    `SELECT gb.material_id, bm.brand_id, bm.brand_name
+       FROM tbl_material_price_group_brand gb
+       JOIN tbl_brand_master bm ON bm.brand_id = gb.brand_id AND bm.status = 1
+      WHERE gb.material_id IN (?)
+      ORDER BY bm.brand_name ASC`,
+    [materials.map((m) => m.material_id)],
+  );
+  const brandsByMaterial = new Map();
+  for (const b of brandRows) {
+    if (!brandsByMaterial.has(b.material_id)) brandsByMaterial.set(b.material_id, []);
+    brandsByMaterial.get(b.material_id).push(b);
+  }
+
+  const items = [];
+  for (const m of materials) {
+    const brandRowsForMaterial = brandsByMaterial.get(m.material_id) || [];
+    if (brandRowsForMaterial.length === 0) {
+      const resolved = await resolveMaterialPrice({
+        clientId: job.fk_client_id, materialId: m.material_id, brandId: null, stateId: ctx.state_id,
+      });
+      items.push({
+        material_id: m.material_id, material_name: m.material_name,
+        uom_name: m.uom_name || null, pricing_type: m.pricing_type,
+        brands: [], price: resolved.price, price_source: resolved.source,
+      });
+      continue;
+    }
+    const brands = [];
+    for (const b of brandRowsForMaterial) {
+      const resolved = await resolveMaterialPrice({
+        clientId: job.fk_client_id, materialId: m.material_id, brandId: b.brand_id, stateId: ctx.state_id,
+      });
+      brands.push({ brand_id: b.brand_id, brand_name: b.brand_name, price: resolved.price, price_source: resolved.source });
+    }
+    items.push({
+      material_id: m.material_id, material_name: m.material_name,
+      uom_name: m.uom_name || null, pricing_type: m.pricing_type,
+      brands, price: null, price_source: null,
+    });
+  }
+  logger.info('Returning ' + items.length + ' materials · jobId=' + jobId);
+  return { items };
+}
+
 /* ─── Quotation lines ───────────────────────────────────────────────────
  * Insert one estimate line (product or material) into quotation_details.
  *
- *   type      'product' | 'material'
- *   itemId    optional — for product → client_service_id (rate-card row);
- *             for material → material_id. Bound to the matching column.
- *   name      display label (required for material; product can derive from
- *             rate-card but the app always sends a name too).
- *   quantity  → quotation_details.unit  (legacy column name for qty)
- *   amount    → quotation_details.unit_price
+ *   type       'product' | 'material'
+ *   itemId     product only → client_service_id (rate-card row).
+ *   materialId material only → REQUIRED (the free-text material path is
+ *              removed — see the design doc's "Backend" section). The
+ *              Others/material-add-request flow never reaches this function;
+ *              it POSTs material-request instead and creates no quotation line.
+ *   brandId    material only, optional — selects which brand price applies.
+ *   name       display label. For material lines the master's own
+ *              material_name is used regardless of what the client sends —
+ *              this is a master-list picker now, not free text.
+ *   quantity   → quotation_details.unit  (legacy column name for qty)
+ *   amount     → quotation_details.unit_price for PRODUCT lines. For a
+ *              MATERIAL line this is only a suggestion: the server
+ *              re-resolves the price via resolveMaterialPrice() and stores
+ *              THAT, ignoring `amount` unless the resolver has no price at
+ *              all (source 'none' — phase-1 "Price Pending"), so a modified
+ *              app can never quote an arbitrary number.
  *
  * status defaults to 1 (active, pending approval) — same default the admin
  * route uses. easyfxer_id (legacy typo) stamps the technician who raised
@@ -150,16 +268,48 @@ async function getRateCard(jobId, efrId) {
  *
  * Returns { lineId }.
  */
-async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, amount }) {
-  logger.info('Add quotation line · jobId=' + jobId + ' · type=' + type + ' · itemId=' + (itemId || null) + ' · qty=' + quantity);
+async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, amount, materialId, brandId }) {
+  logger.info('Add quotation line · jobId=' + jobId + ' · type=' + type + ' · itemId=' + (itemId || null) + ' · materialId=' + (materialId || null) + ' · qty=' + quantity);
   const job = await jobForTech(jobId, efrId);
   if (!job) logger.warn('Add quotation line failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
 
   const isProduct = type === 'product';
-  // Bind itemId to the correct FK column; the other stays NULL.
-  const clientServiceId = isProduct ? (itemId || null) : null;
-  const materialId      = isProduct ? null : (itemId || null);
+  let clientServiceId = null;
+  let materialIdOut = null;
+  let lineName = name || null;
+  let unitPrice = amount;
+
+  if (isProduct) {
+    clientServiceId = itemId || null;
+  } else {
+    // Material line — master-list only. A missing material_id means the
+    // client is still on the old free-text path (or Others reached this
+    // endpoint by mistake, which it never should — Others posts to
+    // material-request instead) — reject rather than silently accepting it.
+    if (!materialId) {
+      logger.warn('Add quotation line rejected · material_id required · jobId=' + jobId);
+      const e = new Error('material_id is required for material lines'); e.status = 422; throw e;
+    }
+
+    const ctx = await jobEstimateContext(jobId);
+    const [[material]] = await pool.query(
+      `SELECT material_id, material_name, service_catg_id, CAST(status AS SIGNED) AS status
+         FROM tbl_material_master WHERE material_id = ? LIMIT 1`,
+      [materialId],
+    );
+    if (!material || material.status !== 1 || Number(material.service_catg_id) !== Number(ctx.fk_service_catg_id)) {
+      logger.warn('Add quotation line rejected · material not available for this job · jobId=' + jobId + ' · materialId=' + materialId);
+      const e = new Error('material not found for this job'); e.status = 422; throw e;
+    }
+
+    const resolved = await resolveMaterialPrice({
+      clientId: job.fk_client_id, materialId, brandId: brandId || null, stateId: ctx.state_id,
+    });
+    unitPrice = resolved.source === 'none' ? (Number(amount) || 0) : (Number(resolved.price) || 0);
+    materialIdOut = materialId;
+    lineName = material.material_name;
+  }
 
   const [ins] = await pool.query(
     `INSERT INTO quotation_details
@@ -169,9 +319,9 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
         job_id, client_service_id, material_id)
      VALUES (?, ?, ?, ?, 0, 0, 0, 1, ?, ?, ?, ?, ?)`,
     [
-      type, name || null, quantity, amount,
+      type, lineName, quantity, unitPrice,
       efrId, new Date(),
-      jobId, clientServiceId, materialId,
+      jobId, clientServiceId, materialIdOut,
     ],
   );
   logger.info('Quotation line created · id=' + ins.insertId + ' · jobId=' + jobId);
@@ -595,6 +745,7 @@ async function getWorkProgress(jobId, efrId) {
 module.exports = {
   jobForTech,
   getRateCard,
+  getJobMaterials,
   addQuotationLine,
   deleteQuotationLine,
   sendForApproval,

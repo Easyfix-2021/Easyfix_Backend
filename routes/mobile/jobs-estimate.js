@@ -64,23 +64,47 @@ router.get('/:id/rate-card', validate(idParam, 'params'), async (req, res, next)
   } catch (e) { logger.warn('Fetch rate-card failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
+// ─── Materials (Material Management phase 2, sub-project B) ───────────
+// GET /:id/materials?search= → master-list materials for this job's service
+// category, each priced via resolveMaterialPrice() for the job's client +
+// state. See docs/superpowers/specs/2026-09-18-app-estimate-material-picker-design.md.
+// { items: [{ material_id, material_name, uom_name, pricing_type,
+//             brands: [{ brand_id, brand_name, price, price_source }],
+//             price, price_source }] }
+const materialsQuery = Joi.object({ search: Joi.string().trim().max(200).allow('').optional() });
+
+router.get('/:id/materials', validate(idParam, 'params'), validate(materialsQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info('Fetch job materials · jobId=' + req.params.id + ' · search=' + (req.query.search || ''));
+    const out = await estimateService.getJobMaterials(Number(req.params.id), req.tech.efr_id, { search: req.query.search });
+    logger.info('Returning ' + (out.items ? out.items.length : 0) + ' materials');
+    modernOk(res, out);
+  } catch (e) { logger.warn('Fetch job materials failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
 // ─── Quotation: add a line ─────────────────────────────────────────────
-// POST /:id/quotation { type, itemId?, name?, quantity, amount } → { lineId }
+// POST /:id/quotation { type, itemId?, name?, quantity, amount, materialId?, brandId? }
+//   → { lineId }
+// materialId/brandId are the technician-app's own field names (camelCase,
+// matching this file's existing `itemId` convention) — NOT the snake_case
+// material_id/brand_id used in the GET /:id/materials RESPONSE shape above,
+// which is the spec's shape and is mapped by the app on the way in.
 const quotationBody = Joi.object({
-  type:     Joi.string().valid('product', 'material').required(),
-  itemId:   Joi.number().integer().positive().optional(),
-  name:     Joi.string().trim().min(1).max(255).optional(),
-  quantity: Joi.number().integer().min(1).default(1),
-  amount:   Joi.number().min(0).default(0),
+  type:       Joi.string().valid('product', 'material').required(),
+  itemId:     Joi.number().integer().positive().optional(),
+  materialId: Joi.number().integer().positive().optional(),
+  brandId:    Joi.number().integer().positive().optional(),
+  name:       Joi.string().trim().min(1).max(255).optional(),
+  quantity:   Joi.number().integer().min(1).default(1),
+  amount:     Joi.number().min(0).default(0),
 })
-  // material lines are free-text, so a name is required when there is no
-  // rate-card itemId to derive it from. `helpers.message()` sets the
-  // human-readable reason directly (the `helpers.error('any.custom', …)`
-  // form drops the message unless a template is registered).
+  // A material line's `materialId` requirement is enforced in the SERVICE
+  // (422 — see addQuotationLine) rather than here, because the design calls
+  // for a 422 specifically and Joi validation failures are always 400
+  // (see middleware/validate.js). `helpers.message()` sets the human-readable
+  // reason directly (the `helpers.error('any.custom', …)` form drops the
+  // message unless a template is registered).
   .custom((value, helpers) => {
-    if (value.type === 'material' && !value.name) {
-      return helpers.message('name is required for material lines');
-    }
     if (value.type === 'product' && !value.itemId && !value.name) {
       return helpers.message('itemId or name is required for product lines');
     }
@@ -89,8 +113,16 @@ const quotationBody = Joi.object({
 
 router.post('/:id/quotation', validate(idParam, 'params'), validate(quotationBody), async (req, res, next) => {
   try {
-    logger.info('Add quotation line · jobId=' + req.params.id + ' · type=' + req.body.type + ' · qty=' + req.body.quantity + ' · amount=' + req.body.amount);
-    const out = await estimateService.addQuotationLine(Number(req.params.id), req.tech.efr_id, req.body);
+    logger.info('Add quotation line · jobId=' + req.params.id + ' · type=' + req.body.type + ' · qty=' + req.body.quantity + ' · amount=' + req.body.amount + ' · materialId=' + (req.body.materialId || null));
+    const out = await estimateService.addQuotationLine(Number(req.params.id), req.tech.efr_id, {
+      type: req.body.type,
+      itemId: req.body.itemId,
+      name: req.body.name,
+      quantity: req.body.quantity,
+      amount: req.body.amount,
+      materialId: req.body.materialId,
+      brandId: req.body.brandId,
+    });
     logger.info('Quotation line created · id=' + out.lineId);
     res.status(201);
     modernOk(res, out);
