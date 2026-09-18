@@ -54,13 +54,22 @@ async function saveTranscript(jobCallerInfoId, tx) {
  * 20 a page, carries call_uuid + transcription_cost) and matches call_uuid to
  * tbl_job_caller_info.unique_id — one pass over the history, not one GET per row.
  *
- * Runs at most ONCE per process (see costBackfillDone): a row Plivo has no
- * transcription for would otherwise send every 30-minute run back down the whole
- * list. Stops at the oldest row still missing a cost (less a day: inserted_time
- * is IST-naive, Plivo's add_time is UTC, and a transcript is requested after the
+ * Runs from its OWN scheduler job — once a day, because a transcript stores its
+ * own cost as it is saved and this only catches a miss — and not from the
+ * transcript cron, because it is
+ * independent of plivo.transcription.enabled: a charge Plivo already made
+ * belongs on the row even when new transcription is switched off. It only READS
+ * Plivo's list — it never requests a transcript, so it cannot spend anything.
+ *
+ * A call Plivo has no transcription for would send every run back down the whole
+ * list, so an unmatched call_uuid is remembered for the life of the process and
+ * skipped. That is why this is not a once-per-process flag: rows that appear
+ * LATER are still picked up, and a restart re-tries the unmatched ones.
+ * Stops at the oldest row still missing a cost (less a day: inserted_time is
+ * IST-naive, Plivo's add_time is UTC, and a transcript is requested after the
  * call). Both pcl rows of a conference call share the jci, so both get the cost.
  */
-let costBackfillDone = false;
+const unmatchedCallUuids = new Set();
 
 async function backfillTranscriptionCosts({ shouldStop = null } = {}) {
   let rows;
@@ -76,10 +85,14 @@ async function backfillTranscriptionCosts({ shouldStop = null } = {}) {
   } catch (e) {
     return { skipped: true, reason: 'transcription_cost_usd missing? ' + e.message };
   }
-  const want = new Set(rows.map((r) => r.callUuid));
-  const result = { missing: want.size, filled: 0, pages: 0, stopped: false };
+  const fresh = rows.filter((r) => !unmatchedCallUuids.has(r.callUuid));
+  const want = new Set(fresh.map((r) => r.callUuid));
+  const result = {
+    missing: rows.length, filled: 0, pages: 0, stopped: false,
+    knownUnmatched: rows.length - fresh.length,
+  };
   if (!want.size) return result;
-  const floorMs = Math.min(...rows.map((r) => new Date(r.insertedAt).getTime())) - 24 * 60 * 60 * 1000;
+  const floorMs = Math.min(...fresh.map((r) => new Date(r.insertedAt).getTime())) - 24 * 60 * 60 * 1000;
 
   for (let offset = 0; want.size; offset += 20) {
     if (typeof shouldStop === 'function' && shouldStop()) { result.stopped = true; break; }
@@ -100,6 +113,9 @@ async function backfillTranscriptionCosts({ shouldStop = null } = {}) {
     }
     if (objects.length < 20 || plivo.plivoTimeMs(objects[objects.length - 1].add_time) < floorMs) break;
   }
+  // Whatever the walk did not find has no transcription on Plivo under that
+  // call_uuid; remember it so the next run does not re-read the whole list.
+  if (!result.stopped) for (const u of want) unmatchedCallUuids.add(u);
   result.unmatched = want.size;
   return result;
 }
@@ -200,15 +216,6 @@ async function runTranscriptionBackfill({ limit = 50, shouldStop = null } = {}) 
     } catch (e) {
       result.failed += 1;
       logger.warn('transcription-backfill row failed · id=' + r.id + ' · ' + e.message);
-    }
-  }
-  if (!costBackfillDone && !result.stopped) {
-    try {
-      result.costBackfill = await backfillTranscriptionCosts({ shouldStop });
-      if (!result.costBackfill.skipped && !result.costBackfill.stopped) costBackfillDone = true;
-    } catch (e) {
-      result.costBackfill = { failed: e.message };
-      logger.warn('transcription cost backfill failed · ' + e.message);
     }
   }
   logger.info('transcription-backfill done · ' + JSON.stringify(result));

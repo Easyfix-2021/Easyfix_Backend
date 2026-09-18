@@ -1274,7 +1274,7 @@ Step by step:
   4. Calls whose recording isn't ready yet are left pending and retried on a later run.
   5. It logs how many were eligible / completed / not-available / pending / failed (visible below under Last Run).
   6. Calls shorter than 15 seconds are skipped — Plivo bills every transcript as at least one full minute.
-  7. Each stored transcript also records its Plivo charge (transcription_cost_usd). Once per server start, the first run also fills that cost for older transcripts from Plivo's transcription list (Last Run → costBackfill).
+  7. Each stored transcript also records its Plivo charge (transcription_cost_usd). Older transcripts are filled in by the separate "Transcription Cost Backfill" task.
 
 Note: only runs automatically if easyfix_properties "plivo.transcription.enabled" = "true" (checked once at server start — restart after flipping). Trigger Now still works for manual testing. Transcriptions are customer PII — ensure a retention policy.`,
     cron: '*/30 * * * *',
@@ -1305,6 +1305,53 @@ Note: only runs automatically if easyfix_properties "plivo.transcription.enabled
     );
     transcriptionBackfillJob.registered = true;
     logger.info('Transcription-backfill cron registered (plivo.transcription.enabled=true, every 30 min IST).');
+  }
+
+  // ── Transcription COST backfill — fills transcription_cost_usd for transcripts
+  //    stored before the cost was captured. Deliberately NOT gated on
+  //    plivo.transcription.enabled: it only READS Plivo's transcription list, and
+  //    a charge Plivo already made belongs on the row even when transcription is
+  //    switched off (as it is on Production since 2026-09-17). ──
+  const transcriptionCostJob = registerJob({
+    id: 'transcription-cost-backfill',
+    name: 'Transcription Cost Backfill',
+    description:
+`What this task does: A once-a-day safety net that records what Plivo charged for any call transcript whose cost was not stored when the transcript was saved.
+
+Normally nothing to do: every transcript stores its own Plivo charge at the moment it is saved. This task only picks up what that missed — transcripts stored before the cost was captured, or while the database column was not yet added.
+
+Step by step:
+  1. Once a day at 03:10 IST it looks for call-log rows that have a transcript but no stored cost.
+  2. If there are none, it stops there and calls nothing — no Plivo requests at all.
+  3. Otherwise it reads Plivo's transcription list (newest first) and saves each matching transcript's charge on its call-log row.
+  4. It stops once it is past the oldest row that was missing a cost.
+  5. A call Plivo has no transcription for is remembered and skipped until the next server restart, so the list is never re-read for it.
+  6. Use Trigger Now if you need it sooner than the nightly run.
+
+This task never REQUESTS a transcript, so it cannot add to the Plivo bill, and it runs whether or not "plivo.transcription.enabled" is on. New transcripts record their own cost when they are stored.`,
+    // DAILY, not every 30 min (owner, 2026-09-18): a transcript records its own
+    // cost as it is saved, so this only ever catches a miss. 03:10 IST keeps it
+    // clear of the 02:20 / 03:45 nightly jobs.
+    cron: '10 3 * * *',
+    cooperativeCancel: true,
+    runner: async () => {
+      const result = await callTranscriptionCron.backfillTranscriptionCosts({
+        shouldStop: () => isCancelRequested('transcription-cost-backfill'),
+      });
+      logger.info('Transcription-cost-backfill cron · ' + JSON.stringify(result));
+      return result;
+    },
+  });
+  if (cronDisabled) {
+    transcriptionCostJob.skipReason = 'CRON_DISABLED=true';
+  } else {
+    transcriptionCostJob.task = cron.schedule(
+      transcriptionCostJob.cron,
+      () => invokeJob(transcriptionCostJob, 'cron'),
+      { timezone: TZ },
+    );
+    transcriptionCostJob.registered = true;
+    logger.info('Transcription-cost-backfill cron registered (daily 03:10 IST, independent of plivo.transcription.enabled).');
   }
 
   // ── Call-metrics (Amazon Transcribe Call Analytics) — start + retrieve jobs
