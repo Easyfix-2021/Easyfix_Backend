@@ -1638,6 +1638,29 @@ You can also run it on demand from Manage Pincodes ("Refresh Status") or with Tr
     logger.info('Issue screenshot cleanup cron registered (02:20 IST nightly).');
   }
 
+  // ─── Employee Performance: freeze closed jobs' Primary SPOC — hourly :40 ─
+  // Writes only tbl_qs_ep_job_spoc (first capture wins); skips until that
+  // table exists. See services/quicksight/employee-performance/spoc-freeze-cron.js.
+  const qsEpSpocFreeze = require('../services/quicksight/employee-performance/spoc-freeze-cron');
+  const qsEpSpocFreezeJob = registerJob({
+    id: 'qs-ep-spoc-freeze',
+    name: 'Employee Performance: Freeze Closed Jobs\' Primary SPOC',
+    description:
+      'Records, once, which Primary SPOC each closed job (checked out since the 1st of last month) belongs to, '
+      + 'using the client\'s current mapping, so Employee Performance revenue does not move when a client is '
+      + 'reassigned later. Jobs already recorded are never changed. Does nothing until the tbl_qs_ep_job_spoc '
+      + 'migration has run.',
+    cron: '40 * * * *',
+    runner: () => qsEpSpocFreeze.runSpocFreeze(),
+  });
+  if (cronDisabled) {
+    qsEpSpocFreezeJob.skipReason = 'CRON_DISABLED=true';
+  } else {
+    qsEpSpocFreezeJob.task = cron.schedule(qsEpSpocFreezeJob.cron, () => invokeJob(qsEpSpocFreezeJob, 'cron'), { timezone: TZ });
+    qsEpSpocFreezeJob.registered = true;
+    logger.info('Employee Performance SPOC-freeze cron registered (hourly at :40 IST).');
+  }
+
   // ─── Deep Skill Image-Gen orphan reset — every 5 minutes ─────────────
   // Standalone cron (NOT registered via registerJob()). Deliberately
   // absent from the Scheduled Jobs admin page — this is infrastructure

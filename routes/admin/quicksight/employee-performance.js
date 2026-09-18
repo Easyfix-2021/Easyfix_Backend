@@ -42,6 +42,44 @@
  * outside), so this report is uploaded by MIS rather than queried — see the
  * service header. Uploading is its own key: whoever prepares the file is not
  * necessarily everyone who may view it.
+ *
+ * LIVE — the same reads over a dashboard object composed from the DATABASE
+ * (open jobs, closed jobs, CRM counts) plus the Excel uploads stored in the
+ * tbl_qs_ep_* tables. services/quicksight/employee-performance/live.service.js
+ * builds and caches it; the numbers are still aggregate.js's. The snapshot
+ * routes above stay as they are until the CRM moves over.
+ *
+ *   GET /live/options?from&to&month        → buildOptions(D) + meta
+ *   GET /live/summary?<filters>            → buildSummary(D, filters) + meta
+ *   GET /live/open-jobs?<filters>&page&pageSize&sortBy&sortDir
+ *   GET /live/technicians?<filters>&page&pageSize&sortBy&sortDir
+ *   GET /live/member?<filters>&name=<CRM name>   (404 MEMBER_NOT_FOUND)
+ *
+ *   The window (the closed jobs and CRM counts read, and D.dates) comes from
+ *   from / to (YYYY-MM-DD) and month (YYYY-MM | ALL): default the current IST
+ *   month 1st .. today; a month alone is that month; at most 3 months; from on
+ *   or before to and not after today; a to after today is read up to today.
+ *   A bad window is a 400 'Validation failed' like any other parameter. meta
+ *   carries the effective window, when the jobs were read, the last upload,
+ *   what is stored per source, and the Unattributed line (live.service header).
+ *
+ *   GET  /live/template                    (upload key) → the 5-sheet .xlsx
+ *   POST /live/upload?dryRun=true|false    (upload key)
+ *     multipart/form-data: file=<the filled .xlsx, max 15 MB>
+ *     dryRun=true (the default) → uploads.previewUpload: the check report,
+ *       nothing saved. dryRun=false → uploads.commitUpload: saved in one
+ *       transaction, the live cache dropped.
+ *     400 unreadable file / blocking errors (details.preview = the report) ·
+ *     409 another save in progress · 503 storage not set up (details.code
+ *     QS_EP_STORAGE_MISSING) until the migration has run.
+ *
+ *     The 15 MB below bounds the COMPRESSED upload and nothing more: an .xlsx
+ *     is a zip and expands, so what the workbook costs to OPEN is capped in
+ *     uploads.service.js (inspectArchive), which measures the archive before
+ *     ExcelJS decompresses it and refuses an oversized one with a 400 of its
+ *     own. The limit lives there, not here, because it is about the file after
+ *     multer has already accepted it — and because commitUpload is reachable
+ *     from anywhere, not only from this route.
  */
 
 const router = require('express').Router();
@@ -55,6 +93,9 @@ const { modernOk, modernError } = require('../../../utils/response');
 const service = require('../../../services/quicksight/quicksight-employee-performance.service');
 const aggregate = require('../../../services/quicksight/employee-performance/aggregate');
 const { buildTemplateWorkbook } = require('../../../services/quicksight/employee-performance/excel-template');
+const live = require('../../../services/quicksight/employee-performance/live.service');
+const uploads = require('../../../services/quicksight/employee-performance/uploads.service');
+const { buildUploadTemplate } = require('../../../services/quicksight/employee-performance/upload-template');
 const { streamWorkbook } = require('../../../utils/xlsx-styled-export');
 const logger = require('../../../logger');
 
@@ -234,5 +275,121 @@ router.get('/member', noStore, validate(memberQuery, 'query'),
     if (!detail) return modernError(res, 404, 'This person has no Employee Performance data', { code: 'MEMBER_NOT_FOUND' });
     return modernOk(res, detail);
   }));
+
+// ─── live reads (database + stored uploads) ─────────────────────────────
+
+const MONTH = FILTER_KEYS.month;
+
+/*
+ * The live window is validated — and DEFAULTED — here, so a bad one is the same
+ * 'Validation failed' 400 as any other parameter, and from / to reach the
+ * handler as the effective window (live.resolveLiveWindow).
+ */
+const withLiveWindow = (schema) => schema.custom((value, helpers) => {
+  try {
+    const w = live.resolveLiveWindow({ from: value.from, to: value.to, month: value.month });
+    return { ...value, from: w.from, to: w.to };
+  } catch (err) {
+    if (err && err.status === 400) return helpers.message(err.message);
+    throw err;
+  }
+}, 'live window');
+
+const liveOptionsQuery = withLiveWindow(Joi.object({ from: DATE, to: DATE, month: MONTH, v: Joi.any().strip() }));
+const liveSummaryQuery = withLiveWindow(Joi.object(FILTER_KEYS));
+const liveOpenJobsQuery = withLiveWindow(Joi.object({ ...FILTER_KEYS, ...pagingKeys(aggregate.OPEN_JOB_SORT_KEYS) }));
+const liveTechniciansQuery = withLiveWindow(Joi.object({ ...FILTER_KEYS, ...pagingKeys(aggregate.TECHNICIAN_SORT_KEYS) }));
+const liveMemberQuery = withLiveWindow(Joi.object({ ...FILTER_KEYS, name: Joi.string().max(NAME_MAX).required() }));
+
+// Build (or reuse) the live D for the validated window.
+const fromLive = (build) => async (req, res, next) => {
+  try {
+    const result = await live.buildLiveD({ from: req.query.from, to: req.query.to });
+    return build(result, req, res);
+  } catch (err) {
+    // 400 a window the service refuses, 422 more jobs than the export ceiling.
+    if (err && (err.status === 400 || err.status === 422)) return modernError(res, err.status, err.message);
+    return next(err);
+  }
+};
+
+router.get('/live/options', noStore, validate(liveOptionsQuery, 'query'),
+  fromLive(({ D, meta }, _req, res) => modernOk(res, { ...aggregate.buildOptions(D), meta })));
+
+router.get('/live/summary', noStore, validate(liveSummaryQuery, 'query'),
+  fromLive(({ D, meta }, req, res) => modernOk(res, { ...aggregate.buildSummary(D, filtersOf(req.query)), meta })));
+
+router.get('/live/open-jobs', noStore, validate(liveOpenJobsQuery, 'query'),
+  fromLive(({ D }, req, res) => modernOk(res, aggregate.pageOpenJobs(D, filtersOf(req.query), pagingOf(req.query)))));
+
+router.get('/live/technicians', noStore, validate(liveTechniciansQuery, 'query'),
+  fromLive(({ D }, req, res) => modernOk(res, aggregate.pageTechnicians(D, filtersOf(req.query), pagingOf(req.query)))));
+
+router.get('/live/member', noStore, validate(liveMemberQuery, 'query'),
+  fromLive(({ D }, req, res) => {
+    const detail = aggregate.memberDetail(D, filtersOf(req.query), req.query.name);
+    if (!detail) return modernError(res, 404, 'This person has no Employee Performance data', { code: 'MEMBER_NOT_FOUND' });
+    return modernOk(res, detail);
+  }));
+
+// ─── live uploads (the 5 MIS sheets) ────────────────────────────────────
+
+// The COMPRESSED .xlsx only — see the header. What it expands to when ExcelJS
+// opens it is capped in uploads.service.js, which measures the zip first.
+const XLSX_MAX_MB = 15;
+const xlsxUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: XLSX_MAX_MB * 1024 * 1024, files: 1 },
+  fileFilter(_req, file, cb) {
+    if (!/\.xlsx$/i.test(file.originalname)) {
+      return cb(Object.assign(new Error('Only the filled .xlsx template is accepted'), { status: 400 }));
+    }
+    cb(null, true);
+  },
+});
+
+function singleXlsx(req, res, next) {
+  xlsxUpload.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      return modernError(res, 400, err.code === 'LIMIT_FILE_SIZE' ? `The file is too large (max ${XLSX_MAX_MB} MB)` : err.message);
+    }
+    if (err.status === 400) return modernError(res, 400, err.message);
+    return next(err);
+  });
+}
+
+// Preview unless the caller explicitly confirms: a missing flag never saves.
+const liveUploadQuery = Joi.object({ dryRun: Joi.boolean().default(true), v: Joi.any().strip() });
+
+router.get('/live/template', noStore, requireAction(UPLOAD_KEY), async (_req, res, next) => {
+  try {
+    return await streamWorkbook(res, 'employee-performance-upload-template.xlsx', buildUploadTemplate());
+  } catch (err) { return next(err); }
+});
+
+router.post('/live/upload', noStore, requireAction(UPLOAD_KEY), validate(liveUploadQuery, 'query'), singleXlsx,
+  async (req, res, next) => {
+    try {
+      if (!req.file) return modernError(res, 400, 'Choose the filled .xlsx template to upload');
+      if (req.query.dryRun) {
+        return modernOk(res, await uploads.previewUpload(req.file.buffer));
+      }
+      const result = await uploads.commitUpload(req.file.buffer, {
+        userId: Number(req.user.user_id),
+        fileName: req.file.originalname,
+      });
+      live.invalidateLiveCache();
+      logger.info('Employee Performance uploads saved', { batchId: result.batchId, userId: req.user.user_id, ...result.saved });
+      return modernOk(res, result, 'Employee Performance uploads saved');
+    } catch (err) {
+      if (err && err.status === 400) {
+        return modernError(res, 400, err.message, err.preview ? { code: 'QS_EP_UPLOAD_BLOCKED', preview: err.preview } : undefined);
+      }
+      if (err && err.status === 409) return modernError(res, 409, err.message, { code: 'QS_EP_UPLOAD_BUSY' });
+      if (err && err.status === 503) return modernError(res, 503, err.message, { code: err.code || 'QS_EP_STORAGE_MISSING' });
+      return next(err);
+    }
+  });
 
 module.exports = router;
