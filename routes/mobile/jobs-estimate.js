@@ -248,18 +248,27 @@ router.get('/:id/work-progress', validate(idParam, 'params'), async (req, res, n
 // under /api/mobile/* is — the shared `router.use(idempotency())` mounted in
 // routes/mobile/index.js already wraps this route, so a retried key replays
 // the first response instead of creating a second request.
+// camelCase like every other mobile body in this file (quotationBody's itemId)
+// — the app speaks camelCase on the wire; the service and the table keep
+// snake_case, so the route maps at the boundary.
 const materialRequestBody = Joi.object({
-  material_name:  Joi.string().trim().min(1).max(200).required(),
-  brand_name:     Joi.string().trim().max(150).allow('', null).optional(),
-  expected_price: Joi.number().min(0).allow(null).optional(),
-  qty:            Joi.number().min(0).allow(null).optional(),
-  note:           Joi.string().trim().max(500).allow('', null).optional(),
+  materialName:  Joi.string().trim().min(1).max(200).required(),
+  brandName:     Joi.string().trim().max(150).allow('', null).optional(),
+  expectedPrice: Joi.number().min(0).allow(null).optional(),
+  quantity:      Joi.number().min(0).allow(null).optional(),
+  note:          Joi.string().trim().max(500).allow('', null).optional(),
 });
 
 router.post('/:id/material-request', validate(idParam, 'params'), validate(materialRequestBody), async (req, res, next) => {
   try {
-    logger.info('Raise material add request · jobId=' + req.params.id + ' · name=' + req.body.material_name);
-    const out = await materialRequestService.createFromJob(Number(req.params.id), req.tech.efr_id, req.body);
+    logger.info('Raise material add request · jobId=' + req.params.id + ' · name=' + req.body.materialName);
+    const out = await materialRequestService.createFromJob(Number(req.params.id), req.tech.efr_id, {
+      material_name: req.body.materialName,
+      brand_name: req.body.brandName,
+      expected_price: req.body.expectedPrice,
+      qty: req.body.quantity,
+      note: req.body.note,
+    });
     res.status(201);
     modernOk(res, out);
   } catch (e) { logger.warn('Raise material add request failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }

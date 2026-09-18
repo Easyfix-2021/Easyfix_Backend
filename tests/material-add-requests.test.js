@@ -377,7 +377,9 @@ test('POST /jobs/:id/material-request with a repeated Idempotency-Key creates on
     const post = () => fetch(`${baseUrl}/jobs/900/material-request`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'idempotency-key': 'mat-req-key-1' },
-      body: JSON.stringify({ material_name: 'Silicone Sealant' }),
+      // camelCase on the wire, like every other mobile body in this router —
+      // the app sends materialName; the route maps it to the service's key.
+      body: JSON.stringify({ materialName: 'Silicone Sealant' }),
     });
 
     const first = await post();
@@ -390,6 +392,8 @@ test('POST /jobs/:id/material-request with a repeated Idempotency-Key creates on
     assert.equal(second.headers.get('idempotent-replay'), 'true');
     assert.deepEqual(secondBody, firstBody);
     assert.equal(Object.keys(REQUESTS).length, 1, 'the retried key must not create a second row');
+    assert.equal(Object.values(REQUESTS)[0].material_name, 'Silicone Sealant', 'the camelCase wire field must reach the stored snake_case column');
+
 
     const insertCalls = fake.calls.filter((c) => /INSERT INTO tbl_material_add_request/i.test(c.sql));
     assert.equal(insertCalls.length, 1);
@@ -407,4 +411,22 @@ test('services/material-request.service.js: request_status is CAST before reachi
     .map((list) => list.replace(/CAST\([^)]*\)\s+AS\s+\w+/gi, ''))
     .filter((list) => FLAG.test(list));
   assert.deepEqual(offenders, [], 'bare TINYINT request_status in a SELECT list');
+});
+
+/* The app posts camelCase (like every other mobile body in jobs-estimate.js —
+   quotationBody's itemId), while the service and the table speak snake_case.
+   A rename on either side of that boundary breaks the app with a 400 that no
+   service-level test can see, so assert the boundary itself. */
+test('mobile material-request body is camelCase and maps to the service snake_case keys', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'routes', 'mobile', 'jobs-estimate.js'), 'utf8');
+  const marker = "router.post('/:id/material-request'";
+  const body = src.slice(src.indexOf('const materialRequestBody'), src.indexOf(marker));
+  assert.ok(body.length > 0, 'materialRequestBody should be declared before the route');
+  for (const key of ['materialName', 'brandName', 'expectedPrice', 'quantity']) {
+    assert.match(body, new RegExp(`\\b${key}\\s*:`), `${key} must be accepted on the wire`);
+  }
+  assert.doesNotMatch(body, /\bmaterial_name\s*:/, 'the wire body must not use snake_case');
+  const handler = src.slice(src.indexOf(marker));
+  assert.match(handler, /material_name:\s*req\.body\.materialName/, 'the route maps the wire field to the service key');
+  assert.match(handler, /qty:\s*req\.body\.quantity/, 'quantity maps to the service qty key');
 });
