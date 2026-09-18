@@ -20,12 +20,24 @@ const {
   stageVisible,
 } = require('../lib/job-stages');
 
-test('STAGE_KEYS is the pinned set of 9 keys', () => {
+test('STAGE_KEYS is the pinned set of 10 keys', () => {
+  // REPINNED 2026-09-18: 'pending-material' (status 16) added here and in the
+  // CRM's mirror in the same change — without a stage, a stage-restricted PM
+  // could never see the jobs they are meant to review.
   assert.deepEqual([...STAGE_KEYS].sort(), [
     'audit-complete', 'cancelled', 'completed', 'estimate-pending', 'onhold',
-    'pending-close', 'pending-feedback', 'pending-scheduling',
-    'pending-start', 'unconfirmed',
+    'pending-close', 'pending-feedback', 'pending-material',
+    'pending-scheduling', 'pending-start', 'unconfirmed',
   ]);
+});
+
+test('status 16 is owned by pending-material, and pending-close can reach it', () => {
+  assert.equal(stageOfStatus(16), 'pending-material');
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-close'] }, 2, 16), true);
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-material'] }, 16, 15), true);
+  // A PM holding only pending-material can see a 16 job and send it to 15,
+  // but cannot reach an unrelated status from it.
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-material'] }, 16, 10), false);
 });
 
 test('stageOfStatus maps statuses to their single stage; unknowns → null', () => {
