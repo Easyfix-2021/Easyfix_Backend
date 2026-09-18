@@ -71,6 +71,29 @@ test('a failing cost write (column not migrated) still stores the transcript and
   } finally { fake.restore(); }
 });
 
+/*
+ * A conference call has one tbl_plivo_call_log row per LEG, all sharing the
+ * job_caller_info_id, so an ungrouped JOIN hands the cron the same call once per
+ * leg. Verified read-only against the QA database with every log row duplicated:
+ * ungrouped 18 -> 36 rows, grouped stays 18, and `LIMIT 10` ungrouped covered
+ * only 5 distinct calls — the duplicates ate the batch.
+ */
+test('the eligibility query returns ONE row per call, not one per conference leg', async () => {
+  const plivo = require('../services/plivo.service');
+  const originalEnabled = plivo.transcriptionEnabled;
+  plivo.transcriptionEnabled = () => true;
+  const fake = installFakePool();
+  const cron = require('../services/call-transcription-cron');
+  try {
+    await cron.runTranscriptionBackfill({ limit: 5 });
+    const select = fake.calls.find((c) => /FROM tbl_job_caller_info/.test(c.sql));
+    assert.match(select.sql, /GROUP BY\s+jci\.job_caller_info/, 'one row per call');
+    // The grouped columns must be aggregated, or MySQL's ONLY_FULL_GROUP_BY rejects the query.
+    assert.match(select.sql, /MAX\(pcl\.transcription_status\)/);
+    assert.match(select.sql, /MAX\(pcl\.transcription_fetched_at\)/);
+  } finally { fake.restore(); plivo.transcriptionEnabled = originalEnabled; }
+});
+
 test('the backfill cron binds MIN_TRANSCRIBE_SECONDS as its call-duration floor', async () => {
   const plivo = require('../services/plivo.service');
   const originalEnabled = plivo.transcriptionEnabled;
