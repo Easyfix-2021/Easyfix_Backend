@@ -153,6 +153,15 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
     else if (row.approval_reject_date_time) status = 'rejected';
     else if (!isEstimateApprovable(row.job_status)) status = 'under_review';
 
+    // Ops Material Approval (sub-project E, 2026-09-18): the magic-link page
+    // shows the SAME materials + totals as the authed client dashboard
+    // (GET /api/client/jobs/:id/estimate-preview) — same helper, so the two
+    // can never disagree. Only Ops-approved (status=1, action_on-stamped)
+    // lines ever surface; see services/job-line-total.js for the filter and
+    // column list.
+    const { estimateLinesForJob } = require('../../services/job-line-total');
+    const { lines: services, materials, totals } = await estimateLinesForJob(jobId);
+
     return modernOk(res, {
       job_id:           row.job_id,
       job_status:       row.job_status,
@@ -161,6 +170,9 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
       service_category: row.service_catg_name,
       client_name:      row.client_name,
       pdf_path:         estimatePdfPath(row.job_id),
+      services,
+      materials,
+      totals,
       status,
       // Action attribution surfaces the legacy "Estimate is approved
       // by X" / "rejected by X" messages on the FE without an extra

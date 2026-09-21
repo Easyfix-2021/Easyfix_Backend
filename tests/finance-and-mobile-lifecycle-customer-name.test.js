@@ -262,9 +262,15 @@ test('finance.js invoice lines still read the row off the `customer_name` alias'
   /*
    * loadInvoiceArtifactData() feeds both /invoices/:id/excel and /pdf. The
    * projection changed; the column name the line builder destructures did not.
+   *
+   * Three branches now, not two: Ops Material Approval billing (2026-09-21,
+   * docs/superpowers/specs/2026-09-18-ops-material-approval-design.md) added a
+   * third line-push for Ops-approved quotation_details materials, alongside
+   * the pre-existing no-services placeholder and per-service branches. All
+   * three must keep mapping the same alias.
    */
   const hits = SRC.finance.match(/customer:\s*j\.customer_name\b/g) || [];
-  assert.equal(hits.length, 2, 'both the no-services and per-service line branches must still map j.customer_name');
+  assert.equal(hits.length, 3, 'the no-services, per-service AND material line branches must all map j.customer_name');
   assert.doesNotMatch(SRC.finance, /customer:\s*j\.job_customer_name\b/,
     'the consumer must read the ALIAS, not the raw column (the fallback lives in SQL)');
 });

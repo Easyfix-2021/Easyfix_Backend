@@ -172,7 +172,70 @@ function computeSnapshot(mode, manifest, paths) {
     hash.update(content);
     hash.update('\0');
   }
-  return { sourceHash: hash.digest('hex'), watchedFileCount: included.length };
+  return { sourceHash: hash.digest('hex'), watchedFileCount: included.length, included };
+}
+
+/*
+ * Which watched paths moved — not merely that the aggregate hash did.
+ *
+ * The state file records one SHA-256 over the whole watched set, so it cannot
+ * name a path by itself. But the commit that last WROTE it is a free baseline:
+ * anything watched that differs from that commit is, by construction, what has
+ * moved since the hash was taken. STATE_RELATIVE is not itself watched, so it
+ * never appears in its own report.
+ *
+ * Best-effort by design. Every git call here allows failure and the caller
+ * degrades to the count delta alone, because this runs INSIDE the failure path:
+ * a shallow clone, or a tree without that commit, must still produce the plain
+ * "stale" message rather than a stack trace.
+ */
+function movedWatchedPaths(mode, manifest, included) {
+  const baseline = runGit(['log', '-1', '--format=%H', '--', STATE_RELATIVE], { allowFailure: true });
+  const commit = String(baseline || '').trim();
+  if (!commit) return null;
+
+  const tree = runGit(['ls-tree', '-r', '--name-only', '-z', commit], { allowFailure: true, encoding: null });
+  if (tree == null) return null;
+  const before = new Set(splitNull(tree).filter((relativePath) => isWatched(relativePath, manifest)));
+  const now = new Set(included);
+
+  const changed = runGit(
+    mode === 'staged'
+      ? ['diff', '--cached', '--name-only', '-z', commit, '--']
+      : ['diff', '--name-only', '-z', commit, '--'],
+    { allowFailure: true, encoding: null },
+  );
+
+  return {
+    added: included.filter((relativePath) => !before.has(relativePath)),
+    removed: [...before].filter((relativePath) => !now.has(relativePath)).sort(),
+    // before.has && now.has already implies watched: both sets are watched-only.
+    modified: changed == null ? [] : splitNull(changed)
+      .filter((relativePath) => before.has(relativePath) && now.has(relativePath))
+      .sort(),
+  };
+}
+
+function summarizePaths(label, paths, lines) {
+  if (!paths.length) return;
+  const shown = paths.slice(0, 10);
+  const extra = paths.length - shown.length;
+  lines.push(`  ${label} ${shown.join(', ')}${extra ? ` (+${extra} more)` : ''}`);
+}
+
+/*
+ * Name the cure, but only to the clone that needs it.
+ *
+ * .githooks/pre-commit runs this checker with --fix, so a clone that ran
+ * `npm run hooks:install` re-records the state file on every commit and cannot
+ * reach this failure by accident — repeating the advice there is noise. A CI
+ * checkout never installs hooks, which is exactly who this line is for: the
+ * failure surfaces in CI, so CI is where the permanent fix has to be named.
+ */
+function hooksNudge() {
+  const configured = runGit(['config', '--get', 'core.hooksPath'], { allowFailure: true });
+  if (String(configured || '').trim() === '.githooks') return [];
+  return ['  this clone has no pre-commit hook: run `npm run hooks:install` once and it re-records this file for you'];
 }
 
 function changedStagedPaths() {
@@ -266,10 +329,25 @@ function check(mode, ifRelevant, fix) {
     return;
   }
   if (stale) {
-    fail(
-      `stale ${STATE_RELATIVE}; review the offline contract, then run `
+    const lines = [`stale ${STATE_RELATIVE}`];
+    if (Number(recorded.watchedFileCount) !== actual.watchedFileCount) {
+      lines.push(`  watched file count: ${recorded.watchedFileCount} -> ${actual.watchedFileCount}`);
+    }
+    const moved = movedWatchedPaths(mode, manifest, actual.included);
+    if (moved === null) {
+      lines.push('  (the commit that last recorded it is unreadable here, so no path list)');
+    } else if (!moved.added.length && !moved.removed.length && !moved.modified.length) {
+      lines.push('  no watched path differs from the recording commit — the state file itself was edited or reverted');
+    } else {
+      summarizePaths('added:   ', moved.added, lines);
+      summarizePaths('removed: ', moved.removed, lines);
+      summarizePaths('modified:', moved.modified, lines);
+    }
+    lines.push(
+      `review the offline contract, then run `
       + `npm run offline:record${mode === 'worktree' ? ':worktree' : ''} and stage the state file`,
     );
+    fail([...lines, ...hooksNudge()].join('\n'));
   }
   console.log(`offline-reliability-sync: OK (${mode}, ${actual.watchedFileCount} watched files)`);
 }

@@ -6157,7 +6157,7 @@ async function hasAfterWorkPhoto(jobId) {
   return rows.length > 0;
 }
 
-async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { partnerApi = false } = {}) {
+async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { partnerApi = false, conn: externalConn = null } = {}) {
   logger.info('Set job status · id=' + jobId + ' · status=' + status + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     logger.warn('Set status rejected, invalid status · id=' + jobId + ' · status=' + status);
@@ -6417,7 +6417,15 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
         + ' · fix the job, then a CRM move into 3/5 or the backfill posts it');
     }
   } else {
-    await pool.query(updateSql, values);
+    /*
+     * Ops Material Review (sub-project E, 2026-09-18) hands its OWN open
+     * transaction here via `conn` so the quotation_details line writes it
+     * already did and this job_status move commit or roll back together —
+     * a line write failing must leave the job at 16, not partway to 15. Every
+     * other caller omits `conn` and gets the pre-existing pool.query
+     * behaviour unchanged.
+     */
+    await (externalConn || pool).query(updateSql, values);
     if (entersCompletion) {
       logger.warn('Completed without a CRM user · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
         + ' · ledger not posted; the next CRM move into 3/5 or the backfill posts it');

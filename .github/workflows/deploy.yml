@@ -182,6 +182,23 @@ jobs:
         env:
           EASYFIX_CRM_UI_DIR: ${{ runner.temp }}/easyfix-crm-ui
         run: npm test
+      # STRICT (no --fix) counterpart to the pre-commit hook, and the ONLY place a
+      # direct push to QA ever meets it. ci.yml carries this same step but fires
+      # on `pull_request` alone, so the operation QA actually advances by —
+      # `git merge HotFix && git push origin QA` — never ran it. QA drifted seven
+      # watched files over six days that way (2026-09-11 → 09-17): five migrations
+      # plus routes/mobile/activity-log.js, with routes/mobile/index.js and the
+      # manifest itself edited. That is a real contract change, not just migrations.
+      #
+      # The automatic --fix cannot cover this: git does not run pre-commit for a
+      # merge commit, so the one operation that most needs the refresh is the one
+      # the hook never sees. Step 3 of docs/PROMOTION_RUNBOOK.md
+      # (`npm run offline:record:worktree`) is the manual remedy, and this step is
+      # what makes it load-bearing rather than advisory.
+      #
+      # Read-only: no backend, DB, or network.
+      - name: Offline reliability contract in sync
+        run: npm run check:offline
 
   build-and-push:
     name: Build image & push to ECR

@@ -134,22 +134,32 @@ async function loadInvoiceArtifactData(invoiceId) {
 
   const jobIds = jobs.map((j) => j.job_id);
   const servicesByJob = new Map();
+  const materialsByJob = new Map();
   if (jobIds.length > 0) {
     /*
      * One query for every job on the invoice — see services/job-line-total.js.
      * It also carries the soft-delete policy: this query used to have no
      * job_service_status filter, so invoices billed for services ops had
      * REMOVED. Every other reader in the backend already excluded them.
+     *
+     * `materials` (Ops-approved quotation_details lines, sub-project E) is now
+     * carried through too — see the header-total comment in /invoices/generate
+     * below for why billing folds these in the same way the client estimate
+     * already does.
      */
     const { estimateLinesForJobs } = require('../../services/job-line-total');
     const byJob = await estimateLinesForJobs(jobIds);
-    for (const [jobId, { lines: jobLines }] of byJob) servicesByJob.set(jobId, jobLines);
+    for (const [jobId, { lines: jobLines, materials: jobMaterials }] of byJob) {
+      servicesByJob.set(jobId, jobLines);
+      materialsByJob.set(jobId, jobMaterials);
+    }
   }
 
   const lines = [];
   for (const j of jobs) {
     const svcs = servicesByJob.get(j.job_id) || [];
-    if (svcs.length === 0) {
+    const mats = materialsByJob.get(j.job_id) || [];
+    if (svcs.length === 0 && mats.length === 0) {
       lines.push({
         job_id: j.job_id, job_ref: j.job_reference_id, client_ref: j.client_ref_id,
         customer: j.customer_name, mobile: j.customer_mob_no, city: j.city_name,
@@ -168,6 +178,17 @@ async function loadInvoiceArtifactData(invoiceId) {
           completed_on: j.checkout_date_time,
           service: s.service_name || '—', quantity: qty,
           unit_charge: charge, material: mat, line_total: s.line_total,
+        });
+      }
+      // One printed line per Ops-approved material (never the technician's
+      // unit_price — approvedMaterialLinesForJobs never selects it).
+      for (const m of mats) {
+        lines.push({
+          job_id: j.job_id, job_ref: j.job_reference_id, client_ref: j.client_ref_id,
+          customer: j.customer_name, mobile: j.customer_mob_no, city: j.city_name,
+          completed_on: j.checkout_date_time,
+          service: m.name || 'Material', quantity: Number(m.unit || 1),
+          unit_charge: 0, material: m.approved_charge, line_total: m.approved_charge,
         });
       }
     }
@@ -234,27 +255,32 @@ router.post('/invoices/generate', validate(Joi.object({
     if (!guard.ok) return modernError(res, 403, 'client outside your scope');
     /*
      * The invoice header total. It MUST equal the sum of the lines the invoice
-     * itself prints, and until 2026-09-09 it did not.
+     * itself prints, and until 2026-09-09 it did not (material_charge was the
+     * gap then). Now the same equality is at risk again from a second material
+     * source: Ops-approved quotation_details lines (sub-project E,
+     * docs/superpowers/specs/2026-09-18-ops-material-approval-design.md), which
+     * that design explicitly left OUT of billing — "Job billing is unchanged in
+     * this release; the invoice side is a separate piece." The owner has since
+     * asked for that piece: "The approved amount should be there in billing."
      *
-     * loadInvoiceArtifactData above builds every line as
-     *   line_total: charge * qty + mat        (finance.js, the `lines.push` above)
-     * while this header summed `total_charge * quantity` and dropped the
-     * material charge entirely. So a client invoiced for jobs carrying material
-     * received a document whose printed lines added up to more than the amount
-     * it billed — and the shortfall was invisible, because nothing on the PDF
-     * shows the two being compared.
+     * loadInvoiceArtifactData above now prints one line per Ops-approved
+     * material (job-line-total's `materials`), so the header has to add the
+     * same sum or the header/lines divergence this comment used to describe
+     * for material_charge would reopen for approved_charge instead.
      *
-     * It was not only a display fault. The payment reconciliation below
-     * (`fullyPaid = (newPaid + newTds) >= total_invoice_amount`) gates on THIS
-     * number, so an invoice was marked fully paid while the client still owed
-     * the material component of every line on it.
-     *
-     * COALESCE per column, not around the SUM: material_charge is NULL on most
-     * rows, and `x * y + NULL` is NULL in MySQL — which would have zeroed the
-     * whole line rather than the missing term, converting an under-count into
-     * a much larger one.
+     * BILLABLE-TIMING: approved (Ops) is enough, no separate client-approval
+     * gate. Nothing on quotation_details records client approval per line —
+     * that lives at job level (status 15/16, the estimate-approval workflow in
+     * routes/admin/jobs.js and routes/client/index.js). This query only ever
+     * covers job_status IN (3,5) — COMPLETED — jobs that have already passed
+     * through that whole lifecycle, so by the time a job reaches an invoice its
+     * estimate (materials included) was already put to the client. Gating here
+     * on Ops-approval alone matches the gate job-line-total.js already uses for
+     * the client's own estimate view (status = 1 AND action_on IS NOT NULL);
+     * adding a second, invoice-only gate would just be a second definition of
+     * "approved" to keep in sync.
      */
-    const { LINE_TOTAL_SQL, ACTIVE_SERVICES_SQL } = require('../../services/job-line-total');
+    const { LINE_TOTAL_SQL, ACTIVE_SERVICES_SQL, approvedMaterialLinesForJobs } = require('../../services/job-line-total');
     /*
      * The expression is INTERPOLATED, not copied. This aggregates across a date
      * range rather than a job-id list, so it has to stay SQL — which is exactly
@@ -275,6 +301,27 @@ router.post('/invoices/generate', validate(Joi.object({
         WHERE j.fk_client_id = ? AND j.job_status IN (3,5)
           AND j.checkout_date_time BETWEEN ? AND ?`,
       [clientId, from, to]);
+    /*
+     * Approved materials, folded in on top of the (unchanged) service total
+     * above — the ONE point every billing reader routes through for them
+     * (loadInvoiceArtifactData uses the same approvedMaterialLinesForJobs via
+     * estimateLinesForJobs). A second query rather than a JOIN into the
+     * aggregate above: joining quotation_details alongside tbl_job_services in
+     * one query would fan out the material rows by the number of service rows
+     * on the same job (and vice versa), over-counting both — the two have no
+     * shared key to join on other than job_id.
+     */
+    const [jobIdRows] = await pool.query(
+      `SELECT job_id FROM tbl_job
+        WHERE fk_client_id = ? AND job_status IN (3,5)
+          AND checkout_date_time BETWEEN ? AND ?`,
+      [clientId, from, to]);
+    const materialsByJob = await approvedMaterialLinesForJobs(jobIdRows.map((r) => r.job_id));
+    let total = Number(sum.total || 0);
+    for (const materials of materialsByJob.values()) {
+      for (const m of materials) total += Number(m.approved_charge || 0);
+    }
+    total = Math.round(total * 100) / 100;
     // VERIFIED — only columns present in Invoice.java JPA model are
     // written. `updated_by` is NOT a real column on tbl_client_invoice.
     const [ins] = await pool.query(
@@ -282,10 +329,10 @@ router.post('/invoices/generate', validate(Joi.object({
           current_due_amount, total_invoice_amount, total_paid_amount,
           is_raised, is_paid, invoice_date)
        VALUES (?, ?, ?, ?, ?, 0, 1, 0, DATE(?))`,
-      [clientId, from, to, sum.total, sum.total, new Date()]);
+      [clientId, from, to, total, total, new Date()]);
     res.status(201);
     logger.info('Invoice generated · id=' + ins.insertId + ' clientId=' + clientId + ' jobCount=' + sum.jobCount);
-    modernOk(res, { invoiceId: ins.insertId, jobCount: sum.jobCount, totalAmount: sum.total }, 'invoice generated');
+    modernOk(res, { invoiceId: ins.insertId, jobCount: sum.jobCount, totalAmount: total }, 'invoice generated');
   } catch (e) { next(e); }
 });
 
