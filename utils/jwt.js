@@ -232,12 +232,14 @@ function verifyJobShareLinkToken(token) {
   } catch (_err) {
     const e = new Error('invalid link');
     e.status = 404;
+    e.details = { code: 'share_not_found' };
     throw e;
   }
   const id = Number(String(decoded?.sub || '').replace(/^sharelink:/, ''));
   if (decoded?.type !== 'job_share_link' || !Number.isInteger(id) || id <= 0) {
     const e = new Error('invalid link');
     e.status = 404;
+    e.details = { code: 'share_not_found' };
     throw e;
   }
   return id;

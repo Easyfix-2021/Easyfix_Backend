@@ -85,7 +85,14 @@ function corsDelegate(req, callback) {
   const baseOptions = {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    // Idempotency-Key / -Content-Digest: the technician app sends them on job
+    // writes and uploads (offline outbox replay safety). Native fetch never
+    // preflights, but the shared-job WEB link (served from the CRM origin,
+    // calling this backend cross-origin) does — without them here every check-
+    // in, photo attach and checkout fails the preflight before reaching us.
+    // Accept-Language: sent on every app request; listed so a value outside
+    // the CORS-safelisted character set cannot trigger the same failure.
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'Idempotency-Content-Digest', 'Accept-Language'],
   };
 
   // Same-origin / curl / health probes (no Origin header) — allowed.
