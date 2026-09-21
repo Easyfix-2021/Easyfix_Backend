@@ -207,10 +207,58 @@ function verifyEasyfixerProfileToken(token) {
 }
 
 // RETIRED 2026-09-10: signJobShareToken / verifyJobShareToken minted the
-// `job_share` token type for the public /api/public/shared-job/* page. That
-// surface is retired — "share" now means delegating a job to another
-// technician, which is authenticated by the technician's own JWT and needs no
-// link token. Nothing mints or accepts `type: 'job_share'` any more.
+// `job_share` token type for the old public /api/public/shared-job/* page (a
+// view-only page for any job). Nothing mints or accepts `type: 'job_share'`.
+//
+// 2026-09-21: the shared-job WEB LINK is a different thing with its own two
+// types. A contact the technician delegated a job to works it from a web copy
+// of the technician app:
+//   · job_share_link  — in the WhatsApp link. Identifies the share and nothing
+//     else; it grants no job access by itself. No exp: it lives exactly as
+//     long as the share stays live, which every use re-checks.
+//   · job_share_guest — issued after the contact proves the phone with an OTP.
+//     Accepted by requireTechAuth for that ONE job (see
+//     middleware/require-tech-lifecycle-capability.js requireShareGuestScope).
+// Subjects are `sharelink:<id>` / `share:<id>`, never numeric, so no verifier
+// that trusts a bare `sub` can read either as a user id.
+function signJobShareLinkToken(shareId) {
+  return jwt.sign({ sub: `sharelink:${shareId}`, type: 'job_share_link' }, requireSecret());
+}
+
+function verifyJobShareLinkToken(token) {
+  let decoded;
+  try {
+    decoded = jwt.verify(String(token || ''), requireSecret());
+  } catch (_err) {
+    const e = new Error('invalid link');
+    e.status = 404;
+    throw e;
+  }
+  const id = Number(String(decoded?.sub || '').replace(/^sharelink:/, ''));
+  if (decoded?.type !== 'job_share_link' || !Number.isInteger(id) || id <= 0) {
+    const e = new Error('invalid link');
+    e.status = 404;
+    throw e;
+  }
+  return id;
+}
+
+function signJobShareGuestToken({ shareId, jobId }) {
+  return jwt.sign(
+    { sub: `share:${shareId}`, type: 'job_share_guest', jobId: Number(jobId) },
+    requireSecret(),
+    { expiresIn: '30d' },
+  );
+}
+
+/** Returns { shareId, jobId } for a verified PAYLOAD, or null when it is not a guest token. */
+function jobShareGuestClaims(payload) {
+  if (!payload || payload.type !== 'job_share_guest') return null;
+  const shareId = Number(String(payload.sub || '').replace(/^share:/, ''));
+  const jobId = Number(payload.jobId);
+  if (!Number.isInteger(shareId) || shareId <= 0 || !Number.isInteger(jobId) || jobId <= 0) return null;
+  return { shareId, jobId };
+}
 
 /**
  * Verify a customer-facing estimate-approval link token.
@@ -276,4 +324,8 @@ module.exports = {
   signEasyfixerProfileToken,
   verifyEasyfixerProfileToken,
   verifyEstimateToken,
+  signJobShareLinkToken,
+  verifyJobShareLinkToken,
+  signJobShareGuestToken,
+  jobShareGuestClaims,
 };

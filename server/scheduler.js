@@ -625,56 +625,10 @@ Why this matters: without this, a job offered to technicians who never respond w
     logger.info('Job-offer expiry cron registered (job.offer_expiry.enabled=true, every 2 min IST).');
   }
 
-  // ─── Job-share (delegation) TTL sweep — every 10 minutes ─────────────
-  // (Added 2026-09-10) A technician can delegate a job to another technician.
-  // While that share is live the original technician is read-only, so a share
-  // nobody answers would strand the job on BOTH phones. This expires the ones
-  // that stalled before work began. A STARTED share is never swept — once the
-  // delegate is on site only ops may end it (POST /admin/jobs/:id/share/release).
-  // Same always-on kill-switch shape as the offer-expiry sweep above: one small
-  // indexed query, and the alternative (stranded jobs) is worse.
-  const jobShareDelegation = require('../services/job-share-delegation.service');
-  const shareExpiryJob = registerJob({
-    id: 'job-share-expiry',
-    name: 'Shared Job Auto-Expiry',
-    description:
-`What this task does: A technician can share (delegate) one of their jobs to another technician. Until the other technician answers, the job is frozen for the original — they cannot start work, raise an estimate, or ask for site permission. This task stops a share from freezing a job forever. Step by step:
-  1. Every 10 minutes, the task wakes up automatically.
-  2. It finds every share that is still waiting to be answered, or was accepted but never actually started, and has been sitting like that for longer than the time limit (currently ${jobShareDelegation.ttlHours()} hours — read from the service itself, changeable with the JOB_SHARE_TTL_HOURS setting).
-  3. It marks each of those shares "expired". The job goes straight back to the original technician, who can work on it again immediately or share it with somebody else.
-  4. A share where the other technician HAS already started work is deliberately left alone — someone is on site doing the job, and only ops can end that, from the CRM.
-  5. It logs how many shares were eligible and how many it expired — visible in the server logs and on this page (Last Run details below).
-
-Why this matters: a share that nobody answers is worse than no share at all, because it takes the job away from the technician who was assigned it without giving it to anybody else.
-
-Note: this task only runs if the property "job.share_expiry.enabled" is not set to "false" in easyfix_properties (it is ON by default). Changing it takes effect after a restart.`,
-    cron: '*/10 * * * *',
-    runner: async () => {
-      const result = await jobShareDelegation.expireStaleShares();
-      logger.info(
-        `Job-share expiry cron · eligible=${result.eligible} · expired=${result.expired}`
-        + (result.skipped ? ' (skipped: delegation migration not applied)' : ` · ttlHours=${result.ttlHours}`),
-      );
-      return result;
-    },
-  });
-  // Always-on infra cron → default-ON kill-switch (set 'false' to disable).
-  const shareExpiryEnabled =
-    String(getProperty('job.share_expiry.enabled') ?? '').toLowerCase() !== 'false';
-  if (cronDisabled) {
-    shareExpiryJob.skipReason = 'CRON_DISABLED=true';
-  } else if (!shareExpiryEnabled) {
-    shareExpiryJob.skipReason = "property 'job.share_expiry.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
-    logger.info("Job-share expiry cron SKIPPED — job.share_expiry.enabled=false in easyfix_properties (set 'true' + restart to enable).");
-  } else {
-    shareExpiryJob.task = cron.schedule(
-      shareExpiryJob.cron,
-      () => invokeJob(shareExpiryJob, 'cron'),
-      { timezone: TZ },
-    );
-    shareExpiryJob.registered = true;
-    logger.info('Job-share expiry cron registered (job.share_expiry.enabled=true, every 10 min IST).');
-  }
+  // Job-share TTL sweep REMOVED 2026-09-21: by the owner's rule a share ends
+  // only by the sharer cancelling (before work starts), the delegate completing
+  // the job, or ops revoking it from the CRM — never by elapsed time. See
+  // services/job-share-delegation.service.js "HOW A SHARE ENDS".
 
   // ─── Job-offer escalation reminder — every 2 minutes ─────────────────
   // (Added 2026-07-29) Re-pushes offers that are still open and unanswered

@@ -28,10 +28,17 @@
  * below. The read is the friendly error; the index is the guarantee. A racing
  * second INSERT surfaces as ER_DUP_ENTRY and is mapped to the same 409.
  *
- * ── WHAT IS DELIBERATELY NOT HERE ──
- * The non-technician (public link) delegate. `contact_name` / `contact_number`
- * are accepted and stored so that path needs no second migration, but nothing
- * in this release turns them into a reachable surface.
+ * ── THE CONTACT DELEGATE (2026-09-21) ──
+ * A share to a plain phone number (`contact_number`, no delegate_efr_id) is
+ * worked from a web copy of the technician app, reached by the WhatsApp link.
+ * The contact proves the phone with an OTP and gets a guest session scoped to
+ * this one job — services/job-share-guest.service.js.
+ *
+ * ── HOW A SHARE ENDS ──
+ * Only three ways, by the owner's rule: the sharer cancels (before work
+ * starts), the delegate COMPLETES the job, or ops revokes it from the CRM.
+ * "Can't Complete Today" keeps it live — the same delegate returns for the
+ * next visit — and there is no time-based expiry (the TTL sweep was removed).
  */
 
 const { pool } = require('../db');
@@ -70,27 +77,15 @@ const TERMINAL_STATUSES = Object.freeze(
  * job.service STATUS COMPLETED(3) / COMPLETED_ALT(5) / CANCELLED(6); imported
  * rather than retyped so a status renumber cannot silently diverge. */
 const { STATUS, delegationColsExist } = require('./job.service');
-const { isAbsentAnswer } = require('../utils/schema-absent-error');
 const NON_SHAREABLE_JOB_STATUSES = new Set([
   STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.CANCELLED,
 ]);
-
-/* Default time a share may sit unstarted before the sweep takes it back. */
-const DEFAULT_TTL_HOURS = 24;
 
 function err(status, message, details) {
   const e = new Error(message);
   e.status = status;
   if (details) e.details = details;
   return e;
-}
-
-/* Hours a pending|accepted share may live. Env override, clamped to something
- * sane so a typo cannot disable the sweep outright. */
-function ttlHours() {
-  const raw = Number(process.env.JOB_SHARE_TTL_HOURS);
-  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_TTL_HOURS;
-  return Math.min(raw, 24 * 30);
 }
 
 /* One projection for every read, so the API shape can never depend on which
@@ -276,6 +271,96 @@ async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactNa
   }
 }
 
+/*
+ * WhatsApp to the person the job was shared with — a team technician (his
+ * efr_no) or a typed/picked contact (contact_number). Without it a contact
+ * share is a dead end: the sharer is locked out and the delegate never hears.
+ *
+ * Best-effort and AFTER the insert, like the supply-gap send: a failed message
+ * never undoes a saved share; the outcome is returned so the app can tell the
+ * sharer to call instead. Only job-level facts go out (service, area, slot) —
+ * never the customer's name, phone or street address, because the number is
+ * whatever the technician typed.
+ *
+ * `job_shared_contact` must match the Gallabox template name exactly, and
+ * bodyValues keys must match its {{variables}}. `link` is a plain URL in the
+ * BODY (not a URL button) so the contact can reopen it as often as the job
+ * needs — start work today, add materials tomorrow.
+ */
+const SHARE_TEMPLATE = 'job_shared_contact';
+
+function istSlot(value) {
+  if (!value) return 'To be confirmed';
+  const d = value instanceof Date ? value : new Date(`${String(value).replace(' ', 'T')}+05:30`);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(d);
+}
+
+/*
+ * The job-level facts a share recipient may see before (and in) the WhatsApp:
+ * service, area, slot, and the sharer's own number. Deliberately NOT the
+ * customer's name, phone or street address.
+ */
+async function shareJobFacts(share) {
+  const [[r]] = await pool.query(
+    `SELECT j.job_id, COALESCE(j.scheduled_date_time, j.requested_date_time) AS slot,
+            sc.service_catg_name, ad.locality, ad.pin_code, ci.city_name,
+            sharer.efr_no AS sharer_no
+       FROM tbl_job j
+       LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+       LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+       LEFT JOIN tbl_city ci ON ci.city_id = ad.city_id
+       LEFT JOIN tbl_easyfixer sharer ON sharer.efr_id = ?
+      WHERE j.job_id = ?
+      LIMIT 1`,
+    [share.sharedByEfrId, share.jobId],
+  );
+  if (!r) return null;
+  const area = [r.locality, r.city_name].filter(Boolean).join(', ')
+    + (r.pin_code ? ` - ${r.pin_code}` : '');
+  return {
+    jobId: Number(r.job_id),
+    service: r.service_catg_name || 'Service job',
+    area: area || 'Shared on call',
+    schedule: istSlot(r.slot),
+    sharerMobile: r.sharer_no ? String(r.sharer_no) : '',
+  };
+}
+
+async function notifyShareRecipient(share, link) {
+  const to = share && share.delegateNumber;
+  if (!to) return { sent: false, reason: 'no recipient number' };
+  try {
+    const facts = await shareJobFacts(share);
+    if (!facts) return { sent: false, reason: 'job not found' };
+    const gallabox = require('./gallabox.whatsapp.service');
+    const result = await gallabox.sendTemplate({
+      to,
+      recipientName: share.delegateName || undefined,
+      templateName: SHARE_TEMPLATE,
+      bodyValues: {
+        contact_name: share.delegateName || 'there',
+        sharer_name: share.sharedByName || 'An EasyFix technician',
+        sharer_mobile: facts.sharerMobile,
+        job_id: String(facts.jobId),
+        service: facts.service,
+        area: facts.area,
+        schedule: facts.schedule,
+        link: link || '',
+      },
+    });
+    const sent = Boolean(result && result.delivered);
+    logger.info(`Job share WhatsApp · shareId=${share.id} · jobId=${share.jobId} · sent=${sent}`);
+    return { sent, reason: sent ? null : (result?.error || (result?.disabled ? 'notifications disabled' : 'not delivered')) };
+  } catch (e) {
+    logger.warn(`Job share WhatsApp failed · shareId=${share.id} · ${e.message}`);
+    return { sent: false, reason: e.message };
+  }
+}
+
 /* ─── The five party-driven transitions ───────────────────────────── */
 
 async function requireLiveShare(jobId) {
@@ -296,6 +381,21 @@ async function acceptShare(jobId, delegateEfrId) {
   const share = await requireLiveShare(jobId);
   if (Number(share.delegate_efr_id) !== Number(delegateEfrId)) throw err(404, 'This job is not shared with you.');
   return toShareJson(await applyTransition(share, 'accepted'), delegateEfrId);
+}
+
+/*
+ * A CONTACT share (no delegate technician) is accepted by the contact proving
+ * the phone with the OTP (services/job-share-guest.service.js) — there is no
+ * Accept button for someone without the app. Pending → accepted; already
+ * accepted/started is a no-op so a second device's verify is not a conflict.
+ */
+async function acceptByContact(shareId) {
+  const share = await findShareById(shareId);
+  if (!share || !LIVE_SET.has(share.status)) {
+    throw err(410, 'This job is no longer shared with you.', { code: 'share_ended' });
+  }
+  if (share.status !== 'pending') return share;
+  return applyTransition(share, 'accepted');
 }
 
 /* Delegate only, pending only. The job returns to the original technician —
@@ -370,52 +470,6 @@ async function resolveLock(jobId, efrId) {
   };
 }
 
-/* ─── The TTL sweep ───────────────────────────────────────────────── */
-
-/*
- * Expire shares that stalled BEFORE the delegate started: pending (never
- * answered) and accepted (answered, never begun). A `started` share is never
- * swept — once work is underway only ops may end it, per the owner's decision.
- *
- * Age is measured from the last thing that happened to the share
- * (responded_on, else created_on) so accepting resets the clock rather than
- * inheriting the pending wait.
- *
- * Per-row and conditional, through applyTransition, so a concurrent accept or
- * cancel wins cleanly instead of being clobbered by a bulk UPDATE.
- */
-async function expireStaleShares({ hours = ttlHours(), limit = 200 } = {}) {
-  try {
-    const now = new Date();
-    const [rows] = await pool.query(
-      `SELECT share_id, job_id, status
-         FROM tbl_job_share_link
-        WHERE status IN ('pending', 'accepted')
-          AND COALESCE(responded_on, created_on) < DATE_SUB(?, INTERVAL ? HOUR)
-        ORDER BY share_id ASC
-        LIMIT ?`,
-      [now, hours, limit],
-    );
-    let expired = 0;
-    for (const row of rows) {
-      try {
-        await applyTransition(row, 'expired', { endReason: 'ttl_expired' });
-        expired += 1;
-      } catch (e) {
-        // 409 = someone answered it between the SELECT and the UPDATE. Expected.
-        if (e.status !== 409) throw e;
-      }
-    }
-    return { eligible: rows.length, expired, ttlHours: hours };
-  } catch (e) {
-    // Table OR column absent (the delegation migration not yet run): nothing
-    // to sweep. ER_NO_SUCH_TABLE alone let the 10-minute cron throw on every
-    // tick against a table that exists without its delegation columns.
-    if (isAbsentAnswer(e)) return { eligible: 0, expired: 0, skipped: true };
-    throw e;
-  }
-}
-
 module.exports = {
   LIVE_STATUSES,
   TERMINAL_STATUSES,
@@ -423,6 +477,11 @@ module.exports = {
   toShareJson,
   findLiveShare,
   createShare,
+  acceptByContact,
+  findShareById,
+  notifyShareRecipient,
+  shareJobFacts,
+  SHARE_TEMPLATE,
   cancelShare,
   acceptShare,
   rejectShare,
@@ -431,6 +490,4 @@ module.exports = {
   releaseShare,
   getShareForViewer,
   resolveLock,
-  expireStaleShares,
-  ttlHours,
 };

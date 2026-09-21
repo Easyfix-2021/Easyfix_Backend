@@ -34,11 +34,12 @@ const { rateLimit } = require('../../middleware/rate-limit');
 router.use('/privacy', require('./privacy'));
 
 router.use('/job-completion', require('./job-completion'));
-// RETIRED 2026-09-10: /shared-job was an unauthenticated 72-hour page a
-// technician could share for any job. "Share" now means DELEGATION to another
-// technician (routes/mobile/job-share.js) — the owner replaced this surface
-// rather than keeping two meanings of the word. The CRM's public page for it
-// lives in another repository and is retired separately.
+// /shared-job (2026-09-21) — entry points of the shared-job WEB LINK: a
+// technician delegates a job to an outside contact, who works it from a web
+// copy of the technician app. The link token grants nothing by itself; these
+// routes show a summary and run the OTP that issues a one-job guest session.
+// (Not the page retired 2026-09-10, which was a view-only page for any job.)
+router.use('/shared-job', require('./shared-job'));
 // Easyfixer-facing profile-update magic-link surface. Token lives in the
 // query string (?token=…) rather than the URL path because the FE keeps the
 // path stable (/profile-update/<jwt>) and proxies the JWT through to the BE

@@ -101,7 +101,9 @@ async function shortenUrl(longUrl, opts = {}, pool) {
       // purpose-agnostic — the prefix only drives readability + the matching FE
       // resolver route (app/public/<flow>/[code]). Old /book/<code> links keep
       // working via the next.config back-compat redirect.
-      const flow = /profile/i.test(purpose || '') ? 'profile' : 'book';
+      // 'job_share' → /public/share/<code> (the shared-job web link).
+      const flow = /profile/i.test(purpose || '') ? 'profile'
+        : /^job_share$/.test(purpose || '') ? 'share' : 'book';
       const shortPath = `/public/${flow}/${code}`;
       logger.info('Short link created · code=' + code + ' · flow=' + flow);
       return {

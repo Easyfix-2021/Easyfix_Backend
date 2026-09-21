@@ -19,7 +19,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const vm = require('node:vm');
 const zlib = require('node:zlib');
 
 process.env.S3_BUCKET_NAME = '';
@@ -46,14 +45,6 @@ const sample = (over = {}) => ({
 });
 // Exactly what build_data.py writes.
 const asDataJs = (d) => Buffer.from(`const D=${JSON.stringify(d)};\n`);
-
-const extractD = (html) => {
-  const m = html.match(/<script>(const D=[\s\S]*?;)<\/script>/);
-  assert.ok(m, 'the data script is present');
-  // Round-tripped through JSON: objects from another realm fail deepStrictEqual
-  // on their prototypes alone.
-  return JSON.parse(JSON.stringify(vm.runInNewContext(`${m[1]} D`)));
-};
 
 test('accepts the data.js build_data.py writes and summarises it', () => {
   const { data, summary } = service.parseDashboardData(asDataJs(sample()));
@@ -91,13 +82,40 @@ test('names the missing / malformed keys of a wrong JSON file', () => {
     (e) => e.status === 400 && /no employees/.test(e.message));
 });
 
-test('the shipped template has the line the data is injected into', () => {
-  assert.doesNotThrow(() => service._internals.dashboardTemplate());
+test('rejects malformed rows at upload instead of failing every read later', () => {
+  const rejects = (over, pattern) => assert.throws(
+    () => service.parseDashboardData(asDataJs(sample(over))),
+    (e) => e.status === 400 && pattern.test(e.message),
+    pattern.source,
+  );
+  const emp = (fields) => ({ employees: { 'Abhishek Yadav': { team: 'Thor', ...fields } } });
+
+  rejects(emp({ daily: [{ date: '2026-08-01' }, null] }), /employee "Abhishek Yadav" daily row 2 is not an object/);
+  rejects(emp({ openRows: ['JOB1'] }), /openRows row 1 is not an object/);
+  rejects(emp({ byZm: { Ravi: { clients: [7] } } }), /byZm "Ravi" clients row 1/);
+  rejects(emp({ byZm: { Ravi: 'x' } }), /byZm "Ravi" is not an object/);
+  rejects(emp({ vertical: 5 }), /vertical is not text/);
+  rejects({ employees: { A: null } }, /employee "A" is not an object/);
+  rejects({ teamMembers: { Thor: 'Abhishek Yadav' } }, /teamMembers "Thor" must be a list of names/);
+  rejects({ txRows: [{}, 3] }, /txRows row 2/);
+  rejects({ primarySpocs: [{ name: 'x' }] }, /primarySpocs must list names only/);
+
+  // Many problems (one per list): the first five, then a count.
+  const many = emp(Object.fromEntries(
+    ['daily', 'clients', 'tatSda', 'productivity', 'cityWise', 'pendingReasons', 'openRows'].map((k) => [k, [null]]),
+  ));
+  rejects(many, /daily row 1 is not an object; .*\(and 2 more\)$/);
+
+  // Positive control: lists that are absent, null or well-formed pass, as
+  // aggregate.js reads them through list().
+  assert.doesNotThrow(() => service.parseDashboardData(asDataJs(sample(emp({
+    daily: [{ date: '2026-08-01', target: 1 }], clients: null, byZm: { Ravi: { openRows: [{ aging: 3 }] } },
+  })))));
 });
 
-test('round trip: upload → meta → page carries the same D, script-safe', async () => {
+test('round trip: upload → meta → the stored D, script-safe', async () => {
   assert.equal(await service.getMeta(), null, 'nothing uploaded yet');
-  assert.equal(await service.getDashboardHtml(), null);
+  assert.equal(await service.getSnapshotD(), null);
 
   const hostile = sample({
     employees: { 'X</script><script>alert(1)</script>': { team: '$& $1 $`', revenue: 1, daily: [] } },
@@ -111,26 +129,8 @@ test('round trip: upload → meta → page carries the same D, script-safe', asy
   assert.deepEqual(meta.uploadedBy, { userId: 7, name: 'MIS User' });
   assert.deepEqual(await service.getMeta(), meta);
 
-  const html = await service.getDashboardHtml();
-  assert.equal(html.includes(service._internals.DATA_HOOK), false, 'the data.js tag is replaced');
-  assert.equal((html.match(/alert\(1\)<\/script>/g) || []).length, 0, 'data cannot close the script element');
-  assert.deepEqual(extractD(html), hostile, 'D reaches the page unchanged');
-});
-
-test('the page signals the CRM when it is drawn, without depending on rAF', async () => {
-  /*
-   * The CRM keeps a "preparing" panel over the frame until this message
-   * arrives, because the iframe's own load event fires before the ~6.5 MB page
-   * has painted. requestAnimationFrame is SUSPENDED in a hidden window, so a
-   * signal built on it alone never fires in a background tab and the panel
-   * would sit there forever — which is exactly what happened in testing. The
-   * timer is the part that must survive.
-   */
-  const html = await service.getDashboardHtml();
-  const signal = html.slice(html.lastIndexOf('<script>'));
-  assert.match(signal, /setTimeout\(send,\s*\d+\)/, 'a timer path exists');
-  assert.match(signal, /requestAnimationFrame/, 'the accurate post-paint path exists too');
-  assert.match(signal, new RegExp(`postMessage\\('${service.READY_MESSAGE}'`), 'posts the agreed message');
-  assert.match(signal, /if\(sent\)\{return;\}/, 'the two paths cannot both post');
-  assert.ok(html.trimEnd().endsWith('</html>'), 'the signal sits inside the document');
+  const stored = zlib.gunzipSync(fs.readFileSync(path.join(TMP, meta.dataKey))).toString('utf8');
+  assert.equal(stored.includes('</script>'), false, 'no string can close a <script>');
+  assert.deepEqual(JSON.parse(stored), hostile, 'D is stored unchanged');
+  assert.deepEqual(await service.getSnapshotD(), hostile);
 });
