@@ -47,6 +47,23 @@ const LEGACY_WORK_BLOCKED = new Set([
   'OFFLINE', 'ON_BENCH',
 ]);
 const REAPPLY_FROM = new Set(['INACTIVE', 'DORMANT', 'APPLICATION_REJECTED']);
+// A rejected profile stays on the "Profile Rejected" wall for this many days
+// after the rejection; only then does re-application open.
+const REJECTION_COOLDOWN_DAYS = 90;
+
+/** ISO instant re-application opens, or null when no cooldown applies. */
+function reapplyAvailableAt(status, changedAt) {
+  if (status !== 'APPLICATION_REJECTED') return null;
+  const since = Date.parse(changedAt || '');
+  // Unknown rejection time: fail closed to "just rejected", never "long ago".
+  const base = Number.isFinite(since) ? since : Date.now();
+  return new Date(base + REJECTION_COOLDOWN_DAYS * 86400000).toISOString();
+}
+
+function inRejectionCooldown(status, changedAt, now = Date.now()) {
+  const at = reapplyAvailableAt(status, changedAt);
+  return at != null && Date.parse(at) > now;
+}
 /*
  * Statuses where Gate 1 is DEFINITIVELY behind the technician, so a
  * registration-finalize call has nothing left to converge and must answer
@@ -166,12 +183,12 @@ function normalizeStatus(value) {
   return STATUS_SET.has(status) ? status : null;
 }
 
-function capabilitiesForStatus(status) {
+function capabilitiesForStatus(status, changedAt) {
   const active = WORK_ENABLED.has(status);
   const paused = status === 'PAUSED';
   const availabilityOnly = status === 'OFFLINE' || status === 'ON_BENCH';
   const editRegistration = EDIT_REGISTRATION.has(status);
-  const reapply = REAPPLY_FROM.has(status);
+  const reapply = REAPPLY_FROM.has(status) && !inRejectionCooldown(status, changedAt);
   /*
    * "Is this technician USING the app" — the same condition readOnlyApp is the
    * negation of. Capabilities that are part of ordinary app use hang off this,
@@ -319,7 +336,10 @@ function lifecycleFromRow(row = {}) {
   const legacyEnabled = persisted
     ? Number(row.efr_status) === 1
     : (row.efr_status == null || Number(row.efr_status) !== 0);
-  const capabilities = capabilitiesForStatus(status);
+  const changedAt = persisted
+    ? asNullableDateTime(row.lifecycle_changed_at)
+    : asNullableDateTime(row.update_date || row.insert_date);
+  const capabilities = capabilitiesForStatus(status, changedAt);
   capabilities.receiveNewJobs = capabilities.receiveNewJobs
     && verified && legacyEnabled;
   if (persisted && WORK_ENABLED.has(status) && (!verified || !legacyEnabled)) {
@@ -331,9 +351,8 @@ function lifecycleFromRow(row = {}) {
     status,
     reasonCode: persisted ? (row.lifecycle_reason_code || null) : null,
     reason: persisted ? (row.lifecycle_reason || null) : null,
-    changedAt: persisted
-      ? asNullableDateTime(row.lifecycle_changed_at)
-      : asNullableDateTime(row.update_date || row.insert_date),
+    changedAt,
+    reapplyAvailableAt: reapplyAvailableAt(status, changedAt),
     // The scheduled block end date is single-sourced from
     // scheduled_reactivation_date (a PAUSED/SUSPENDED transition writes the
     // "until" there); there is no separate lifecycle_until column.
@@ -1154,6 +1173,13 @@ function assertTransition(current, target, input) {
     if (current.status !== 'REAPPLIED' && !REAPPLY_FROM.has(current.status)) {
       throw httpError(409, `re-application is not allowed from ${current.status}`);
     }
+    if (inRejectionCooldown(current.status, current.changedAt)) {
+      throw httpError(
+        409,
+        `re-application opens ${REJECTION_COOLDOWN_DAYS} days after profile rejection`,
+        { reapplyAvailableAt: reapplyAvailableAt(current.status, current.changedAt) },
+      );
+    }
   }
 }
 
@@ -1572,11 +1598,13 @@ async function transition(efrId, input = {}, actor = null) {
           jobsAllowed: workEnabled
             && verifiedAfterTransition
             && nextLegacyStatus !== 0,
-          canReapply: REAPPLY_FROM.has(target),
+          canReapply: REAPPLY_FROM.has(target)
+            && !inRejectionCooldown(target, now.toISOString()),
+          reapplyAvailableAt: reapplyAvailableAt(target, now.toISOString()),
           canClaimEarnings: true,
           source,
           capabilities: {
-            ...capabilitiesForStatus(target),
+            ...capabilitiesForStatus(target, now.toISOString()),
             receiveNewJobs: workEnabled
               && verifiedAfterTransition
               && nextLegacyStatus !== 0,

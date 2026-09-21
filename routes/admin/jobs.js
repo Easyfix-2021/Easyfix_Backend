@@ -2,6 +2,10 @@ const router = require('express').Router();
 
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
+// Material Request Flow v2 (2026-09-21) — the single line-state derivation,
+// used by the material-review completeness check and the new quotation-lines
+// add endpoint below.
+const quotationLineState = require('../../services/quotation-line-state');
 // tbl_job_notes — the legacy free-text ops notepad, read+add only. Deliberately
 // separate from jobComments below: audit trail vs. operator-to-operator notes.
 const jobNotes = require('../../services/job-notes.service');
@@ -3399,25 +3403,38 @@ const materialReviewBody = require('joi').object({
  * Every PENDING (status = 1, action_on NULL — see the STATUS VALUES note
  * above) type='material' quotation_details row on the job must appear in
  * `lines` exactly once — reused as the "did Ops half-review this job" guard
- * the design calls for. Returns an error string, or null when `lines` is a
- * valid, complete, one-to-one review of `pendingIds`.
+ * the design calls for.
+ *
+ * Material Request Flow v2 (2026-09-21) splits the old single validator in
+ * two, with different HTTP outcomes:
+ *   - COVERAGE (a missing or an unknown/extra line_id) means the quote
+ *     changed under the reviewer — a technician (or the CRM) added or
+ *     removed a line while this review screen was open. That is a 409, with
+ *     the exact contract message the CRM shows: "New materials were added —
+ *     reload and review again".
+ *   - CONTENT (duplicate line_id, a missing/negative approved_amount, an
+ *     amount on a rejected line) is a malformed submission from the SAME
+ *     screen — 422, unchanged from before.
  *
  * Column semantics (approved_charge / status / action_by / action_on) are
  * the SAME ones routes/admin/quotations.js PATCH /:id/approve|reject
  * already write — reused, not reinvented.
  */
-function validateMaterialLines(pendingIds, lines) {
+const MATERIAL_LINES_CHANGED_MESSAGE = 'New materials were added — reload and review again';
+
+function findMaterialLinesCoverageError(pendingIds, lines) {
+  const submittedIds = new Set(lines.map((l) => Number(l.line_id)));
+  const hasExtra = [...submittedIds].some((id) => !pendingIds.has(id));
+  const hasMissing = [...pendingIds].some((id) => !submittedIds.has(id));
+  return (hasExtra || hasMissing) ? MATERIAL_LINES_CHANGED_MESSAGE : null;
+}
+
+function validateMaterialLineContent(lines) {
   const seen = new Map();
   for (const line of lines) {
     const lid = Number(line.line_id);
     if (seen.has(lid)) return `duplicate line_id ${lid} in lines`;
     seen.set(lid, line);
-  }
-  for (const lid of seen.keys()) {
-    if (!pendingIds.has(lid)) return `line_id ${lid} is not a pending material line on this job`;
-  }
-  for (const pid of pendingIds) {
-    if (!seen.has(pid)) return `material line ${pid} is missing from the review`;
   }
   for (const [lid, line] of seen) {
     if (line.decision === 'approve') {
@@ -3460,20 +3477,31 @@ router.post(
         const conn = await pool.getConnection();
         try {
           await conn.beginTransaction();
+          // Material Request Flow v2 (2026-09-21): "pending" now ALSO requires
+          // sent_on IS NOT NULL — a draft line (added but never sent) is not
+          // under review at all and must never be forced into this payload.
+          // This is exactly quotationLineState's `review_pending` predicate,
+          // narrowed to type='material' (this endpoint's own scope).
           const [pendingRows] = await conn.query(
             `SELECT id FROM quotation_details
               WHERE job_id = ? AND type = 'material'
-                AND CAST(status AS SIGNED) = 1 AND action_on IS NULL
+                AND ${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.REVIEW_PENDING)}
               FOR UPDATE`,
             [jobId],
           );
           const pendingIds = new Set(pendingRows.map((r) => Number(r.id)));
           const lines = Array.isArray(submittedLines) ? submittedLines : [];
-          const lineError = validateMaterialLines(pendingIds, lines);
-          if (lineError) {
+          const coverageError = findMaterialLinesCoverageError(pendingIds, lines);
+          if (coverageError) {
             try { await conn.rollback(); } catch { /* nothing was written yet */ }
-            logger.warn('Material review approve refused · jobId=' + jobId + ' · ' + lineError);
-            return modernError(res, 422, lineError);
+            logger.warn('Material review approve refused (coverage) · jobId=' + jobId + ' · ' + coverageError);
+            return modernError(res, 409, coverageError);
+          }
+          const contentError = validateMaterialLineContent(lines);
+          if (contentError) {
+            try { await conn.rollback(); } catch { /* nothing was written yet */ }
+            logger.warn('Material review approve refused (content) · jobId=' + jobId + ' · ' + contentError);
+            return modernError(res, 422, contentError);
           }
 
           const now = new Date();
@@ -3536,17 +3564,56 @@ router.post(
             logger.warn('Material client request failed (non-fatal) · jobId=' + jobId + ' · ' + err.message);
           });
       } else {
-        updated = await job.setStatus(
-          jobId,
-          {
-            status: job.STATUS.PENDING_FOR_MATERIAL,
-            // material_reject_reason is the CONTRACT field the technician
-            // app reads (see the migration header) — the primary channel for
-            // "why was this rejected", not a nicety.
-            extras: { material_sub_status: 1, material_reject_reason: reason },
-          },
-          req.user,
-        );
+        // "Reject Request" (Material Request Flow v2, 2026-09-21): every
+        // review_pending material line on the job is rejected AND the job
+        // returns to its PRE-request status (1/2/20, default 2) — NOT back
+        // to 16/1 "Quotation Pending" as sub-project D originally shipped.
+        // Line writes + the status move happen on ONE connection, same
+        // reasoning as the approve branch above: a failing line write must
+        // leave the job at 16, never partway reverted.
+        const preStatus = await require('../../services/material-review-store').getPreMaterialStatus(jobId);
+        const conn = await pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          const [pendingRows] = await conn.query(
+            `SELECT id FROM quotation_details
+              WHERE job_id = ? AND type = 'material'
+                AND ${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.REVIEW_PENDING)}
+              FOR UPDATE`,
+            [jobId],
+          );
+          const now = new Date();
+          for (const row of pendingRows) {
+            await conn.query(
+              `UPDATE quotation_details
+                  SET status = 0, action_by = ?, action_on = ?
+                WHERE id = ? AND job_id = ?`,
+              [req.user.user_id, now, row.id, jobId],
+            );
+          }
+          updated = await job.setStatus(
+            jobId,
+            {
+              status: preStatus,
+              // material_reject_reason is the CONTRACT field the technician
+              // app reads (see the migration header) — the primary channel
+              // for "why was this rejected", not a nicety.
+              extras: { material_sub_status: null, material_reject_reason: reason },
+            },
+            req.user,
+            { conn },
+          );
+          await conn.commit();
+        } catch (e) {
+          try { await conn.rollback(); } catch { /* connection may already be gone */ }
+          throw e;
+        } finally {
+          conn.release();
+        }
+        // See the approve branch's identical comment above: re-read now that
+        // the transaction is durable, rather than trust setStatus's own
+        // pre-commit read.
+        updated = await job.getById(jobId);
         // Also mirrored onto the CRM History tab, fail-soft and after the
         // status has already committed — same rule as the ops check-in
         // reason comment above: a comment failure must not turn a landed
@@ -3566,6 +3633,139 @@ router.post(
       return modernOk(res, updated, decision === 'approve' ? 'material estimate approved' : 'material estimate rejected');
     } catch (e) {
       logger.warn('Material review failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
+
+// ─── NEW — CRM add a material line (Material Request Flow v2, 2026-09-21) ──
+// POST /:id/quotation-lines { materialId, brandId?, quantity, approvedAmount }
+// behind scopedJob + requireAction('isJobMaterialReview') → { lineId, job_status }.
+//
+// The line is born REVIEWED — Ops added it, so it needs no further internal
+// review, only the client's: sent_on = action_on = now, status = 1,
+// approved_charge = the entered amount. unit_price = round(approvedAmount)
+// (same INT-column rule mobile-job-estimate.service.js's addQuotationLine
+// already enforces); client_charge = the resolved rate-card price, a
+// snapshot, NULL when the resolver has none; name = the master material's
+// own name, never whatever the caller sent.
+//
+// Job-status transition (design's "Transitions", "CRM add line"): allowed
+// from 1/2/20/16/15 (not closed/cancelled) — 16 stays 16; 15 stays 15 and the
+// client request is RE-sent; 1/2/20 move to 15, storing the job's pre-status
+// so a later Reject Request can restore it. Anything else → 409.
+const quotationLinesBody = Joi.object({
+  materialId: Joi.number().integer().positive().required(),
+  brandId: Joi.number().integer().positive().optional(),
+  quantity: Joi.number().integer().min(1).required(),
+  approvedAmount: Joi.number().min(0).required(),
+});
+
+const CRM_ADD_LINE_ALLOWED_STATUSES = new Set([
+  1, job.STATUS.IN_PROGRESS, job.STATUS.IN_PROGRESS_ALT,
+  job.STATUS.PENDING_FOR_MATERIAL, job.STATUS.ESTIMATE_PENDING_APPROVAL,
+]);
+const CRM_ADD_LINE_ENTRY_STATUSES = new Set([1, job.STATUS.IN_PROGRESS, job.STATUS.IN_PROGRESS_ALT]);
+
+router.post(
+  '/:id/quotation-lines',
+  validate(idParam, 'params'),
+  validate(quotationLinesBody),
+  scopedJob,
+  requireAction('isJobMaterialReview'),
+  async (req, res, next) => {
+    const { pool } = require('../../db');
+    try {
+      const jobId = Number(req.params.id);
+      const jobStatus = Number(req.scopedJob.job_status);
+      logger.info('CRM add quotation line · jobId=' + jobId + ' · materialId=' + req.body.materialId + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      if (!CRM_ADD_LINE_ALLOWED_STATUSES.has(jobStatus)) {
+        logger.warn('CRM add quotation line refused · jobId=' + jobId + ' · job_status=' + jobStatus);
+        return modernError(res, 409, 'This job cannot take a new material line in its current status');
+      }
+
+      const [[material]] = await pool.query(
+        `SELECT material_id, material_name, CAST(status AS SIGNED) AS status
+           FROM tbl_material_master WHERE material_id = ? LIMIT 1`,
+        [req.body.materialId],
+      );
+      if (!material || material.status !== 1) {
+        logger.warn('CRM add quotation line refused · material not found/active · jobId=' + jobId + ' · materialId=' + req.body.materialId);
+        return modernError(res, 422, 'material not found');
+      }
+
+      const [[addr]] = await pool.query(
+        `SELECT ci.state_id
+           FROM tbl_job j
+           LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+           LEFT JOIN tbl_city    ci ON ci.city_id    = ad.city_id
+          WHERE j.job_id = ? LIMIT 1`,
+        [jobId],
+      );
+      const { resolveMaterialPrice } = require('../../services/material-price-resolver');
+      const resolvedPrice = await resolveMaterialPrice({
+        clientId: req.scopedJob.fk_client_id, materialId: req.body.materialId,
+        brandId: req.body.brandId || null, stateId: addr ? addr.state_id : null,
+      });
+      const clientCharge = resolvedPrice.source === 'none' ? null : (Number(resolvedPrice.price) || 0);
+
+      const approvedAmount = Number(req.body.approvedAmount);
+      const unitPrice = Math.round(approvedAmount);
+      const now = new Date();
+      const entersEstimatePending = CRM_ADD_LINE_ENTRY_STATUSES.has(jobStatus);
+
+      const conn = await pool.getConnection();
+      let lineId;
+      try {
+        await conn.beginTransaction();
+        const [ins] = await conn.query(
+          `INSERT INTO quotation_details
+             (type, name, unit, unit_price, tx_charge, client_charge, approved_charge, margin,
+              status, action_by, sent_by, sent_on, action_on,
+              job_id, material_id)
+           VALUES ('material', ?, ?, ?, 0, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?)`,
+          [
+            material.material_name, req.body.quantity, unitPrice,
+            clientCharge, approvedAmount,
+            req.user.user_id, req.user.user_id, now, now,
+            jobId, req.body.materialId,
+          ],
+        );
+        lineId = ins.insertId;
+
+        if (entersEstimatePending) {
+          await require('../../services/material-review-store').storePreMaterialStatus(jobId, jobStatus, conn);
+          await job.setStatus(jobId, { status: job.STATUS.ESTIMATE_PENDING_APPROVAL }, req.user, { conn });
+        }
+        await conn.commit();
+      } catch (e) {
+        try { await conn.rollback(); } catch { /* connection may already be gone */ }
+        throw e;
+      } finally {
+        conn.release();
+      }
+
+      const updated = await job.getById(jobId);
+
+      // "Client request sent" (entering 15) / "re-sent" (already at 15) —
+      // fire-and-forget, same rule as the material-review approve path above:
+      // never awaited, never allowed to fail this response. Not fired for a
+      // line landing at 16 — the client hasn't been notified about this job
+      // at all yet, so there is nothing to (re-)send.
+      if (entersEstimatePending || jobStatus === job.STATUS.ESTIMATE_PENDING_APPROVAL) {
+        require('../../services/material-client-request.service')
+          .sendMaterialClientRequest(jobId)
+          .catch((err) => {
+            logger.warn('Material client request failed (non-fatal) · jobId=' + jobId + ' · ' + err.message);
+          });
+      }
+
+      logger.info('CRM quotation line created · id=' + lineId + ' · jobId=' + jobId + ' · job_status=' + updated.job_status);
+      res.status(201);
+      return modernOk(res, { lineId, job_status: updated.job_status });
+    } catch (e) {
+      logger.warn('CRM add quotation line failed · jobId=' + req.params.id + ' · ' + e.message);
       return next(e);
     }
   },

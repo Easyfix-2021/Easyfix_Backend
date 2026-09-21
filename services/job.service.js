@@ -28,6 +28,11 @@ const {
 const { deriveTimeSlot, resolveTimeSlot, hasTimeOfDay, wallClockTime } = require('./time-slot');
 const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
 const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
+// Material Request Flow v2 (2026-09-21) — pre_material_status read/write +
+// the single line-state derivation. See services/material-review-store.js and
+// services/quotation-line-state.js headers.
+const { storePreMaterialStatus } = require('./material-review-store');
+const quotationLineState = require('./quotation-line-state');
 const {
   persistJobOfferBatch,
   MAX_OFFER_RECIPIENTS,
@@ -567,6 +572,39 @@ const SORTABLE_COLUMNS = {
   // Category, on the alias the projection already emits it from.
   service_category: 'sc.service_catg_name',
 };
+
+/*
+ * material_state / material_count (Material Request Flow v2, 2026-09-21) —
+ * job-level rollup over quotation_details, unconditional (every column it
+ * touches — job_status, sent_on, action_on, status, client_status — is
+ * either long-standing or shipped in the SAME migration as this feature; see
+ * migrations/2026-09-21-material-request-flow-v2.sql). One fragment, used by
+ * both the LIST projection and getByIdCore, so the mobile list, the mobile
+ * detail and the admin detail can never disagree about a job's material
+ * state. Built ONLY from services/quotation-line-state.js's predicates —
+ * never a hand-written copy of "sent_on IS NULL" etc.
+ *
+ * material_state: 'review_pending' at job_status 16, 'approval_pending' at
+ * job_status 15, else 'draft' when any draft line exists, else NULL.
+ * material_count: count of lines in draft/review_pending/approval_pending —
+ * the technician/CRM "still open" set (quotationLineState.OPEN_STATES).
+ */
+function materialStateColumns() {
+  const draftExists = quotationLineState.statePredicateSql('mst', quotationLineState.STATE.DRAFT);
+  const openLine = quotationLineState.openLineSql('msc');
+  return `,
+  CASE
+    WHEN j.job_status = 16 THEN 'review_pending'
+    WHEN j.job_status = 15 THEN 'approval_pending'
+    WHEN EXISTS (SELECT 1 FROM quotation_details mst WHERE mst.job_id = j.job_id AND ${draftExists})
+      THEN 'draft'
+    ELSE NULL
+  END AS material_state,
+  (SELECT COUNT(*) FROM quotation_details msc
+     WHERE msc.job_id = j.job_id
+       AND (${openLine})
+  ) AS material_count`;
+}
 
 // ─── Projections ────────────────────────────────────────────────────
 // Note: extra columns (ticket_created_date_time, time_slot, client_spoc*,
@@ -2916,6 +2954,7 @@ async function list({
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
     + JOB_AGE_COLUMNS()
+    + materialStateColumns()
     + escalationColumns(wantsEscalation)
     + manageColumns(wantsManage, hasJobOffer);
   const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
@@ -3931,6 +3970,7 @@ async function getByIdCore(jobId) {
                JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
                must NOT end in one. */
             ${JOB_AGE_COLUMNS()}
+            ${materialStateColumns()}
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]
@@ -6378,6 +6418,26 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     extras = rest;
   }
 
+  /*
+   * pre_material_status (Material Request Flow v2, 2026-09-21) — same
+   * treatment as material_reject_reason immediately above: no tbl_job column
+   * exists for it (row-size ceiling), so it routes to tbl_job_material_review
+   * instead of the UPDATE. Callers pass it in `extras` under this name (the
+   * CRM add-line → 15 path stores the job's status just before this move);
+   * the Reject Request → pre-status path READS it first (via
+   * getPreMaterialStatus, before calling setStatus with the resolved target
+   * status) rather than through this key.
+   */
+  let preMaterialStatus;
+  let hasPreMaterialStatus = false;
+  if (extras && typeof extras === 'object' && 'pre_material_status' in extras) {
+    preMaterialStatus = extras.pre_material_status;
+    hasPreMaterialStatus = preMaterialStatus !== undefined;
+    const rest = { ...extras };
+    delete rest.pre_material_status;
+    extras = rest;
+  }
+
   // Tier-specific extras — caller passes a map of column→value pairs
   // for transition side-effects that don't generalise (mobile GPS
   // checkin, app_checkout_date_time, etc.). Whitelisted to prevent
@@ -6494,6 +6554,15 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
                                reviewed_at   = VALUES(reviewed_at)`,
       [jobId, materialRejectReason, crmUserId || null, new Date()],
     );
+  }
+
+  // pre_material_status — same non-atomic caveat as material_reject_reason
+  // above (a separate pool.query, not the same transaction as the status
+  // UPDATE): writing the pre-status a beat after the job moves into 16/15 is
+  // recoverable (the job just re-enters the material flow), unlike a lost
+  // reject reason there is no user-facing message to lose.
+  if (hasPreMaterialStatus) {
+    await storePreMaterialStatus(jobId, preMaterialStatus);
   }
 
   /*

@@ -6,7 +6,7 @@ const requireSpocAuth = require('../../middleware/client-auth');
 const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
-const { isEstimateApprovable } = require('../../services/job-estimate-approval');
+const { isEstimateApprovable, stampApprovalPendingLines } = require('../../services/job-estimate-approval');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const otpAttempts = require('../../services/otp-attempts.service');
@@ -1087,13 +1087,29 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
       logger.warn('Estimate-approve blocked · not yet PM-reviewed · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, 'This estimate is still being reviewed by EasyFix.');
     }
-    await pool.query(
-      'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
-      [req.spoc.id, new Date(), job.job_id]);
     // Legacy stamps cancel_by/etc with the SPOC's linked USER — same
     // resolution as the client cancel route above.
     const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
-    await jobService.setStatus(job.job_id, { status: 1 }, { user_id: link?.user_id ?? null });
+    // Material Request Flow v2 (2026-09-21): the tbl_job stamp, the
+    // approval_pending quotation_details lines and the status move to 1 all
+    // land in ONE transaction — see services/job-estimate-approval.js's
+    // stampApprovalPendingLines header for why this is a SHARED function
+    // rather than a copy per surface.
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
+        [req.spoc.id, new Date(), job.job_id]);
+      await stampApprovalPendingLines(conn, job.job_id, true);
+      await jobService.setStatus(job.job_id, { status: 1 }, { user_id: link?.user_id ?? null }, { conn });
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch { /* connection may already be gone */ }
+      throw e;
+    } finally {
+      conn.release();
+    }
     logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }
@@ -1123,11 +1139,22 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
       logger.warn('Estimate-reject blocked · not yet PM-reviewed · id=' + job.job_id + ' status=' + job.job_status);
       return modernError(res, 409, 'This estimate is still being reviewed by EasyFix.');
     }
-    await pool.query(
-      'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
-      [req.body.reason, new Date(), job.job_id]);
     const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
-    await jobService.setStatus(job.job_id, { status: 2 }, { user_id: link?.user_id ?? null });
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
+        [req.body.reason, new Date(), job.job_id]);
+      await stampApprovalPendingLines(conn, job.job_id, false);
+      await jobService.setStatus(job.job_id, { status: 2 }, { user_id: link?.user_id ?? null }, { conn });
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch { /* connection may already be gone */ }
+      throw e;
+    } finally {
+      conn.release();
+    }
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
     logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
