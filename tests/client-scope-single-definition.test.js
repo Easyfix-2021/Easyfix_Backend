@@ -62,7 +62,6 @@ test('allStores is not re-applied at any call site', () => {
  */
 const EXEMPT = new Set([
   'GET /team/bookings',                 // takes an explicit contact id
-  'GET /notices',                       // notices are per-SPOC, not per-job
   'PATCH /notices/read',
   'GET /customers/:customerId/addresses',      // booking lookup, keyed by customer
   'GET /customers/mobile/:mobile/addresses',

@@ -2,7 +2,7 @@ const XLSX = require('xlsx');
 const { pool } = require('../db');
 const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
-const { streamStyledXlsx } = require('../utils/xlsx-styled-export');
+const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../utils/xlsx-styled-export');
 const clientServicesSvc = require('./client-services.service');
 const materialRatesSvc = require('./client-material-rates.service');
 
@@ -43,9 +43,25 @@ function mkErr(status, message, extra) {
   return e;
 }
 
-function firstSheet(buffer) {
+/*
+ * Reads `preferredName` when the workbook has a sheet by that name
+ * (case/whitespace-insensitive), else falls back to the FIRST sheet.
+ *
+ * This is what lets the combined GET /:clientId/rate-cards/export.xlsx
+ * download (sheets literally named "Services" and "Materials") round-trip
+ * through EITHER tab's upload — the Services tab asks for "Services" and
+ * gets it even though it's the first sheet of a two-sheet file; the
+ * Materials tab asks for "Materials" and gets the SECOND sheet instead of
+ * silently reading the Services data as if it were materials. A single-
+ * sheet file — either tab's own per-tab download ("Rate Cards" / "Material
+ * Rates") or the upload template — has no sheet by that name, so both fall
+ * back to "whatever the one sheet is", unchanged from before this existed.
+ */
+function namedOrFirstSheet(buffer, preferredName) {
   const wb = XLSX.read(buffer, { type: 'buffer' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const wantedKey = preferredName.trim().toLowerCase();
+  const matchName = wb.SheetNames.find((n) => n.trim().toLowerCase() === wantedKey);
+  const sheet = wb.Sheets[matchName || wb.SheetNames[0]];
   if (!sheet) return [];
   return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
 }
@@ -128,7 +144,7 @@ async function loadExistingClientServiceByType(clientId) {
 }
 
 async function parseServiceRows(buffer, clientId) {
-  const raw = firstSheet(buffer);
+  const raw = namedOrFirstSheet(buffer, 'Services');
   const [typeById, existingByTypeId] = await Promise.all([
     loadServiceTypeRef(), loadExistingClientServiceByType(clientId),
   ]);
@@ -282,24 +298,146 @@ async function commitServicesUpload(buffer, clientId, actor = {}) {
 // treats as No Brand (Decision A), matched via the same nameKey normaliser.
 const NO_BRAND_ALIASES = new Set(['not applicable', 'na', 'n/a', 'no brand']);
 
+/*
+ * Plain edit-distance nearest-neighbour for "did you mean" suggestions on an
+ * unresolved Material/Brand/State cell.
+ *
+ * ponytail: this is a linear scan + classic Levenshtein, fine at the scale of
+ * a few hundred materials/brands/states (a full preview parse already does a
+ * handful of DB round-trips; this adds microseconds). It would need a real
+ * fuzzy-search library (e.g. Fuse.js) if any of these lists grows into the
+ * thousands and this starts being slow or the threshold starts misfiring.
+ */
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j - 1], prev[j], cur[j - 1]);
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+function suggestClosest(rawName, byKeyMap, nameField) {
+  const target = nameKey(rawName);
+  if (!target) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const rec of byKeyMap.values()) {
+    const d = levenshtein(target, nameKey(rec[nameField]));
+    if (d < bestDist) { bestDist = d; best = rec; }
+  }
+  const threshold = Math.max(2, Math.ceil(target.length / 3));
+  return best && bestDist <= threshold ? best[nameField] : null;
+}
+
+function unknownNameError(label, rawName, byKeyMap, nameField) {
+  const suggestion = suggestClosest(rawName, byKeyMap, nameField);
+  return suggestion
+    ? `Unknown ${label} "${rawName}" — did you mean "${suggestion}"?`
+    : `Unknown ${label} "${rawName}"`;
+}
+
+/*
+ * Hidden "Lists" sheet + per-column dropdown validation, so a Material/
+ * Brand/State cell can only be filled from an actual master-data name —
+ * the owner's fix for "a little typo ... can create errors or duplicate
+ * entries". A hidden sheet + a named range is the standard Excel pattern
+ * for a long dropdown list (an inline list is capped at 255 characters).
+ * ExcelJS (already a dependency) supports both natively — no new package.
+ *
+ * `lastDataRow` is a fixed cap (Excel validation needs a bounded range, not
+ * "the rest of the sheet") — 1000 rows is generous for a rate-card upload.
+ */
+const TEMPLATE_LAST_DATA_ROW = 1000;
+
+function addMaterialListsAndValidation(wb, sheetName, firstDataRow, { materialNames, brandNames, stateNames }) {
+  const listsWs = wb.addWorksheet('Lists', { state: 'hidden' });
+  listsWs.getColumn(1).values = ['Materials', ...materialNames];
+  listsWs.getColumn(2).values = ['Brands', ...brandNames];
+  listsWs.getColumn(3).values = ['States', ...stateNames];
+
+  const ws = wb.getWorksheet(sheetName);
+  const lastRow = TEMPLATE_LAST_DATA_ROW;
+  const rangeFormula = (col, names) => (names.length ? [`Lists!$${col}$2:$${col}$${names.length + 1}`] : null);
+
+  const materialsRange = rangeFormula('A', materialNames);
+  const brandsRange = rangeFormula('B', brandNames);
+  const statesRange = rangeFormula('C', stateNames);
+
+  if (materialsRange) {
+    ws.dataValidations.add(`A${firstDataRow}:A${lastRow}`, {
+      type: 'list', allowBlank: false, formulae: materialsRange,
+      showErrorMessage: true, errorTitle: 'Unknown material', error: 'Pick a material from the dropdown list.',
+    });
+  }
+  if (brandsRange) {
+    ws.dataValidations.add(`B${firstDataRow}:B${lastRow}`, {
+      type: 'list', allowBlank: true, formulae: brandsRange,
+      showErrorMessage: true, errorTitle: 'Unknown brand',
+      error: 'Pick a brand from the dropdown list, or leave blank for No Brand.',
+    });
+  }
+  if (statesRange) {
+    ws.dataValidations.add(`D${firstDataRow}:D${lastRow}`, {
+      type: 'list', allowBlank: true, formulae: statesRange,
+      showErrorMessage: true, errorTitle: 'Unknown state',
+      error: 'Pick a state from the dropdown list, or leave blank for the all-states price.',
+    });
+  }
+}
+
+/*
+ * Material | Brand | Price | State (2026-09-21 redesign — see the design
+ * doc). ONE ROW per (material, brand, state); State blank = the all-states
+ * base price; Brand blank = No Brand. Dropdowns on all three name columns
+ * (see addMaterialListsAndValidation) so a typo is rejected by Excel itself
+ * before the file ever reaches this parser.
+ *
+ * Applying the SAME dropdowns to a DOWNLOADED file (the per-tab download or
+ * the combined export.xlsx) was considered and deliberately skipped: those
+ * files already contain valid current names (no dropdown needed to prevent a
+ * typo that isn't there), and building it would mean threading the master
+ * material/brand/state lists into services/client-xlsx.service.js, which
+ * today does no DB access at all — a bigger change for a secondary case.
+ * The parser below is the real safety net either way: every cell is
+ * validated against master data on upload regardless of which file it came
+ * from, dropdown or not.
+ */
 async function generateMaterialRatesTemplate(res) {
-  await streamStyledXlsx(res, 'easyfix-rate-card-materials-template.xlsx', {
+  const ref = await loadMaterialRatesRef();
+  const materialNames = [...new Set([...ref.materialByKey.values()].map((m) => m.material_name))].sort();
+  const brandNames = [...new Set([...ref.brandByKey.values()].map((b) => b.brand_name))].sort();
+  const stateNames = [...new Set([...ref.stateByKey.values()].map((s) => s.state_name))].sort();
+
+  const wb = buildStyledWorkbook({
     title: 'EasyFix · Rate Card (Materials) Template',
-    meta: 'One row = one price group. Brands blank or "No Brand" = a brand-less price. Master Price Today / Review Flag are read-only.',
+    meta: 'One row = one (Material, Brand, State) price. Leave State blank for the all-states price; leave Brand blank for No Brand. Use the dropdown in each cell.',
     sheetName: 'Material Rates',
     columns: [
-      { header: 'Material',            key: 'material',            width: 28 },
-      { header: 'Brands',              key: 'brands',              width: 24 },
-      { header: 'Client Price',        key: 'price',               width: 14 },
-      { header: 'State Overrides',     key: 'state_overrides',     width: 34 },
-      { header: 'Master Price Today',  key: 'master_price_today',  width: 18 },
-      { header: 'Review Flag',         key: 'review_flag',         width: 24 },
+      { header: 'Material', key: 'material', width: 28 },
+      { header: 'Brand',    key: 'brand',    width: 20 },
+      { header: 'Price',    key: 'price',    width: 14 },
+      { header: 'State',    key: 'state',    width: 20 },
     ],
-    rows: [{
-      material: 'Adapter 5A', brands: 'Philips, Havells', price: 150,
-      state_overrides: 'Maharashtra, Gujarat: ₹275.00', master_price_today: '', review_flag: '',
-    }],
+    rows: [
+      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 150, state: '' },
+      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 275, state: stateNames[0] || 'Maharashtra' },
+    ],
   });
+  // buildStyledWorkbook with no `kpis` puts the header on row 4 (title/meta/
+  // spacer), so data starts row 5 — see xlsx-styled-export.js's own headerRow
+  // default.
+  addMaterialListsAndValidation(wb, 'Material Rates', 5, { materialNames, brandNames, stateNames });
+  await streamWorkbook(res, 'easyfix-rate-card-materials-template.xlsx', wb);
 }
 
 async function loadMaterialRatesRef() {
@@ -310,7 +448,7 @@ async function loadMaterialRatesRef() {
   ]);
   return {
     materialByKey: new Map(materials.map((m) => [nameKey(m.material_name), m])),
-    brandByKey: new Map(brands.map((b) => [b.brand_key, b])),
+    brandByKey: new Map(brands.map((b) => [nameKey(b.brand_name), b])),
     stateByKey: new Map(states.map((s) => [nameKey(s.state_name), s])),
   };
 }
@@ -327,39 +465,36 @@ function groupSignature(price, brandIds, states) {
   return `${Number(price).toFixed(2)}|${b}|${s}`;
 }
 
-// Parses "Maharashtra, Gujarat: ₹275.00; Delhi: ₹260.00" — the EXACT grammar
-// services/client-xlsx.service.js#exportMaterialRates writes: groups joined
-// by "; ", each "<comma-separated state names>: ₹<price to 2dp>". The ₹ sign
-// is optional on parse (tolerant of a manually-edited cell) but the segment
-// is quoted verbatim in any error, per the design doc.
-function parseStateOverridesCell(raw, stateByKey) {
-  const text = String(raw || '').trim();
-  if (!text) return { states: [], errors: [] };
-  const errors = [];
-  const states = [];
-  for (const segment of text.split(';').map((s) => s.trim()).filter(Boolean)) {
-    const m = /^(.+?):\s*₹?\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(segment);
-    if (!m) { errors.push(`Malformed State Overrides segment "${segment}"`); continue; }
-    const stateNames = m[1].split(',').map((s) => s.trim()).filter(Boolean);
-    if (!stateNames.length) { errors.push(`Malformed State Overrides segment "${segment}"`); continue; }
-    const stateIds = [];
-    let bad = false;
-    for (const sn of stateNames) {
-      const st = stateByKey.get(nameKey(sn));
-      if (!st) { errors.push(`Unknown state "${sn}" in State Overrides segment "${segment}"`); bad = true; continue; }
-      stateIds.push(st.state_id);
-    }
-    if (bad) continue;
-    const price = Number(m[2]);
-    if (!(price > 0)) { errors.push(`State Overrides segment "${segment}" must have a price greater than 0`); continue; }
-    states.push({ state_ids: stateIds, price });
+// Every row that individually failed to parse, or that a later cross-row
+// check condemns, blocks the WHOLE material — replace() rewrites a
+// material's entire group set atomically, so a clean sibling row can't be
+// written half of a group set the file also describes incorrectly for the
+// same material.
+function blockAllRows(rows, message) {
+  for (const r of rows) {
+    r.errors.push(message);
+    r.outcome = 'blocked';
   }
-  return { states, errors };
 }
 
+/*
+ * Parses the flat sheet into { rows, materials, stateNameById }.
+ *
+ *   rows      — one entry per raw sheet row, in file order (for the
+ *               row-level echo / error display).
+ *   materials — Map keyed by `id:<material_id>` (resolved) or
+ *               `name:<raw text key>` (material name itself didn't
+ *               resolve — still bucketed so the compiled-plan preview has
+ *               somewhere to show the error), each an accumulator with
+ *               { material_id, material_name, rows, groups?, outcome? }.
+ *               `groups` (client-price-group shape, ready for
+ *               validateClientGroupsPayload/replace()) is present only when
+ *               the material compiled cleanly.
+ */
 async function parseMaterialRateRows(buffer, clientId) {
-  const raw = firstSheet(buffer);
+  const raw = namedOrFirstSheet(buffer, 'Materials');
   const ref = await loadMaterialRatesRef();
+  const stateNameById = new Map([...ref.stateByKey.values()].map((s) => [s.state_id, s.state_name]));
   const existingItems = await materialRatesSvc.list(clientId);
   const existingByMaterialId = new Map(existingItems.map((it) => [it.material_id, it]));
   const existingSignaturesByMaterialId = new Map();
@@ -371,128 +506,215 @@ async function parseMaterialRateRows(buffer, clientId) {
   }
 
   const rows = [];
-  const materials = new Map(); // material_id -> accumulator
+  const materials = new Map(); // bucket key -> accumulator (see doc-comment above)
 
   raw.forEach((r, i) => {
     const rowNumber = i + 2;
     const errors = [];
+    const warnings = [];
 
-    const materialName = String(cell(r, 'Material') || '').trim();
-    const brandsRaw = String(cell(r, 'Brands') || '').trim();
-    const priceRaw = String(cell(r, 'Client Price') ?? '').trim();
-    const stateOverridesRaw = String(cell(r, 'State Overrides') || '').trim();
+    const materialRaw = String(cell(r, 'Material') || '').trim();
+    const brandRaw = String(cell(r, 'Brand') || '').trim();
+    const priceRaw = String(cell(r, 'Price') ?? '').trim();
+    const stateRaw = String(cell(r, 'State') || '').trim();
 
-    if (!materialName) errors.push('Material is required');
-    const material = materialName ? ref.materialByKey.get(nameKey(materialName)) || null : null;
-    if (materialName && !material) errors.push(`Unknown material "${materialName}"`);
+    let material = null;
+    if (!materialRaw) errors.push('Material is required');
+    else {
+      material = ref.materialByKey.get(nameKey(materialRaw)) || null;
+      if (!material) errors.push(unknownNameError('material', materialRaw, ref.materialByKey, 'material_name'));
+    }
 
-    const isNoBrand = !brandsRaw || NO_BRAND_ALIASES.has(nameKey(brandsRaw));
-    const brandIds = [];
+    const isNoBrand = !brandRaw || NO_BRAND_ALIASES.has(nameKey(brandRaw));
+    let brand = null;
     if (!isNoBrand) {
-      const dedupe = new Set();
-      for (const bn of brandsRaw.split(',').map((s) => s.trim()).filter(Boolean)) {
-        const bkey = nameKey(bn);
-        if (dedupe.has(bkey)) { errors.push(`Brand "${bn}" repeated within the same row`); continue; }
-        dedupe.add(bkey);
-        const b = ref.brandByKey.get(bkey);
-        if (!b) { errors.push(`Unknown brand "${bn}"`); continue; }
-        brandIds.push(b.brand_id);
-      }
+      brand = ref.brandByKey.get(nameKey(brandRaw)) || null;
+      if (!brand) errors.push(unknownNameError('brand', brandRaw, ref.brandByKey, 'brand_name'));
+    }
+
+    let state = null;
+    if (stateRaw) {
+      state = ref.stateByKey.get(nameKey(stateRaw)) || null;
+      if (!state) errors.push(unknownNameError('state', stateRaw, ref.stateByKey, 'state_name'));
     }
 
     let price = null;
-    if (!priceRaw) errors.push('Client Price is required');
-    else if (!/^-?\d+(\.\d+)?$/.test(priceRaw)) errors.push('Client Price must be a number');
+    if (!priceRaw) errors.push('Price is required');
+    else if (!/^-?\d+(\.\d+)?$/.test(priceRaw)) errors.push('Price must be a number');
     else {
       price = Number(priceRaw);
-      if (!(price > 0)) errors.push('Client Price must be greater than 0');
+      if (!(price > 0)) errors.push('Price must be greater than 0');
     }
 
-    const { states, errors: stateErrors } = parseStateOverridesCell(stateOverridesRaw, ref.stateByKey);
-    errors.push(...stateErrors);
-
-    const parsed = {
-      row_number: rowNumber, material: materialName, brands: brandsRaw, price: priceRaw,
-      state_overrides: stateOverridesRaw, errors,
-      outcome: errors.length ? 'blocked' : null,
-      _material_id: material ? material.material_id : null,
+    const row = {
+      row_number: rowNumber, material: materialRaw, brand: brandRaw, price: priceRaw, state: stateRaw,
+      errors, warnings, outcome: errors.length ? 'blocked' : null,
+      _resolved: errors.length === 0,
+      _brand_key: isNoBrand ? '' : (brand ? nameKey(brand.brand_name) : null),
+      _brand_id: isNoBrand ? null : (brand ? brand.brand_id : null),
+      _brand_name: isNoBrand ? '' : (brand ? brand.brand_name : brandRaw),
+      _state_id: state ? state.state_id : null,
+      _price: price,
     };
-    rows.push(parsed);
+    rows.push(row);
 
-    if (errors.length || !material) return; // unresolved — stays 'blocked', not grouped
-
-    if (!materials.has(material.material_id)) {
-      materials.set(material.material_id, {
-        material_id: material.material_id, material_name: material.material_name,
-        groups: [], rows: [], hasNoBrandRow: false, hasBrandedRow: false, brandIdsSeen: new Set(),
+    const bucketKey = material ? `id:${material.material_id}` : `name:${nameKey(materialRaw)}`;
+    if (!materials.has(bucketKey)) {
+      materials.set(bucketKey, {
+        material_id: material ? material.material_id : null,
+        material_name: material ? material.material_name : (materialRaw || '(blank)'),
+        rows: [],
       });
     }
-    const acc = materials.get(material.material_id);
-    acc.rows.push(parsed);
-
-    if (isNoBrand) acc.hasNoBrandRow = true; else acc.hasBrandedRow = true;
-    if (acc.hasNoBrandRow && acc.hasBrandedRow) {
-      parsed.errors.push(`Cannot mix No Brand and brand prices for "${material.material_name}"`);
-      parsed.outcome = 'blocked';
-      return;
-    }
-    for (const bid of brandIds) {
-      if (acc.brandIdsSeen.has(bid)) {
-        parsed.errors.push(`Brand repeated across rows for "${material.material_name}"`);
-        parsed.outcome = 'blocked';
-      } else {
-        acc.brandIdsSeen.add(bid);
-      }
-    }
-    if (parsed.outcome === 'blocked') return;
-
-    acc.groups.push({ price, brand_ids: brandIds, states, _row: parsed });
+    materials.get(bucketKey).rows.push(row);
   });
 
-  // Resolve outcome per material, now that each material's full group set
-  // (every row sharing its name) is assembled. replace() rewrites a
-  // material's ENTIRE group set atomically, so one bad row for a material
-  // blocks every row of that material — a clean sibling can't be written
-  // half of a group set the file also describes incorrectly.
   for (const acc of materials.values()) {
-    const blockedRows = acc.rows.filter((row) => row.outcome === 'blocked');
-    if (blockedRows.length) {
-      for (const row of acc.rows) {
-        if (row.outcome !== 'blocked') {
-          row.errors.push(`Blocked — another row for "${acc.material_name}" is invalid (row ${blockedRows[0].row_number})`);
-          row.outcome = 'blocked';
-        }
-      }
+    const resolvedRows = acc.rows.filter((r) => r._resolved);
+    if (resolvedRows.length === 0) continue; // every row already individually blocked
+
+    const hasNoBrand = resolvedRows.some((r) => r._brand_key === '');
+    const hasBranded = resolvedRows.some((r) => r._brand_key !== '');
+    if (hasNoBrand && hasBranded) {
+      blockAllRows(acc.rows, `Cannot mix No Brand and brand prices for "${acc.material_name}"`);
       continue;
     }
 
+    // Duplicate / conflicting (brand, state) keys within this material.
+    const byKey = new Map();
+    for (const r of resolvedRows) {
+      const key = `${r._brand_key}|${r._state_id ?? 'base'}`;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(r);
+    }
+    let hasConflict = false;
+    for (const dupRows of byKey.values()) {
+      if (dupRows.length < 2) continue;
+      const prices = new Set(dupRows.map((r) => r._price));
+      if (prices.size > 1) {
+        const rowNums = dupRows.map((r) => r.row_number).join(', ');
+        for (const r of dupRows) r.errors.push(`Conflicting duplicate rows (${rowNums}) for the same material/brand/state with different prices`);
+        hasConflict = true;
+      } else {
+        // Identical duplicates — keep the first for grouping, warn on the rest.
+        for (const r of dupRows.slice(1)) {
+          r.warnings.push(`Duplicate of row ${dupRows[0].row_number} — identical, ignored`);
+          r._dropped = true;
+        }
+      }
+    }
+    if (hasConflict) {
+      blockAllRows(acc.rows, `Blocked — a duplicate row for "${acc.material_name}" has conflicting prices`);
+      continue;
+    }
+
+    // Base price (State blank) required for every brand that appears.
+    const liveRows = resolvedRows.filter((r) => !r._dropped);
+    const brandKeys = [...new Set(liveRows.map((r) => r._brand_key))];
+    let missingBase = false;
+    for (const bk of brandKeys) {
+      const brandRows = liveRows.filter((r) => r._brand_key === bk);
+      if (!brandRows.some((r) => r._state_id == null)) {
+        const label = bk === '' ? 'No Brand' : brandRows[0]._brand_name;
+        blockAllRows(acc.rows, `${label} has state prices but no all-states price for "${acc.material_name}"`);
+        missingBase = true;
+      }
+    }
+    if (missingBase) continue;
+
+    // Compile client price GROUPS: brands whose base price AND whole
+    // state-override map are identical share ONE group.
+    const perBrand = new Map();
+    for (const bk of brandKeys) {
+      const brandRows = liveRows.filter((r) => r._brand_key === bk);
+      const baseRow = brandRows.find((r) => r._state_id == null);
+      const overrides = new Map();
+      for (const r of brandRows) if (r._state_id != null) overrides.set(r._state_id, r._price);
+      perBrand.set(bk, { brand_id: baseRow._brand_id, brand_name: baseRow._brand_name, basePrice: baseRow._price, overrides });
+    }
+
+    const bySig = new Map();
+    for (const b of perBrand.values()) {
+      const ov = [...b.overrides.entries()].sort((a, c) => a[0] - c[0])
+        .map(([sid, p]) => `${sid}:${Number(p).toFixed(2)}`).join(',');
+      const sig = `${Number(b.basePrice).toFixed(2)}|${ov}`;
+      if (!bySig.has(sig)) bySig.set(sig, { basePrice: b.basePrice, overrides: b.overrides, brand_ids: [], brand_names: [] });
+      const entry = bySig.get(sig);
+      if (b.brand_id != null) { entry.brand_ids.push(b.brand_id); entry.brand_names.push(b.brand_name); }
+    }
+
+    const groups = [...bySig.values()].map((entry) => {
+      // Group states sharing the same override price into one entry.
+      const priceToStates = new Map();
+      for (const [stateId, price] of entry.overrides) {
+        const priceKey = Number(price).toFixed(2);
+        if (!priceToStates.has(priceKey)) priceToStates.set(priceKey, { price: Number(price), state_ids: [] });
+        priceToStates.get(priceKey).state_ids.push(stateId);
+      }
+      return {
+        price: entry.basePrice, brand_ids: entry.brand_ids, brand_names: entry.brand_names,
+        states: [...priceToStates.values()],
+      };
+    });
+
     // Belt-and-suspenders: reuse the SAME cross-row validation the direct
-    // PUT route enforces (No Brand mixing / duplicate brand / price>0 /
-    // duplicate state) — the per-row checks above should already agree,
+    // PUT route enforces — the per-row checks above should already agree,
     // but this guarantees commit-time parity with replace().
-    const groupsForValidation = acc.groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states }));
+    const groupsForValidation = groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states }));
     try {
       materialRatesSvc.validateClientGroupsPayload(groupsForValidation);
     } catch (e) {
-      for (const row of acc.rows) { row.errors.push(e.message); row.outcome = 'blocked'; }
+      blockAllRows(acc.rows, e.message);
       continue;
     }
 
-    const isNewMaterial = !existingByMaterialId.has(acc.material_id);
-    const existingSigs = existingSignaturesByMaterialId.get(acc.material_id);
-    for (const g of acc.groups) {
-      const sig = groupSignature(g.price, g.brand_ids, g.states);
-      g._row.outcome = isNewMaterial ? 'new' : (existingSigs && existingSigs.has(sig) ? 'unchanged' : 'update');
-    }
+    acc.groups = groups;
+
+    const isNewMaterial = acc.material_id == null || !existingByMaterialId.has(acc.material_id);
+    const existingSigs = acc.material_id != null ? existingSignaturesByMaterialId.get(acc.material_id) : null;
+    const newSigs = new Set(groups.map((g) => groupSignature(g.price, g.brand_ids, g.states)));
+    const unchanged = !isNewMaterial && existingSigs && existingSigs.size === newSigs.size
+      && [...newSigs].every((s) => existingSigs.has(s));
+    acc.outcome = isNewMaterial ? 'new' : (unchanged ? 'unchanged' : 'update');
+    for (const r of resolvedRows) r.outcome = acc.outcome;
   }
 
-  return { rows, materials };
+  return { rows, materials, stateNameById };
 }
 
 function publicMaterialRow(r) {
   return {
-    row_number: r.row_number, material: r.material, brands: r.brands, price: r.price,
-    state_overrides: r.state_overrides, outcome: r.outcome, errors: r.errors,
+    row_number: r.row_number, material: r.material, brand: r.brand, price: r.price, state: r.state,
+    outcome: r.outcome, errors: r.errors, warnings: r.warnings,
+  };
+}
+
+// The compiled "what goes where" plan for one material — a group's brands
+// and state overrides expanded back into Brand/State/Price lines, the same
+// expansion services/client-xlsx.service.js#addMaterialRatesSheet uses when
+// writing the sheet, so the preview reads as "this is what the download
+// would show" even though it's built from the parser's own group shape (IDs
+// only) rather than client-material-rates.service.js#list()'s shape (which
+// carries names).
+function publicMaterialPlan(acc, stateNameById) {
+  const lines = [];
+  for (const g of (acc.groups || [])) {
+    const brandLabels = g.brand_ids.length === 0 ? ['No Brand'] : g.brand_names;
+    for (const brandLabel of brandLabels) {
+      lines.push({ brand: brandLabel, state: 'All States', price: g.price });
+      for (const s of g.states) {
+        for (const stateId of s.state_ids) {
+          lines.push({ brand: brandLabel, state: stateNameById.get(stateId) || `#${stateId}`, price: s.price });
+        }
+      }
+    }
+  }
+  return {
+    material: acc.material_name,
+    material_id: acc.material_id,
+    outcome: acc.outcome || 'blocked',
+    lines,
+    errors: [...new Set(acc.rows.flatMap((r) => r.errors))],
   };
 }
 
@@ -503,8 +725,12 @@ function summarizeMaterialRateRows(rows) {
 }
 
 async function previewMaterialRatesUpload(buffer, clientId) {
-  const { rows } = await parseMaterialRateRows(buffer, clientId);
-  return { rows: rows.map(publicMaterialRow), summary: summarizeMaterialRateRows(rows) };
+  const { rows, materials, stateNameById } = await parseMaterialRateRows(buffer, clientId);
+  return {
+    rows: rows.map(publicMaterialRow),
+    materials: [...materials.values()].map((acc) => publicMaterialPlan(acc, stateNameById)),
+    summary: summarizeMaterialRateRows(rows),
+  };
 }
 
 async function commitMaterialRatesUpload(buffer, clientId, actor = {}) {
@@ -515,12 +741,14 @@ async function commitMaterialRatesUpload(buffer, clientId, actor = {}) {
       { rows: rows.map(publicMaterialRow), summary });
   }
 
+  const writable = [...materials.values()].filter((acc) => acc.groups && acc.material_id != null);
+
   // Re-validate brand/state existence right before writing — a race between
   // preview and commit (a brand/state deactivated meanwhile) must be caught
   // here, not silently written. materialRatesSvc.replace() below repeats this
   // per-material too; run it once up front so a mid-transaction 422 refuses
   // the WHOLE file before any material is written, matching "all or none".
-  for (const acc of materials.values()) {
+  for (const acc of writable) {
     await materialRatesSvc.assertBrandsAndStatesExist(
       acc.groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states })),
     );
@@ -529,7 +757,7 @@ async function commitMaterialRatesUpload(buffer, clientId, actor = {}) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    for (const acc of materials.values()) {
+    for (const acc of writable) {
       const groups = acc.groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states }));
       await materialRatesSvc.replace(clientId, acc.material_id, { groups }, actor, { conn });
     }
@@ -541,7 +769,7 @@ async function commitMaterialRatesUpload(buffer, clientId, actor = {}) {
   } finally {
     conn.release();
   }
-  logger.info({ client_id: clientId, materials: materials.size }, 'Material rate-card bulk upload committed');
+  logger.info({ client_id: clientId, materials: writable.length }, 'Material rate-card bulk upload committed');
   return { summary };
 }
 

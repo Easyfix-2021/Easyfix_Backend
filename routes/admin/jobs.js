@@ -2795,33 +2795,31 @@ async function sendEstimateEmail(jobId, userId) {
   // Recipient resolution mirrors legacy `confirmApprovejob`:
   // reporting contact's manager_name CSV (legacy stores emails here, not
   // names) + contact_email, owner email. Skip clearly malformed entries
-  // so a typo in one CSV field doesn't poison the whole send.
-  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  const recipients = new Set();
-  const skipped = [];
-  const addIfValid = (raw, source) => {
-    const v = String(raw || '').trim();
-    if (!v) return;
-    if (EMAIL_RE.test(v)) recipients.add(v);
-    else skipped.push({ value: v, source });
-  };
-  addIfValid(j.client_spoc_email, 'job.client_spoc_email');
-  addIfValid(j.owner_email,       'owner.official_email');
+  // so a typo in one CSV field doesn't poison the whole send. Validation +
+  // dedupe lives in services/email-address.util.js, shared with
+  // services/material-client-request.service.js's own (narrower) recipient
+  // rule — this route keeps its own recipient SET (owner included).
+  const { collectValidEmails } = require('../../services/email-address.util');
+  const candidates = [
+    { value: j.client_spoc_email, source: 'job.client_spoc_email' },
+    { value: j.owner_email,       source: 'owner.official_email' },
+  ];
   if (j.reporting_contact_id) {
     const [[c]] = await pool.query(
       'SELECT contact_email, manager_name FROM tbl_client_contacts WHERE id = ?',
       [j.reporting_contact_id]
     );
     if (c) {
-      addIfValid(c.contact_email, 'contact.contact_email');
+      candidates.push({ value: c.contact_email, source: 'contact.contact_email' });
       if (c.manager_name) {
         for (const m of String(c.manager_name).split(',')) {
-          addIfValid(m, 'contact.manager_name[]');
+          candidates.push({ value: m, source: 'contact.manager_name[]' });
         }
       }
     }
   }
-  if (recipients.size === 0) {
+  const { recipients, skipped } = collectValidEmails(candidates);
+  if (recipients.length === 0) {
     require('../../logger').warn(
       `Estimate email skipped — no valid recipients for job ${jobId}` +
       (skipped.length ? ` (rejected ${skipped.length} malformed entries)` : '')
@@ -2830,7 +2828,7 @@ async function sendEstimateEmail(jobId, userId) {
   }
 
   await emailServiceForJobs.send({
-    to: [...recipients],
+    to: recipients,
     subject: `Client_Estimate Approval_${j.job_id}_${j.customer_name || ''}_${j.customer_mob_no || ''}`,
     text: `Hi ${j.client_name || ''},\n\n`
       + `Please find below the estimate for job ${j.job_reference_id || j.job_id}.\n\n`
@@ -2839,7 +2837,7 @@ async function sendEstimateEmail(jobId, userId) {
       + `Kindly approve via the client portal.\n\nRegards,\nEasyFix`,
     category: 'estimate.send-for-approval',
   });
-  logger.info('Estimate email sent · jobId=' + jobId + ' recipients=' + recipients.size);
+  logger.info('Estimate email sent · jobId=' + jobId + ' recipients=' + recipients.length);
 }
 
 // ─── Job Comments sub-resource (legacy tbl_job_comment) ──────────────
@@ -3527,6 +3525,16 @@ router.post(
         // uncommitted UPDATE). Re-read now that the transaction is durable so
         // the response reflects the real, committed status.
         updated = await job.getById(jobId);
+
+        // "Send Request to Client" — fire-and-forget, exactly like
+        // send-for-approval's sendEstimateEmail: AFTER commit, never
+        // awaited, and a failure here must never undo or fail this
+        // response (see services/material-client-request.service.js).
+        require('../../services/material-client-request.service')
+          .sendMaterialClientRequest(jobId)
+          .catch((err) => {
+            logger.warn('Material client request failed (non-fatal) · jobId=' + jobId + ' · ' + err.message);
+          });
       } else {
         updated = await job.setStatus(
           jobId,

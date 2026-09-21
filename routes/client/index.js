@@ -1949,15 +1949,20 @@ router.get('/notices', async (req, res, next) => {
     // jobs (dashboard_notification_log.job_id → tbl_job.fk_client_id), not by an
     // individual user_id (those rows are keyed to whichever internal/SPOC user
     // the event fired for, so a user-id filter misses the client's own events).
+    // Scoped to the jobs THIS contact may see (the shared hierarchy scope): a
+    // notification names a job and, for material approvals, its amounts — a
+    // branch-limited SPOC must not read another branch's. Same predicate the
+    // job lists use, so the feed and the jobs page always agree.
+    const scope = scopePredicate(hierarchyFilter(await resolveClientHierarchy(req), req));
     const [rows] = await pool.query(
       `SELECT n.id, n.n_title, n.n_desc, n.status, n.job_id, n.createdAt
          FROM dashboard_notification_log n
          JOIN tbl_job j ON j.job_id = n.job_id
-        WHERE j.fk_client_id = ?
+        WHERE j.fk_client_id = ? AND ${scope.sql}
         GROUP BY n.job_id
         ORDER BY n.createdAt DESC
         LIMIT 100`,
-      [req.spoc.client_id]);
+      [req.spoc.client_id, ...scope.params]);
     const items = rows.map((r) => ({
       notice_id: r.id,
       title: r.n_title || 'Notification',
@@ -2403,7 +2408,24 @@ router.get('/notices/unread-count', async (req, res, next) => {
           )`,
       [now, now, req.spoc.id]
     );
-    modernOk(res, { count: Number(unread) || 0 });
+    // Job-linked dashboard notifications (booking confirmed, material
+    // approval needed, …) — SAME client scoping as GET /notices above
+    // (job_id -> tbl_job.fk_client_id, not user_id). Without this half the
+    // bell never moved for those events even though GET /notices showed
+    // them — "hard to miss" needs the count to include them too.
+    // Same hierarchy scope as GET /notices, so the badge never counts a job
+    // notification the list would not show this contact.
+    const scope = scopePredicate(hierarchyFilter(await resolveClientHierarchy(req), req));
+    const [[{ unread: jobsUnread }]] = await pool.query(
+      `SELECT COUNT(DISTINCT n.job_id) AS unread
+         FROM dashboard_notification_log n
+         JOIN tbl_job j ON j.job_id = n.job_id
+        WHERE j.fk_client_id = ? AND n.status <> 'read' AND ${scope.sql}`,
+      [req.spoc.client_id, ...scope.params]
+    );
+    const notices = Number(unread) || 0;
+    const jobs = Number(jobsUnread) || 0;
+    modernOk(res, { count: notices + jobs, notices, jobs });
   } catch (e) { next(e); }
 });
 

@@ -120,6 +120,7 @@ async function listForClient(clientId) {
             COALESCE(cs.overhead_variable,       0) AS overhead_variable,
             COALESCE(cs.client_fixed,            0) AS client_fixed,
             COALESCE(cs.client_variable,         0) AS client_variable,
+            COALESCE(cs.total_amount,            0) AS total_amount,
             st.service_type_name,
             st.service_catg_id
        FROM tbl_client_service cs
