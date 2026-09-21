@@ -40,6 +40,7 @@ const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
 const materialRatesSvc = require('../../services/client-material-rates.service');
+const rateCardUploadSvc = require('../../services/rate-card-bulk-upload.service');
 const lookupSvc = require('../../services/lookup.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
 // Same module the client portal's Performance book judges against — see the
@@ -62,6 +63,18 @@ const DOC_MIME = new Set([
   'image/png', 'image/jpeg', 'image/webp', 'image/gif',
   'application/pdf',
 ]);
+
+// Multer in-memory storage for the Rate Card Bulk Upload (.xlsx only) —
+// same shape as routes/admin/materials.js's `upload` for the Manage
+// Materials import.
+const uploadRateCardXlsx = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/\.(xlsx|xls)$/i.test(file.originalname)) cb(null, true);
+    else cb(new Error('Only .xlsx / .xls files are accepted'));
+  },
+});
 
 /* ─── Permission gates ────────────────────────────────────────────── */
 // Migrated 2026-05-30 from inline `req.user.permissions.actionPermissions`
@@ -1637,6 +1650,65 @@ router.delete(
   },
 );
 
+/*
+ * Rate Card Bulk Upload — Services tab
+ * (docs/superpowers/specs/2026-09-21-rate-card-bulk-upload-design.md).
+ *
+ * GET  /:clientId/rate-cards/template        → blank template (header + 1 example row)
+ * POST /:clientId/rate-cards/upload/preview  → parse + validate, writes nothing
+ * POST /:clientId/rate-cards/upload/commit   → re-validates, writes in ONE transaction
+ *
+ * Accepts exactly what GET /:clientId/rate-cards/download writes
+ * (exportRateCards' columns). Client id is ALWAYS the URL param — never
+ * read from the file. All three sit behind isClientEdit, unlike the
+ * read-only rate-cards routes above.
+ */
+router.get('/:clientId/rate-cards/template', requireClientEdit, async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    logger.info('Download services rate-card template · clientId=' + req.params.clientId);
+    await rateCardUploadSvc.generateServicesTemplate(res);
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/:clientId/rate-cards/upload/preview',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Preview services rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.previewServicesUpload(req.file.buffer, req.params.clientId);
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.post(
+  '/:clientId/rate-cards/upload/commit',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Commit services rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.commitServicesUpload(
+        req.file.buffer, req.params.clientId, { userId: req.user && req.user.user_id },
+      );
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.rows ? { rows: e.rows, summary: e.summary } : undefined);
+      next(e);
+    }
+  },
+);
+
 /* ─── Client Material Rates (Material Management phase 2, sub-project C) ──
  *
  * Client-specific material price overrides on top of the material master
@@ -1772,6 +1844,65 @@ router.post(
       modernOk(res, out);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * Rate Card Bulk Upload — Materials tab
+ * (docs/superpowers/specs/2026-09-21-rate-card-bulk-upload-design.md).
+ *
+ * GET  /:clientId/material-rates/template        → blank template
+ * POST /:clientId/material-rates/upload/preview  → parse + validate, writes nothing
+ * POST /:clientId/material-rates/upload/commit   → re-validates, writes in ONE transaction
+ *
+ * Accepts exactly what GET /:clientId/material-rates/download writes
+ * (exportMaterialRates' columns, including its literal State Overrides
+ * grammar). Client id is ALWAYS the URL param. All three sit behind
+ * isClientEdit, unlike the read-only material-rates routes above.
+ */
+router.get('/:clientId/material-rates/template', requireClientEdit, async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    logger.info('Download material rate-card template · clientId=' + req.params.clientId);
+    await rateCardUploadSvc.generateMaterialRatesTemplate(res);
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/:clientId/material-rates/upload/preview',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Preview material rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.previewMaterialRatesUpload(req.file.buffer, req.params.clientId);
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.post(
+  '/:clientId/material-rates/upload/commit',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Commit material rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.commitMaterialRatesUpload(
+        req.file.buffer, req.params.clientId, { userId: req.user && req.user.user_id },
+      );
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.rows ? { rows: e.rows, summary: e.summary } : undefined);
       next(e);
     }
   },
