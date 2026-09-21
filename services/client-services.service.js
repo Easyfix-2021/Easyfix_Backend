@@ -307,7 +307,8 @@ const COST_COLUMN_MAP = [
   ['clientVariable',        'client_variable'],
 ];
 
-async function create(clientId, body) {
+// `conn` (optional): see update() below — same external-transaction idiom.
+async function create(clientId, body, { conn: externalConn = null } = {}) {
   logger.info('Create client service · clientId=' + clientId + ' categoryId=' + body.serviceCategoryId + ' chargeType=' + (body.chargeType ?? 'null'));
   const csv = idsToCsv(body.serviceTypeIds);
   const hasTypeIds = await clientServiceHasTypeIds(pool);
@@ -357,7 +358,7 @@ async function create(clientId, body) {
   vals.push(body.serviceStatus != null ? body.serviceStatus : 1);
 
   const placeholders = cols.map(() => '?').join(', ');
-  const [ins] = await pool.query(
+  const [ins] = await (externalConn || pool).query(
     `INSERT INTO tbl_client_service (${cols.join(', ')}) VALUES (${placeholders})`,
     vals,
   );
@@ -366,7 +367,12 @@ async function create(clientId, body) {
 }
 
 // Partial update. service_type_ids accepted as array → CSV.
-async function update(clientServiceId, body) {
+//
+// `conn` (optional): pass an open transaction connection so a caller writing
+// several rows atomically (e.g. the rate-card bulk-upload commit) shares ONE
+// transaction instead of each update() committing on its own — same idiom as
+// job.service.js#setStatus's `conn: externalConn` param: `(conn || pool)`.
+async function update(clientServiceId, body, { conn: externalConn = null } = {}) {
   logger.info('Update client service · id=' + clientServiceId);
   const sets = [];
   const vals = [];
@@ -427,7 +433,7 @@ async function update(clientServiceId, body) {
     throw Object.assign(new Error('nothing to update'), { status: 400 });
   }
   vals.push(clientServiceId);
-  const [r] = await pool.query(
+  const [r] = await (externalConn || pool).query(
     `UPDATE tbl_client_service SET ${sets.join(', ')} WHERE client_service_id = ?`,
     vals,
   );

@@ -221,7 +221,11 @@ async function digilockerDownloadAadhaar(efrId, clientId) {
   logger.info('KYC DigiLocker Aadhaar downloaded · clientId=' + (clientId || '-'));
   const d = parsed.data || {};
   return {
-    aadhaarNumber: d.aadhaar_number || d.masked_aadhaar || null,
+    // Never fall back to `masked_aadhaar`: DigiLocker usually returns only the
+    // mask (xxxxxxxx1234), and a mask handed out as `aadhaarNumber` gets saved
+    // as the technician's Aadhaar. The legacy Flutter app did exactly that
+    // (~85 rows), and the real number can't be recovered from what is stored.
+    aadhaarNumber: d.aadhaar_number || null,
     name: d.name || null,
     dob: d.dob || null,
     gender: d.gender || null,
