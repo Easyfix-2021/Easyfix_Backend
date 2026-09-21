@@ -275,6 +275,39 @@ async function exists(key) {
 }
 
 /*
+ * Read an object's bytes server-side. Returns null when the key does not
+ * exist; any other error bubbles (an S3 outage must not read as "no file").
+ * For private objects the backend streams to an authorised caller itself
+ * rather than handing the browser a presigned URL.
+ */
+async function getObjectBuffer(key) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { GetObjectCommand } = require('@aws-sdk/client-s3');
+  try {
+    const r = await client().send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    return Buffer.from(await r.Body.transformToByteArray());
+  } catch (e) {
+    if (e?.$metadata?.httpStatusCode === 404 || e?.name === 'NoSuchKey' || e?.Code === 'NoSuchKey') return null;
+    throw e;
+  }
+}
+
+/*
+ * Replace an object's tag set. Tags (unlike metadata) can be changed without
+ * rewriting the object, and lifecycle rules can filter on them — used to mark
+ * superseded QuickSight Employee Performance snapshots for expiry.
+ */
+async function tagObject(key, tags) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectTaggingCommand } = require('@aws-sdk/client-s3');
+  await client().send(new PutObjectTaggingCommand({
+    Bucket: BUCKET,
+    Key: key,
+    Tagging: { TagSet: Object.entries(tags).map(([Key, Value]) => ({ Key, Value: String(Value) })) },
+  }));
+}
+
+/*
  * Mint a presigned GET URL the browser can hit directly. TTL is
  * intentionally short (5 min) — long enough to render images in a
  * page session, short enough that a leaked URL ages out before it's
@@ -702,4 +735,8 @@ module.exports = {
   putSkillImage,
   // Generic arbitrary-key put (2026-06-12) — used by Deep Skill preview staging:
   putAtKey,
+  // Generic server-side read (2026-09-15) — QuickSight Employee Performance snapshot:
+  getObjectBuffer,
+  // Tag replace (2026-09-21) — marks superseded Employee Performance data for the lifecycle rule:
+  tagObject,
 };
