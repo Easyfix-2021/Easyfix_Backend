@@ -41,7 +41,7 @@ const { rateLimit } = require('../../middleware/rate-limit');
 const logger = require('../../logger');
 const emailService = require('../../services/email.service');
 const jobService = require('../../services/job.service');
-const { isEstimateApprovable, assertEstimateApprovable } = require('../../services/job-estimate-approval');
+const { isEstimateApprovable, assertEstimateApprovable, stampApprovalPendingLines } = require('../../services/job-estimate-approval');
 
 // Peek-the-token middleware. Runs the signature check WITHOUT any
 // downstream SQL so the rate limiter can key its bucket on jobId.
@@ -231,19 +231,33 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next
     // Owner rule (design "Flow"): a status-16 job has not been PM-reviewed
     // yet — the client link may show it but must not be able to act on it.
     assertEstimateApprovable(job.job_status);
-    await pool.query(
-      `UPDATE tbl_job
-          SET approved_by_client_contact = ?,
-              approved_on_date_time      = ?
-        WHERE job_id = ?`,
-      [clientContactId, new Date(), jobId]
-    );
     let linkedUserId = null;
     if (clientContactId) {
       const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [clientContactId]);
       linkedUserId = link?.user_id ?? null;
     }
-    await jobService.setStatus(jobId, { status: 1 }, { user_id: linkedUserId });
+    // Material Request Flow v2 (2026-09-21) — same shared transaction shape
+    // as the authed client flow (routes/client/index.js): the tbl_job stamp,
+    // the approval_pending line stamps and the status move all land together.
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `UPDATE tbl_job
+            SET approved_by_client_contact = ?,
+                approved_on_date_time      = ?
+          WHERE job_id = ?`,
+        [clientContactId, new Date(), jobId]
+      );
+      await stampApprovalPendingLines(conn, jobId, true);
+      await jobService.setStatus(jobId, { status: 1 }, { user_id: linkedUserId }, { conn });
+      await conn.commit();
+    } catch (e) {
+      try { await conn.rollback(); } catch { /* connection may already be gone */ }
+      throw e;
+    } finally {
+      conn.release();
+    }
     logger.info({ jobId, clientContactId }, 'public-estimate: approved via token link');
     return modernOk(res, { approved: true });
   } catch (e) {
@@ -299,24 +313,38 @@ router.patch('/:token/reject', peekToken, tokenRateLimit, async (req, res, next)
     // Owner rule (design "Flow"): a status-16 job has not been PM-reviewed
     // yet — the client link may show it but must not be able to act on it.
     assertEstimateApprovable(job.job_status);
-    await pool.query(
-      `UPDATE tbl_job
-          SET approval_reject_reason     = ?,
-              approval_reject_date_time  = ?
-        WHERE job_id = ?`,
-      [reason, new Date(), jobId]
-    );
     // Material Management phase 2, sub-project D (2026-09-18): mirrors PATCH
     // /api/client/jobs/:id/estimate/reject — reject ALSO moves job_status to
     // 2 (IN_PROGRESS), the canonical "2/20 Pending to Close on App" target,
-    // through jobService.setStatus().
+    // through jobService.setStatus(). Material Request Flow v2 (2026-09-21)
+    // adds the approval_pending line stamps, in the SAME transaction as the
+    // tbl_job writes and the status move — same shared shape as the authed
+    // client flow (routes/client/index.js).
     {
       let linkedUserId = null;
       if (clientContactId) {
         const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [clientContactId]);
         linkedUserId = link?.user_id ?? null;
       }
-      await jobService.setStatus(jobId, { status: 2 }, { user_id: linkedUserId });
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.query(
+          `UPDATE tbl_job
+              SET approval_reject_reason     = ?,
+                  approval_reject_date_time  = ?
+            WHERE job_id = ?`,
+          [reason, new Date(), jobId]
+        );
+        await stampApprovalPendingLines(conn, jobId, false);
+        await jobService.setStatus(jobId, { status: 2 }, { user_id: linkedUserId }, { conn });
+        await conn.commit();
+      } catch (e) {
+        try { await conn.rollback(); } catch { /* connection may already be gone */ }
+        throw e;
+      } finally {
+        conn.release();
+      }
     }
 
     // Fire ops escalation — best-effort, never blocks the response.

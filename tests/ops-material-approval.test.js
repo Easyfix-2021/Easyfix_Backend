@@ -94,9 +94,13 @@ let simulateLineWriteFailureFor = null; // a line id, or null
 
 function materialLine(over = {}) {
   return {
+    // sent_on defaults to "already sent" — Material Request Flow v2
+    // (2026-09-21) narrows "pending" to review_pending (sent_on IS NOT NULL
+    // AND action_on IS NULL); a fixture line with sent_on unset would no
+    // longer read as pending under the real predicate.
     id: null, job_id: JOB_ID, type: 'material', name: 'Pipe fitting',
     unit: 2, unit_price: 999, approved_charge: null,
-    status: 1, action_by: null, action_on: null,
+    status: 1, action_by: null, action_on: null, sent_on: new Date('2026-09-20T10:00:00Z'),
     ...over,
   };
 }
@@ -113,6 +117,7 @@ function filterQuotationRows(sql, jobIds) {
   const requiredStatus = statusMatch ? Number(statusMatch[1]) : null;
   const requiresActionOnNotNull = /action_on\s+IS\s+NOT\s+NULL/i.test(sql);
   const requiresActionOnNull = /action_on\s+IS\s+NULL/i.test(sql) && !requiresActionOnNotNull;
+  const requiresSentOnNotNull = /sent_on\s+IS\s+NOT\s+NULL/i.test(sql);
   const requiresTypeMaterial = /type\s*=\s*'material'/i.test(sql);
   return quotationRows.filter((r) => {
     if (!jobIds.includes(r.job_id)) return false;
@@ -120,6 +125,7 @@ function filterQuotationRows(sql, jobIds) {
     if (requiredStatus != null && Number(r.status) !== requiredStatus) return false;
     if (requiresActionOnNotNull && r.action_on == null) return false;
     if (requiresActionOnNull && r.action_on != null) return false;
+    if (requiresSentOnNotNull && r.sent_on == null) return false;
     return true;
   });
 }
@@ -353,15 +359,19 @@ test('TRANSACTION: a failing line write leaves the job at 16 (never reaches setS
 // 2. Coverage / amount validation → 422, job stays at 16
 // ═════════════════════════════════════════════════════════════════════════
 
-test('422: a pending line missing from the review', async () => {
+// Material Request Flow v2 (2026-09-21): a missing or an unknown/extra
+// line_id is now 409 (the quote changed under the reviewer), not 422 — see
+// routes/admin/jobs.js's MATERIAL_LINES_CHANGED_MESSAGE.
+test('409: a pending line missing from the review', async () => {
   quotationRows = [materialLine({ id: 91 }), materialLine({ id: 92 })];
   const res = await adminPost({ decision: 'approve', lines: [{ line_id: 91, decision: 'approve', approved_amount: 10 }] });
-  assert.equal(res.status, 422, JSON.stringify(res.body));
+  assert.equal(res.status, 409, JSON.stringify(res.body));
+  assert.match(res.body?.error ?? '', /reload and review again/i);
   assert.equal(statusUpdates(fake.calls).length, 0);
   assert.equal(quotationUpdates(fake.calls).length, 0, 'nothing may be written before the coverage check passes');
 });
 
-test('422: an unknown line_id', async () => {
+test('409: an unknown line_id', async () => {
   quotationRows = [materialLine({ id: 91 })];
   const res = await adminPost({
     decision: 'approve',
@@ -370,7 +380,7 @@ test('422: an unknown line_id', async () => {
       { line_id: 999, decision: 'reject' },
     ],
   });
-  assert.equal(res.status, 422, JSON.stringify(res.body));
+  assert.equal(res.status, 409, JSON.stringify(res.body));
   assert.equal(statusUpdates(fake.calls).length, 0);
 });
 
@@ -419,25 +429,36 @@ test('approved_amount of exactly 0 is accepted (>= 0, not > 0)', async () => {
 // 5. Whole-review reject leaves every line untouched
 // ═════════════════════════════════════════════════════════════════════════
 
-test('a whole-review reject leaves every material line untouched (still pending)', async () => {
+// Material Request Flow v2 (2026-09-21) — "Reject Request" changed shape:
+// every review_pending material line is now REJECTED (status=0, action_on
+// stamped) and the job returns to its PRE-status (2, IN_PROGRESS, is the
+// default this fixture's tbl_job_material_review lookup falls back to —
+// nothing seeds a row, so getPreMaterialStatus's own default applies), NOT
+// "stays 16, lines untouched" as sub-project D originally shipped.
+test('a whole-review reject marks every review_pending line REJECTED and returns the job to its pre-status', async () => {
   quotationRows = [materialLine({ id: 91 }), materialLine({ id: 92 })];
   const res = await adminPost({ decision: 'reject', reason: 'Quote missing brand' });
   assert.equal(res.status, 200, JSON.stringify(res.body));
-  assert.equal(quotationUpdates(fake.calls).length, 0, 'no quotation_details row may be touched on a whole-review reject');
-  assert.equal(quotationRows[0].status, 1);
-  assert.equal(quotationRows[0].action_on, null);
-  assert.equal(quotationRows[1].status, 1);
-  assert.equal(quotationRows[1].action_on, null);
+  assert.equal(quotationRows[0].status, 0, 'line 91 must be rejected');
+  assert.ok(quotationRows[0].action_on, 'line 91 must be stamped action_on');
+  assert.equal(quotationRows[1].status, 0, 'line 92 must be rejected');
+  assert.ok(quotationRows[1].action_on, 'line 92 must be stamped action_on');
+  const upd = statusUpdates(fake.calls)[0];
+  assert.ok(upd, 'the job status move must have run');
+  assert.equal(boundValue(upd, 'job_status'), 2, 'no stored pre-status defaults to 2 (IN_PROGRESS)');
+  assert.equal(boundValue(upd, 'material_sub_status'), null);
 });
 
-test('a `lines` payload sent alongside a whole-review reject is ignored, not validated', async () => {
+test('a `lines` payload sent alongside a whole-review reject is ignored — every review_pending line is rejected regardless of what `lines` said', async () => {
   quotationRows = [materialLine({ id: 91 })];
-  // If this were validated as a coverage review it would 422 (line 91 given
-  // an approve decision with no amount) — but decision is 'reject', so `lines`
-  // must never reach the coverage/amount checks at all.
+  // `lines` asks to APPROVE line 91 with no amount at all — if this were
+  // validated as a coverage/content review it would 409 or 422. Since
+  // decision is 'reject', `lines` must never reach those checks, and the
+  // line must still land REJECTED (not approved, and not left untouched).
   const res = await adminPost({ decision: 'reject', reason: 'anything', lines: [{ line_id: 91, decision: 'approve' }] });
   assert.equal(res.status, 200, JSON.stringify(res.body));
-  assert.equal(quotationUpdates(fake.calls).length, 0);
+  assert.equal(quotationRows[0].status, 0, 'the line is rejected — `lines`\' own "approve" was never consulted');
+  assert.equal(quotationRows[0].approved_charge, null, 'a whole-review reject never writes an approved_charge');
 });
 
 // ═════════════════════════════════════════════════════════════════════════

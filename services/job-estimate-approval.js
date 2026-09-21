@@ -41,4 +41,34 @@ function assertEstimateApprovable(jobStatus) {
   }
 }
 
-module.exports = { isEstimateApprovable, assertEstimateApprovable, ESTIMATE_PENDING_APPROVAL };
+/*
+ * Material Request Flow v2 (2026-09-21) — the client's approve/reject
+ * decision now ALSO stamps client_status/client_action_on on every
+ * `approval_pending` quotation_details line for the job, in the SAME
+ * transaction as the tbl_job move (setStatus's `conn` option). ONE function
+ * because it has the same four call sites this file's header already
+ * enumerates (routes/client/index.js's authed approve/reject, routes/public/
+ * estimate.js's token approve/reject) — a per-route copy is exactly how a
+ * fifth surface misses it next time.
+ *
+ * Targets `approval_pending` lines specifically (quotationLineState's own
+ * predicate: action_on IS NOT NULL AND status = 1 AND client_status IS
+ * NULL) rather than "every line on the job" — a `rejected` (CRM-rejected)
+ * line was never shown to the client and must never look client-actioned.
+ */
+const quotationLineState = require('./quotation-line-state');
+
+async function stampApprovalPendingLines(conn, jobId, approved) {
+  const predicate = quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.APPROVAL_PENDING);
+  await conn.query(
+    `UPDATE quotation_details
+        SET client_status = ?, client_action_on = ?
+      WHERE job_id = ? AND (${predicate})`,
+    [approved ? 1 : 0, new Date(), jobId],
+  );
+}
+
+module.exports = {
+  isEstimateApprovable, assertEstimateApprovable, ESTIMATE_PENDING_APPROVAL,
+  stampApprovalPendingLines,
+};

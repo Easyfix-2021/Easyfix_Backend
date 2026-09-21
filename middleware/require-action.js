@@ -84,4 +84,47 @@ function requireAction(actionKey) {
   };
 }
 
+/*
+ * requireAnyAction(actionKeys) — passes when the caller holds AT LEAST ONE
+ * of the listed action keys, rather than exactly one.
+ *
+ * Added 2026-09-21 for a READ-ONLY cross-grant: the CRM's Material Review
+ * "Add Material" dialog (isJobMaterialReview, held by roles 2 Admin and 13
+ * Project Manager) needs to search GET /admin/materials and
+ * GET /admin/materials/:id, which were gated on isMaterialView alone (role 2
+ * only) — a PM would 403 opening that dialog. The fix is an any-of on the
+ * two GET routes, NOT granting isMaterialView to role 13: that would also
+ * expose the standalone Manage Materials master screen, which
+ * isJobMaterialReview was never meant to unlock. Every WRITE route on
+ * materials (add/edit/deactivate/delete/import) stays on plain
+ * requireAction('isMaterialView'-or-stronger) and is unaffected.
+ */
+function requireAnyAction(actionKeys) {
+  const keys = Array.isArray(actionKeys) ? actionKeys.filter(Boolean) : [];
+  if (keys.length === 0) {
+    throw new Error('requireAnyAction(): actionKeys must be a non-empty array');
+  }
+
+  return async function anyActionGuard(req, res, next) {
+    try {
+      if (!req.user || !req.user.user_id) {
+        return modernError(res, 401, 'authentication required');
+      }
+
+      if (!req.user.permissions) {
+        req.user.permissions = await getEffectivePermissions(req.user.user_id);
+      }
+
+      const perms = (req.user.permissions && req.user.permissions.actionPermissions) || [];
+      if (!keys.some((k) => perms.includes(k))) {
+        return modernError(res, 403, `Missing permission: one of ${keys.join(', ')}`);
+      }
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  };
+}
+
 module.exports = requireAction;
+module.exports.requireAnyAction = requireAnyAction;

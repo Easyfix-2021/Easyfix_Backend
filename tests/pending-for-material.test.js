@@ -105,6 +105,22 @@ const fake = installFakePool([
   [/^\s*INSERT INTO tbl_job_comment/i, () => ({ insertId: 1, affectedRows: 1 })],
   [/^\s*INSERT INTO tbl_job_logs/i, () => ({ insertId: 1, affectedRows: 1 })],
   [/INFORMATION_SCHEMA/i, () => [{ n: 3 }]],
+  // Material Request Flow v2 (2026-09-21): sendForApproval/materialRequired
+  // now require at least one DRAFT line to exist — one fixture draft row so
+  // this file keeps testing sub-project D's original behaviour, not the new
+  // 422 guard (covered in tests/quotation-line-state.test.js /
+  // tests/material-request-flow-v2.test.js). Matched by the ABSENCE of
+  // `type = 'material'` — that clause is unique to the admin material-review
+  // route's pendingIds lookup, which must see NO rows here (this file's
+  // material-review tests assert on an EMPTY `lines` review).
+  [/^\s*SELECT id FROM quotation_details(?!.*type\s*=\s*'material')/is, () => [{ id: 1 }]],
+  [/^\s*SELECT id FROM quotation_details.*type\s*=\s*'material'/is, () => []],
+  [/^\s*UPDATE quotation_details\b/i, () => ({ affectedRows: 1 })],
+  // Client/public approve-reject: the approval_pending line stamp — no line
+  // fixtures in THIS file's world, so an UPDATE that touches 0 rows is
+  // correct (nothing to stamp) and this is here only so the query has a
+  // canned response rather than falling through with wrong SQL shape
+  // assumptions.
   // Last resort — resolveCustomerRequests / job-services / images / videos /
   // webhook-adjacent reads this file makes no claim about.
   [/^\s*(SELECT|INSERT|UPDATE)/i, () => []],
@@ -164,14 +180,18 @@ test('positive control: setStatus still rejects 17 (17 was never added)', async 
 
 const estimateService = require('../services/mobile-job-estimate.service');
 
-test('materialRequired: 2 -> 16, material_sub_status = 1', async () => {
+// Material Request Flow v2 (2026-09-21): materialRequired is now a literal
+// ALIAS of sendForApproval (material_sub_status = 1 "Quotation Pending" is
+// retired) — 2 -> 16 with sub-status 2 "Review Pending", same as send-for-
+// approval, given the fixture draft line the fake pool now returns.
+test('materialRequired (alias of sendForApproval): 2 -> 16, material_sub_status = 2', async () => {
   jobFixture = makeJob({ job_status: 2, fk_easyfixter_id: TECH_EFR_ID });
   const out = await estimateService.materialRequired(jobFixture.job_id, TECH_EFR_ID);
   assert.equal(out.status, 16);
-  const upd = jobUpdates(fake.calls)[0];
+  const upd = jobUpdates(fake.calls).find((c) => /job_status\s*=\s*\?/i.test(c.sql));
   assert.ok(upd);
   assert.equal(boundValue(upd, 'job_status'), 16);
-  assert.equal(boundValue(upd, 'material_sub_status'), 1);
+  assert.equal(boundValue(upd, 'material_sub_status'), 2);
 });
 
 test('materialRequired: 20 (IN_PROGRESS_ALT) also qualifies', async () => {
@@ -180,17 +200,20 @@ test('materialRequired: 20 (IN_PROGRESS_ALT) also qualifies', async () => {
   assert.equal(out.status, 16);
 });
 
-test('materialRequired refuses a job that is not 2/20 — nothing is written', async () => {
+// 15 -> 409 "Waiting for client approval" (Material Request Flow v2's
+// job-level write lock — every OTHER status still refuses too, but 15 is the
+// one with its own contract message).
+test('materialRequired refuses a job at 15 — nothing is written', async () => {
   jobFixture = makeJob({ job_status: 15, fk_easyfixter_id: TECH_EFR_ID });
   await assert.rejects(
     () => estimateService.materialRequired(jobFixture.job_id, TECH_EFR_ID),
-    (e) => { assert.equal(e.status, 409); return true; },
+    (e) => { assert.equal(e.status, 409); assert.match(e.message, /Waiting for client approval/); return true; },
   );
   assert.equal(jobUpdates(fake.calls).length, 0);
 });
 
 test('sendForApproval sets 16 / material_sub_status 2 — NEVER 15', async () => {
-  jobFixture = makeJob({ job_status: 16, material_sub_status: 1, fk_easyfixter_id: TECH_EFR_ID });
+  jobFixture = makeJob({ job_status: 16, material_sub_status: 2, fk_easyfixter_id: TECH_EFR_ID });
   const out = await estimateService.sendForApproval(jobFixture.job_id, TECH_EFR_ID, {});
   assert.equal(out.sent, true);
   const upd = jobUpdates(fake.calls).find((c) => /approval_sent_on_date_time/i.test(c.sql));
@@ -258,16 +281,22 @@ test('material-review approve: 16 -> 15, permission_required stored, sub-status 
   assert.equal(cleared.params[1], null, 'approve clears the reject reason');
 });
 
-test('material-review reject: 16 stays 16, material_sub_status -> 1, reason stored in tbl_job_material_review AND tbl_job_comment', async () => {
+// Material Request Flow v2 (2026-09-21) — "Reject Request" now returns the
+// job to its PRE-status (default 2, since this fixture's world has no
+// tbl_job_material_review row seeded) rather than back to 16/1 "Quotation
+// Pending" as sub-project D originally shipped. See
+// tests/material-request-flow-v2.test.js for the case where a pre-status WAS
+// stored.
+test('material-review reject: job returns to pre-status (2), material_sub_status cleared, reason stored in tbl_job_material_review AND tbl_job_comment', async () => {
   jobFixture = makeJob({ job_status: 16, material_sub_status: 2 });
   const reason = 'Quote missing brand for item 3';
   const res = await adminPost(`/jobs/${jobFixture.job_id}/material-review`, { decision: 'reject', reason });
   assert.equal(res.status, 200, JSON.stringify(res.body));
   const upd = statusUpdates(fake.calls)[0];
   assert.ok(upd);
-  assert.equal(boundValue(upd, 'job_status'), 16);
-  assert.equal(boundValue(upd, 'material_sub_status'), 1);
-  const stored = fake.calls.find((c) => /INSERT INTO tbl_job_material_review/i.test(c.sql));
+  assert.equal(boundValue(upd, 'job_status'), 2, 'no stored pre-status defaults to 2 (IN_PROGRESS)');
+  assert.equal(boundValue(upd, 'material_sub_status'), null);
+  const stored = fake.calls.find((c) => /INSERT INTO tbl_job_material_review/i.test(c.sql) && /reject_reason/i.test(c.sql));
   assert.ok(stored, 'the reason must be persisted for the technician app');
   assert.equal(stored.params[1], reason);
 
