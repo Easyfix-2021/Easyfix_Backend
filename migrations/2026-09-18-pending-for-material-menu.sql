@@ -11,9 +11,12 @@
 --
 -- Shape copied from the sibling rows (menu_id 48-55, parent_menu 47 "My
 -- Orders", menu_depth 2, action_name 'MyOrderAction', icons 'fa-angle-right').
--- sequence 3.00055 places it directly after "Pending to Close on App"
--- (3.0005) and before "Audit & Complete" (3.0006) — the lifecycle position of
--- status 16, which a job reaches FROM Pending to Close on App.
+-- sequence 3.0005 places it directly after "Pending to Close on App" and
+-- before "Audit & Complete" — the lifecycle position of status 16, which a job
+-- reaches FROM Pending to Close on App. It TIES with Pending to Close on
+-- purpose: tbl_menu.sequence holds only 4 decimals (3.00055 rounds to 3.0006
+-- and lands AFTER Audit), and the sidebar orders by sequence then menu_id, so a
+-- tie with the lower-id row sorts this one immediately after it.
 --
 -- Idempotent: the INSERT is guarded by NOT EXISTS on the url, so a re-run is a
 -- no-op.
@@ -30,9 +33,13 @@
 -- ─── 1. The menu row ──────────────────────────────────────────────────────
 
 INSERT INTO tbl_menu (menu_name, parent_menu, menu_depth, has_child, url, menu_status, sequence, icons, action_name)
-SELECT 'Pending for Material', 47, 2, 0, 'dashboardChecking?enumDesc=PendingForMaterial', 1, 3.00055, 'fa-angle-right', 'MyOrderAction'
+SELECT 'Pending for Material', 47, 2, 0, 'dashboardChecking?enumDesc=PendingForMaterial', 1, 3.0005, 'fa-angle-right', 'MyOrderAction'
   FROM DUAL
  WHERE NOT EXISTS (SELECT 1 FROM tbl_menu WHERE url = 'dashboardChecking?enumDesc=PendingForMaterial');
+
+-- Corrects a row seeded before the 4-decimal rounding was noticed (idempotent).
+UPDATE tbl_menu SET sequence = 3.0005
+ WHERE url = 'dashboardChecking?enumDesc=PendingForMaterial' AND sequence <> 3.0005;
 
 -- ─── 2. Verify (read-only) — the id printed here goes into the env allowlist ─
 
