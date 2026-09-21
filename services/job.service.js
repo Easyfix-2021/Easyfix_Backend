@@ -621,7 +621,17 @@ const LIST_COLUMNS = `
    */
   ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name, ad.address, ad.gps_location,
+  /*
+   * ad.pin_code joins the BASE list (2026-09-21, ops: "add PIN under city").
+   * It was only in manageColumns() -- the view=manage projection -- so the two
+   * My Orders queues, which never ask for that view, rendered the city with an
+   * always-undefined PIN under it and the line silently never appeared. The
+   * tbl_address join below is unconditional for this query, so this costs no
+   * extra join and no extra row.
+   * NOTE: this comment lives INSIDE a template literal and ships to MySQL as a
+   * SQL comment -- no backticks in here, they would end the literal.
+   */
+  j.fk_address_id, ci.city_name, ad.address, ad.gps_location, ad.pin_code,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -862,7 +872,8 @@ function manageColumns(want, hasJobOffer) {
     : `, NULL AS offer_total, NULL AS offer_pending, NULL AS offer_accepted`
       + `, NULL AS offer_rejected, NULL AS offer_expired`;
   return `,
-  ad.pin_code,
+  /* ad.pin_code moved to LIST_COLUMNS on 2026-09-21 -- manageColumns is always
+     appended to it, so naming it here too would select the same column twice. */
   ef.efr_manager_id,
   /*
    * Master / Under Master / Individual. The relationship is tbl_easyfixer's own
