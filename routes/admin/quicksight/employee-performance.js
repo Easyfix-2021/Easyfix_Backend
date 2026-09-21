@@ -8,10 +8,6 @@
  *     → { dateFrom, dateTo, employeeCount, spocCount, uploadedAt,
  *         uploadedBy: { userId, name }, originalName, sizeBytes } | null
  *
- *   GET  /api/admin/quicksight/employee-performance/dashboard
- *     → { html } — the dashboard page with the latest snapshot inlined, for the
- *       CRM to render in a sandboxed iframe. 404 when nothing is uploaded.
- *
  *   GET  /api/admin/quicksight/employee-performance/template   (upload key)
  *     → employee-performance-template.xlsx — the 8 sheets update_dashboard.bat
  *       reads, header-only, plus Read me and Example rows.
@@ -93,16 +89,6 @@ router.get('/meta', async (_req, res, next) => {
 });
 
 const NO_DATA = 'No Employee Performance data has been uploaded yet';
-
-router.get('/dashboard', async (_req, res, next) => {
-  try {
-    const html = await service.getDashboardHtml();
-    if (!html) return modernError(res, 404, NO_DATA);
-    // Per-employee revenue: keep it out of every intermediary cache.
-    res.set('Cache-Control', 'no-store');
-    return modernOk(res, { html });
-  } catch (err) { return next(err); }
-});
 
 // The Excel template MIS fills before running update_dashboard.bat. Same key as
 // the upload: it is the first half of that same job.

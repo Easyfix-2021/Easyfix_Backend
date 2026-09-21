@@ -290,12 +290,9 @@ test('the snapshot is parsed once per upload and replaced by a newer one', async
   assert.deepEqual(await ok('/summary?vertical=Sports'), json(agg.buildSummary(third, { verticals: ['Sports'] })));
 });
 
-test('the existing /meta and /dashboard reads still answer', async () => {
+test('/meta still answers; the retired /dashboard page does not', async () => {
   const meta = await get('/meta');
   assert.equal(meta.status, 200);
   assert.equal(meta.body.data.employeeCount, Object.keys(D.employees).length);
-  const dash = await get('/dashboard');
-  assert.equal(dash.status, 200);
-  assert.equal(dash.cache, 'no-store');
-  assert.match(dash.body.data.html, /const D=/);
+  assert.equal((await fetch(`${base}/dashboard`)).status, 404);
 });

@@ -293,6 +293,21 @@ async function getObjectBuffer(key) {
 }
 
 /*
+ * Replace an object's tag set. Tags (unlike metadata) can be changed without
+ * rewriting the object, and lifecycle rules can filter on them — used to mark
+ * superseded QuickSight Employee Performance snapshots for expiry.
+ */
+async function tagObject(key, tags) {
+  if (!isEnabled()) throw new Error('S3 is not configured (S3_BUCKET_NAME unset)');
+  const { PutObjectTaggingCommand } = require('@aws-sdk/client-s3');
+  await client().send(new PutObjectTaggingCommand({
+    Bucket: BUCKET,
+    Key: key,
+    Tagging: { TagSet: Object.entries(tags).map(([Key, Value]) => ({ Key, Value: String(Value) })) },
+  }));
+}
+
+/*
  * Mint a presigned GET URL the browser can hit directly. TTL is
  * intentionally short (5 min) — long enough to render images in a
  * page session, short enough that a leaked URL ages out before it's
@@ -722,4 +737,6 @@ module.exports = {
   putAtKey,
   // Generic server-side read (2026-09-15) — QuickSight Employee Performance snapshot:
   getObjectBuffer,
+  // Tag replace (2026-09-21) — marks superseded Employee Performance data for the lifecycle rule:
+  tagObject,
 };

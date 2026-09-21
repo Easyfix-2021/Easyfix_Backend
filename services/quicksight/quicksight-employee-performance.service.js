@@ -4,17 +4,18 @@
  * Unlike every other QuickSight report this one is NOT computed from
  * easyfix_core. MIS builds it off-platform: a raw workbook (Open/Close order,
  * targets, emp detail, TimeChamp, CRM counts, IVR) goes through build_data.py,
- * which writes `data.js` — a single `const D={...};` literal that the
- * dashboard page (assets/quicksight/employee-performance/dashboard.html)
- * renders. Half of those sources do not exist in the DB, so the report is a
- * snapshot that an authorised operator uploads, not a query.
+ * which writes `data.js` — a single `const D={...};` literal. The CRM's
+ * Employee tab renders it through aggregate.js (a port of the MIS page,
+ * assets/quicksight/employee-performance/dashboard.html, which the parity test
+ * still runs). Half of those sources do not exist in the DB, so the report is
+ * a snapshot that an authorised operator uploads, not a query.
  *
  * WHAT IS STORED. Never the uploaded file itself. The upload is parsed as
- * JSON (after stripping the `const D=` / `;` wrapper) and shape-checked, then
- * RE-SERIALISED — so the stored object is pure data, whatever the file held.
- * `<` is escaped as < on the way out, which keeps the JSON valid and
- * makes it impossible for a string inside it to close the <script> element the
- * dashboard is injected into. Stored gzipped: the JSON compresses ~10x.
+ * JSON (after stripping the `const D=` / `;` wrapper), shape-checked down to
+ * every row aggregate.js reads (see checkRows), then RE-SERIALISED — so the
+ * stored object is pure data, whatever the file held. `<` is escaped as
+ * \u003c (still valid JSON), so the object stays safe to inline in a <script>
+ * should anything ever do that again. Stored gzipped: ~10x smaller.
  *
  * WHERE. Private S3 (`QuickSight/EmployeePerformance/`) — it attributes
  * revenue to named employees, so it must never sit under the public
@@ -31,6 +32,13 @@
  * instances served different numbers. Now whichever meta lands last is
  * complete and points at its own data. Meta without dataKey (written before
  * this change) still reads data.json.gz.
+ *
+ * CLEAN-UP. After its meta lands, an upload tags the data object the PREVIOUS
+ * meta named `superseded=true`; an S3 lifecycle rule on that tag expires them
+ * (docs/QS_EMPLOYEE_PERFORMANCE_S3_LIFECYCLE.md). The live
+ * object is never tagged: a meta read before this upload's meta was written
+ * can only name data that this meta has already replaced. An age-only rule
+ * would be wrong — it would delete the live snapshot after 90 quiet days.
  */
 
 const fs = require('node:fs');
@@ -48,10 +56,6 @@ const S3_PREFIX = 'QuickSight/EmployeePerformance';
 const DATA_NAME = 'data.json.gz';   // legacy: meta without dataKey
 const DATA_KEY_RE = /^data-[A-Za-z0-9-]+\.json\.gz$/;
 const META_NAME = 'meta.json';
-
-const TEMPLATE_PATH = path.join(__dirname, '..', '..', 'assets', 'quicksight', 'employee-performance', 'dashboard.html');
-// The one line build_data.py's README says was changed in the original page.
-const DATA_HOOK = '<script src="data.js"></script>';
 
 // A gzip bomb must not be able to exhaust memory: cap what we inflate.
 const MAX_INFLATED_BYTES = 200 * 1024 * 1024;
@@ -75,6 +79,53 @@ const SHAPE = {
   unassigned: Array.isArray,
   zmBreakdown: Array.isArray,
 };
+
+/*
+ * Row-level shape: what aggregate.js dereferences without a guard. It reads
+ * every array through list() (a non-array is simply empty), so a missing or
+ * null list is fine — but each ELEMENT is read as an object (`x.date`,
+ * `x.client`), and a null there was a 500 on every read of the snapshot
+ * instead of a 400 at upload. Numbers are not checked: the page sums them
+ * as-is and parity keeps that.
+ */
+const EMPLOYEE_ROW_LISTS = ['daily', 'clients', 'tatSda', 'productivity', 'cityWise', 'pendingReasons', 'openRows', 'zonal', 'revPerf'];
+const ZM_ROW_LISTS = ['daily', 'clients', 'tatSda', 'cityWise', 'pendingReasons', 'openRows'];
+const TOP_ROW_LISTS = ['txRows', 'unassigned'];
+const MAX_REPORTED = 5;
+
+function checkRows(data) {
+  const problems = [];
+  const rowsOf = (label, value) => {
+    if (!Array.isArray(value)) return;
+    const bad = value.findIndex((x) => !isPlainObject(x));
+    if (bad !== -1) problems.push(`${label} row ${bad + 1} is not an object`);
+  };
+  const strings = (label, value) => {
+    if (!value.every((x) => typeof x === 'string')) problems.push(`${label} must list names only`);
+  };
+
+  strings('primarySpocs', data.primarySpocs);
+  strings('verticals', data.verticals);
+  strings('zonalManagers', data.zonalManagers);
+  TOP_ROW_LISTS.forEach((k) => rowsOf(k, data[k]));
+  Object.entries(data.teamMembers).forEach(([team, members]) => {
+    if (!Array.isArray(members) || !members.every((x) => typeof x === 'string')) {
+      problems.push(`teamMembers "${team}" must be a list of names`);
+    }
+  });
+  Object.entries(data.employees).forEach(([name, e]) => {
+    if (!isPlainObject(e)) { problems.push(`employee "${name}" is not an object`); return; }
+    if (e.vertical != null && typeof e.vertical !== 'string') problems.push(`employee "${name}" vertical is not text`);
+    EMPLOYEE_ROW_LISTS.forEach((k) => rowsOf(`employee "${name}" ${k}`, e[k]));
+    if (e.byZm == null) return;
+    if (!isPlainObject(e.byZm)) { problems.push(`employee "${name}" byZm is not an object`); return; }
+    Object.entries(e.byZm).forEach(([zm, slice]) => {
+      if (!isPlainObject(slice)) { problems.push(`employee "${name}" byZm "${zm}" is not an object`); return; }
+      ZM_ROW_LISTS.forEach((k) => rowsOf(`employee "${name}" byZm "${zm}" ${k}`, slice[k]));
+    });
+  });
+  return problems;
+}
 
 function badRequest(message) {
   return Object.assign(new Error(message), { status: 400 });
@@ -129,6 +180,11 @@ function parseDashboardData(buffer) {
     throw badRequest('The data file has invalid months (expected YYYY-MM)');
   }
   if (Object.keys(data.employees).length === 0) throw badRequest('The data file has no employees');
+  const rowProblems = checkRows(data);
+  if (rowProblems.length) {
+    const more = rowProblems.length > MAX_REPORTED ? ` (and ${rowProblems.length - MAX_REPORTED} more)` : '';
+    throw badRequest(`The data file has malformed entries: ${rowProblems.slice(0, MAX_REPORTED).join('; ')}${more}`);
+  }
 
   return {
     data,
@@ -159,6 +215,17 @@ async function writeObject(name, buffer, contentType) {
   const tmp = `${target}.tmp`;
   fs.writeFileSync(tmp, buffer);
   fs.renameSync(tmp, target);
+}
+
+// Best-effort: an IAM policy without s3:PutObjectTagging leaves the object
+// in place (a leak, never data loss), so it must not fail the upload.
+async function markSuperseded(name) {
+  if (!s3.isEnabled()) return;   // local dev: nothing expires, nothing to tag
+  try {
+    await s3.tagObject(`${S3_PREFIX}/${name}`, { superseded: 'true' });
+  } catch (err) {
+    logger.warn('Employee Performance: could not tag the superseded data object', { key: name, error: err.message });
+  }
 }
 
 async function readObject(name) {
@@ -247,10 +314,9 @@ async function saveSnapshot({ buffer, originalName, user }) {
   const uploadedAt = new Date().toISOString();
   // Same-millisecond uploads on two instances must still get two objects.
   const dataKey = `data-${uploadedAt.replace(/[:.]/g, '-')}-${crypto.randomBytes(4).toString('hex')}.json.gz`;
-  // ponytail: superseded data objects are kept (~0.6 MB each); deleting the
-  // previous one can race a reader still loading it. Add an S3 lifecycle rule
-  // on the prefix if the count ever matters.
   await writeObject(dataKey, zlib.gzipSync(json), 'application/gzip');
+  // Read before our meta is written, so it can only name data ours replaces.
+  const previous = await getMeta();
 
   const meta = {
     ...summary,
@@ -265,6 +331,9 @@ async function saveSnapshot({ buffer, originalName, user }) {
   // JSON.parse, and toScriptSafeJson's escape of '<' parses back to '<').
   generation += 1;
   snapshotCache = { uploadedAt: meta.uploadedAt, data };
+  // Not deleted: a reader on another instance may be mid-load. Expired later
+  // by the lifecycle rule (see CLEAN-UP in the header).
+  if (previous && dataNameOf(previous) !== dataKey) await markSuperseded(dataNameOf(previous));
   return meta;
 }
 
@@ -273,59 +342,10 @@ async function getMeta() {
   return buf ? JSON.parse(buf.toString('utf8')) : null;
 }
 
-let templateCache = null;
-function dashboardTemplate() {
-  if (templateCache) return templateCache;
-  const html = fs.readFileSync(TEMPLATE_PATH, 'utf8');
-  if (!html.includes(DATA_HOOK)) {
-    throw new Error(`Employee Performance template has no ${DATA_HOOK} line to inject data into`);
-  }
-  templateCache = html;
-  return html;
-}
-
-/*
- * The composed page is ~6.5 MB, which the browser needs seconds to parse and
- * paint. The iframe's own `load` event fires BEFORE that paint, so the CRM
- * cannot use it to know when to reveal the frame — it showed a blank white box
- * instead. This script is the frame saying "I am drawn". Sandboxed frames have
- * an opaque origin, so it posts to '*' and the CRM matches on the message value
- * alone (revealing a frame is all the message can do).
- *
- * Two animation frames after load is the accurate "first paint has happened"
- * signal, but requestAnimationFrame is SUSPENDED while the window is hidden —
- * a background tab would then never reveal its frame, which is how this was
- * first seen. The timer is therefore not a nicety: whichever fires first wins,
- * and `sent` keeps it to one message.
- */
-const READY_MESSAGE = 'ef-employee-performance-ready';
-const READY_SIGNAL = '<script>(function(){var sent=false;'
-  + `var send=function(){if(sent){return;}sent=true;try{parent.postMessage('${READY_MESSAGE}','*');}catch(e){}};`
-  + 'var after=function(){if(typeof requestAnimationFrame==="function"){'
-  + 'requestAnimationFrame(function(){requestAnimationFrame(send);});}setTimeout(send,150);};'
-  + 'if(document.readyState==="complete"){after();}else{window.addEventListener("load",after);}})();</script>';
-
-// Template with the stored data inlined, or null when nothing is uploaded.
-async function getDashboardHtml() {
-  const meta = await getMeta();
-  if (!meta) return null;
-  const gz = await readObject(dataNameOf(meta));
-  if (!gz) return null;
-  const json = zlib.gunzipSync(gz).toString('utf8');
-  // Function replacers throughout: a string replacement would expand
-  // `$&`-style patterns occurring inside the data.
-  const html = dashboardTemplate().replace(DATA_HOOK, () => `<script>const D=${json};</script>`);
-  return html.includes('</body>')
-    ? html.replace('</body>', () => `${READY_SIGNAL}</body>`)
-    : html + READY_SIGNAL;
-}
-
 module.exports = {
   parseDashboardData,
   saveSnapshot,
   getMeta,
-  getDashboardHtml,
   getSnapshotD,
-  READY_MESSAGE,
-  _internals: { toScriptSafeJson, dashboardTemplate, DATA_HOOK },
+  _internals: { toScriptSafeJson, checkRows },
 };
