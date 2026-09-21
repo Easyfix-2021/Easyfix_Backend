@@ -40,6 +40,7 @@ const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
 const materialRatesSvc = require('../../services/client-material-rates.service');
+const lookupSvc = require('../../services/lookup.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
 // Same module the client portal's Performance book judges against — see the
 // GET /:clientId/targets handler for why this is a passthrough, not a copy.
@@ -1695,6 +1696,32 @@ router.get('/:clientId/material-rates/options', async (req, res, next) => {
     if (!(await loadAndGuardClient(req, res))) return;
     const items = await materialRatesSvc.options(req.params.clientId);
     modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /:clientId/material-rates/download
+ * Streams the client's material rate card as XLSX — same recipe as
+ * GET /:clientId/rate-cards/download (loadAndGuardClient scope guard, same
+ * read-level permission as the list route above, xlsxSvc → buffer → attachment
+ * headers). One row per client price GROUP (list() already shapes materials
+ * into groups; a material with several brand-scoped groups gets one row per
+ * group), so we project it straight into the exporter rather than re-querying.
+ */
+router.get('/:clientId/material-rates/download', async (req, res, next) => {
+  try {
+    logger.info('Download client material rates XLSX · clientId=' + req.params.clientId);
+    const client = await loadAndGuardClient(req, res);
+    if (!client) return;
+    const items = await materialRatesSvc.list(req.params.clientId);
+    const states = await lookupSvc.states();
+    const stateNameById = new Map(states.map((s) => [s.state_id, s.state_name]));
+    logger.info('Exporting ' + items.length + ' client material-rate materials to XLSX');
+    const buf = await xlsxSvc.exportMaterialRates(items, stateNameById);
+    const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="material-rates-${safeName}.xlsx"`);
+    res.send(buf);
   } catch (e) { next(e); }
 });
 

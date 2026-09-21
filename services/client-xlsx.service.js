@@ -120,6 +120,47 @@ async function exportRateCards(clientName, rateCards) {
   return toBuffer(wb);
 }
 
+/* ─── 2b. Material rate card export ───────────────────────────────── */
+
+/*
+ * `items` is the exact shape returned by
+ * services/client-material-rates.service.js#list() — one row per row per
+ * PRICE GROUP (a material can have several brand-scoped groups), matching
+ * the RateCardsTab Materials-tab grid. `stateNameById` resolves the group's
+ * state_ids for the "State Overrides" column; callers build it once from
+ * services/lookup.service.js#states().
+ */
+async function exportMaterialRates(items, stateNameById = new Map()) {
+  const groupCount = (items || []).reduce((n, it) => n + it.groups.length, 0);
+  logger.info('Export material rates to XLSX · materials=' + (items ? items.length : 0) + ' groups=' + groupCount);
+  const { wb, ws } = newWorkbook('Material Rates');
+  applyHeader(ws, [
+    'Material', 'Brands', 'Client Price', 'State Overrides', 'Master Price Today', 'Review Flag',
+  ]);
+  for (const item of (items || [])) {
+    for (const g of item.groups) {
+      const brands = g.brands.length === 0 ? 'No Brand' : g.brands.map((b) => b.brand_name).join(', ');
+      const stateOverrides = (g.states || [])
+        .map((s) => `${s.state_ids.map((id) => stateNameById.get(id) || `#${id}`).join(', ')}: ₹${Number(s.price).toFixed(2)}`)
+        .join('; ');
+      const flagged = g.review && g.review.flagged;
+      const reviewFlagText = flagged
+        ? `Master changed ₹${Number(g.review.master_price_seen).toFixed(2)} → ₹${g.review.master_price_today != null ? Number(g.review.master_price_today).toFixed(2) : '—'}`
+        : '';
+      ws.addRow([
+        item.material_name ?? '',
+        brands,
+        Number(g.price) || 0,
+        stateOverrides,
+        g.master_price_today != null ? Number(g.master_price_today) : '',
+        reviewFlagText,
+      ]);
+    }
+  }
+  logger.info('Returning material rates XLSX · groups=' + groupCount);
+  return toBuffer(wb);
+}
+
 /* ─── 3. SPOC list export (cross-client report) ───────────────────── */
 
 async function exportSpocList(rows) {
@@ -475,6 +516,7 @@ async function buildSpocTemplate() {
 module.exports = {
   exportClientList,
   exportRateCards,
+  exportMaterialRates,
   exportSpocList,
   parseSpocUpload,
   buildSpocTemplate,
