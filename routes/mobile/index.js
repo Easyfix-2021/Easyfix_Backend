@@ -327,6 +327,9 @@ router.use(requireShareGuestScope);
 // decisions require new-work eligibility; already-assigned work uses the
 // continuation capability. Reads stay available for restricted technicians.
 router.use(requireTechJobMutationCapability);
+// Records the REAL actor of each write on a shared job (contact or delegate) —
+// after the lock, which is what resolves req.jobShare. Best-effort.
+router.use(require('../../middleware/share-action-log').shareActionLog);
 
 // Idempotency layer (offline outbox) — keyed off req.tech (set above by
 // requireTechAuth). Retries of a same-keyed write replay the stored response

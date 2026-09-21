@@ -296,3 +296,73 @@ test('the customer bridge call rings the guest\'s phone, not the sharer\'s', () 
   assert.match(readRaw('routes/mobile/index.js'),
     /const techMobile = req\.shareGuest \? req\.shareGuest\.contactNumber : req\.tech\.efr_no;/);
 });
+
+/* ─── 8. Who actually did it: the share action log ────────────────────── */
+{
+  const { EventEmitter } = require('node:events');
+  const actionLog = require('../middleware/share-action-log');
+
+  test('each write names its action; reads and the sharer\'s own writes are not logged', () => {
+    assert.equal(actionLog.actionName('/jobs/5001/checkin'), 'checkin');
+    assert.equal(actionLog.actionName('/jobs/5001/material-request'), 'material-request');
+    assert.equal(actionLog.actionName('/jobs/5001/images/991'), 'images');
+    assert.equal(actionLog.actionName('/jobs/5001'), 'job');
+    assert.equal(actionLog.actionName('/uploads'), 'upload');
+    assert.equal(actionLog.actionName('/uploads/document'), 'upload-document');
+
+    const share = { share_id: 77, job_id: 5001 };
+    const contact = actionLog.actionRow({ method: 'POST', path: '/jobs/5001/selfie', jobShare: share,
+      shareGuest: { share, contactNumber: '9876543210', contactName: 'Suresh' }, tech: { efr_id: 901 } }, 200);
+    assert.deepEqual(
+      { t: contact.actor_type, n: contact.actor_number, e: contact.actor_efr_id, a: contact.action },
+      { t: 'contact', n: '9876543210', e: null, a: 'selfie' },
+    );
+    const delegate = actionLog.actionRow({ method: 'POST', path: '/jobs/5001/checkin', jobShare: share,
+      tech: { efr_id: 901, actual_efr_id: 902 } }, 200);
+    assert.deepEqual({ t: delegate.actor_type, e: delegate.actor_efr_id }, { t: 'delegate', e: 902 });
+
+    // The sharer himself (no substitution), any read, a non-shared job: nothing.
+    assert.equal(actionLog.actionRow({ method: 'POST', path: '/jobs/5001/cancel', jobShare: share, tech: { efr_id: 901 } }, 409), null);
+    assert.equal(actionLog.actionRow({ method: 'GET', path: '/jobs/5001', jobShare: share, shareGuest: { share } }, 200), null);
+    assert.equal(actionLog.actionRow({ method: 'POST', path: '/jobs/6000/checkin', tech: { efr_id: 5, actual_efr_id: 6 } }, 200), null);
+  });
+
+  test('the log row carries the final status and the path as the request arrived; a failed write never throws', async () => {
+    const inserts = [];
+    const realQuery = require('../db').pool.query;
+    require('../db').pool.query = async (sql, params) => {
+      if (/INSERT INTO tbl_job_share_action_log/.test(sql)) inserts.push(params);
+      return [[], []];
+    };
+    try {
+      const share = { share_id: 77, job_id: 5001 };
+      const req = { method: 'POST', path: '/jobs/5001/checkout', jobShare: share,
+        shareGuest: { share, contactNumber: '9876543210', contactName: 'Suresh' }, tech: { efr_id: 901 } };
+      const res = new EventEmitter();
+      let nexted = false;
+      actionLog.shareActionLog(req, res, () => { nexted = true; });
+      assert.equal(nexted, true);
+      req.path = '/5001/checkout'; // what a sub-router leaves behind
+      res.statusCode = 201;
+      res.emit('finish');
+      await new Promise((r) => setImmediate(r));
+      assert.equal(inserts.length, 1);
+      const cols = ['share_id', 'job_id', 'actor_type', 'actor_efr_id', 'actor_number', 'actor_name', 'action', 'method', 'path', 'status_code'];
+      const row = Object.fromEntries(cols.map((c, i) => [c, inserts[0][i]]));
+      assert.deepEqual(row, { share_id: 77, job_id: 5001, actor_type: 'contact', actor_efr_id: null,
+        actor_number: '9876543210', actor_name: 'Suresh', action: 'checkout', method: 'POST',
+        path: '/jobs/5001/checkout', status_code: 201 });
+    } finally {
+      require('../db').pool.query = realQuery;
+    }
+    // Table absent (migration not run): swallowed.
+    await actionLog.writeRow({ share_id: 1, action: 'x' }, { query: async () => { const e = new Error("Table 'tbl_job_share_action_log' doesn't exist"); e.code = 'ER_NO_SUCH_TABLE'; throw e; } });
+  });
+
+  test('the action log is mounted after the share lock, which resolves who the actor is', () => {
+    const src = readRaw('routes/mobile/index.js');
+    const lock = src.indexOf('router.use(requireTechJobMutationCapability);');
+    const log = src.indexOf("router.use(require('../../middleware/share-action-log').shareActionLog);");
+    assert.ok(lock > 0 && log > lock);
+  });
+}
