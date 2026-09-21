@@ -91,9 +91,14 @@ test('routes · /api/admin/settings no longer serves tbl_city', () => {
   assert.doesNotMatch(src, /crudFactory\(\s*'tbl_city'/,
     'tbl_city must not be served by the generic CRUD factory — use /api/admin/cities');
 
+  // tbl_state followed deliberately on 2026-09-21: a state must carry a zonal
+  // manager that reaches its cities in one transaction — /api/admin/states.
+  assert.doesNotMatch(src, /crudFactory\(\s*'tbl_state'/,
+    'tbl_state must not be served by the generic CRUD factory — use /api/admin/states');
+
   // The mount removal must not have taken its neighbours with it. Without this
   // the assertion above also passes on an empty file.
-  for (const table of ['tbl_state', 'tbl_service_catg', 'tbl_service_type', 'tbl_document_type']) {
+  for (const table of ['tbl_service_catg', 'tbl_service_type', 'tbl_document_type']) {
     assert.match(src, new RegExp(`crudFactory\\(\\s*'${table}'`),
       `${table} must still be served — only tbl_city was removed`);
   }
