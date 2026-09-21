@@ -46,15 +46,17 @@ test('status 16 is owned by pending-material, and pending-close can reach it', (
 // overlap with estimate-pending (also [15]) — see lib/job-stages.js's own
 // comment. stageOfStatus's single-owner reverse map must stay unaffected:
 // estimate-pending, not pending-material, still owns 15 for
-// transitionAllowed/stageVisible purposes.
-test('pending-material VISIBILITY widens to include 15 (list scoping), but stageOfStatus(15) still resolves to estimate-pending (single-owner, unaffected)', () => {
+// labelling purposes (stageOfStatus), but ACCESS checks every owned stage
+// that lists the status — the PM's own page lists 15, so they may act on it.
+test('pending-material covers 15: listed, actionable, only its own moves; stageOfStatus(15) stays estimate-pending', () => {
+  const pm = { mode: 'list', stages: ['pending-material'] };
   assert.deepEqual([...stageVisibleStatuses(['pending-material'])].sort((a, b) => a - b), [15, 16]);
-  assert.equal(stageOfStatus(15), 'estimate-pending', 'the overlap must not steal single ownership of 15 from estimate-pending');
-  // A PM restricted to ONLY pending-material can now list a 15 job...
-  assert.ok(stageVisibleStatuses(['pending-material']).has(15));
-  // ...but stageVisible (single-job action gating) still requires OWNING the
-  // status's real stage (estimate-pending), which this PM does not hold.
-  assert.equal(stageVisible({ mode: 'list', stages: ['pending-material'] }, 15), false);
+  assert.equal(stageOfStatus(15), 'estimate-pending', 'the overlap must not change the label owner of 15');
+  assert.equal(stageVisible(pm, 15), true, 'a PM must act on the Approval Pending job their page lists');
+  assert.equal(transitionAllowed(pm, 15, 15), true, 'CRM add-material keeps a 15 job at 15');
+  assert.equal(transitionAllowed(pm, 15, 6), true, 'cancel is a pending-material target');
+  assert.equal(transitionAllowed(pm, 15, 1), false, "15 -> 1 is estimate-pending's move, not pending-material's");
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['estimate-pending'] }, 15, 1), true);
 });
 
 test('stageOfStatus maps statuses to their single stage; unknowns → null', () => {
