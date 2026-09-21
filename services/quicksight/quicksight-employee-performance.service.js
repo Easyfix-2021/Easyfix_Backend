@@ -23,6 +23,14 @@
  *
  * meta.json is written AFTER the data object and is what readers key on, so
  * a failed data write never advertises a snapshot that is not there.
+ *
+ * Each upload's data gets its OWN object (data-<uploadedAt>-<rand>.json.gz)
+ * and meta.dataKey names it, so meta.json alone decides what is loaded. With
+ * one shared data.json.gz, two overlapping uploads could interleave
+ * (A data, B data, B meta, A meta): meta said A while the object held B, and
+ * instances served different numbers. Now whichever meta lands last is
+ * complete and points at its own data. Meta without dataKey (written before
+ * this change) still reads data.json.gz.
  */
 
 const fs = require('node:fs');
@@ -31,12 +39,14 @@ const { promisify } = require('node:util');
 const zlib = require('node:zlib');
 
 const gunzip = promisify(zlib.gunzip);
+const crypto = require('node:crypto');
 
 const s3 = require('../../utils/s3-storage');
 const logger = require('../../logger');
 
 const S3_PREFIX = 'QuickSight/EmployeePerformance';
-const DATA_NAME = 'data.json.gz';
+const DATA_NAME = 'data.json.gz';   // legacy: meta without dataKey
+const DATA_KEY_RE = /^data-[A-Za-z0-9-]+\.json\.gz$/;
 const META_NAME = 'meta.json';
 
 const TEMPLATE_PATH = path.join(__dirname, '..', '..', 'assets', 'quicksight', 'employee-performance', 'dashboard.html');
@@ -182,8 +192,14 @@ let snapshotCache = null;   // { uploadedAt, data }
 let snapshotLoad = null;    // { uploadedAt, generation, promise }
 let generation = 0;
 
-async function loadSnapshotData() {
-  const gz = await readObject(DATA_NAME);
+// The data object a meta describes. The pattern keeps a hand-edited meta from
+// naming a path outside the prefix / private directory.
+function dataNameOf(meta) {
+  return typeof meta.dataKey === 'string' && DATA_KEY_RE.test(meta.dataKey) ? meta.dataKey : DATA_NAME;
+}
+
+async function loadSnapshotData(meta) {
+  const gz = await readObject(dataNameOf(meta));
   if (!gz) return null;
   const raw = await gunzip(gz, { maxOutputLength: MAX_INFLATED_BYTES });
   return JSON.parse(raw.toString('utf8'));
@@ -201,7 +217,7 @@ async function getSnapshotD() {
   }
 
   const startedAt = generation;
-  const promise = loadSnapshotData();
+  const promise = loadSnapshotData(meta);
   const load = { uploadedAt, generation: startedAt, promise };
   snapshotLoad = load;
   try {
@@ -228,11 +244,18 @@ async function saveSnapshot({ buffer, originalName, user }) {
   snapshotCache = null;
   snapshotLoad = null;
 
-  await writeObject(DATA_NAME, zlib.gzipSync(json), 'application/gzip');
+  const uploadedAt = new Date().toISOString();
+  // Same-millisecond uploads on two instances must still get two objects.
+  const dataKey = `data-${uploadedAt.replace(/[:.]/g, '-')}-${crypto.randomBytes(4).toString('hex')}.json.gz`;
+  // ponytail: superseded data objects are kept (~0.6 MB each); deleting the
+  // previous one can race a reader still loading it. Add an S3 lifecycle rule
+  // on the prefix if the count ever matters.
+  await writeObject(dataKey, zlib.gzipSync(json), 'application/gzip');
 
   const meta = {
     ...summary,
-    uploadedAt: new Date().toISOString(),
+    uploadedAt,
+    dataKey,
     uploadedBy: { userId: user?.user_id ?? null, name: user?.user_name || null },
     originalName: originalName ? String(originalName).slice(0, 200) : null,
     sizeBytes: Buffer.byteLength(json),
@@ -284,7 +307,9 @@ const READY_SIGNAL = '<script>(function(){var sent=false;'
 
 // Template with the stored data inlined, or null when nothing is uploaded.
 async function getDashboardHtml() {
-  const gz = await readObject(DATA_NAME);
+  const meta = await getMeta();
+  if (!meta) return null;
+  const gz = await readObject(dataNameOf(meta));
   if (!gz) return null;
   const json = zlib.gunzipSync(gz).toString('utf8');
   // Function replacers throughout: a string replacement would expand
