@@ -29,6 +29,7 @@ const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
+const { requireShareGuestScope } = require('../../middleware/share-guest-scope');
 const { otpFailureHttpStatus } = require('./otp-http-status');
 const { upsertEasyfixerDocuments } = require('../../services/easyfixer-document.service');
 const sensitiveChange = require('../../services/easyfixer-sensitive-change.service');
@@ -317,6 +318,9 @@ router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, 
 
 // ─── Protected ─────────────────────────────────────────────────────
 router.use(requireTechAuth);
+// A shared-job web-link GUEST authenticates as the sharer (see tech-auth.js);
+// this fence confines it to its one job + uploads, before anything else runs.
+router.use(requireShareGuestScope);
 
 // Server-side counterpart to the app's lifecycle policy. All /jobs writes are
 // guarded here before any sub-router or inline handler can mutate state: offer
@@ -612,7 +616,8 @@ async function resolveMobileCallLegs(req, jobId) {
   if (!job) return { error: { status: 404, msg: 'job not found' } };
   const canCall = job.fk_easyfixter_id === req.tech.efr_id;
   if (!canCall) return { error: { status: 404, msg: 'job not found' } };
-  const techMobile = req.tech.efr_no;
+  // A shared-job guest is on the contact's phone, not the sharer's — ring that.
+  const techMobile = req.shareGuest ? req.shareGuest.contactNumber : req.tech.efr_no;
   if (!techMobile) return { error: { status: 422, msg: 'No mobile number on file for your account' } };
   const [[cust]] = await pool.query(
     `SELECT c.customer_mob_no AS mobile,
@@ -1081,17 +1086,18 @@ router.post('/jobs/:id/checkout',
     );
     logger.info('Checked out · id=' + job.job_id + ' · status->' + (isRevisit ? 'REVISIT' : 'COMPLETED'));
 
-    // A live DELEGATION ends with the visit it was created for. This is the one
-    // place that knows WHICH of the two endings happened — isNextVisit is the
-    // app's "Can't Complete Today", everything else is a completion — so the
-    // share is closed here rather than inferred from job_status later.
-    // Best-effort: the transition already committed and must not be undone by a
-    // bookkeeping failure. `closeForJobOutcome` is a no-op unless a `started`
-    // share exists.
-    try {
-      await delegation.closeForJobOutcome(job.job_id, isRevisit ? 'handed_back' : 'completed');
-    } catch (se) {
-      logger.warn('Closing job share failed · id=' + job.job_id + ' · ' + se.message);
+    // A live DELEGATION ends when the delegate COMPLETES the job. "Can't
+    // Complete Today" (isNextVisit) keeps it live — by the owner's rule the
+    // same delegate returns for the next visit and the sharer stays locked out
+    // until completion, a pre-start cancel, or an ops revoke. Best-effort: the
+    // transition already committed and must not be undone by a bookkeeping
+    // failure. `closeForJobOutcome` is a no-op unless a `started` share exists.
+    if (!isRevisit) {
+      try {
+        await delegation.closeForJobOutcome(job.job_id, 'completed');
+      } catch (se) {
+        logger.warn('Closing job share failed · id=' + job.job_id + ' · ' + se.message);
+      }
     }
 
     // otherRemark has no tbl_job column — persist it as a check-out job comment

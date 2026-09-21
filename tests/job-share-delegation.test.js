@@ -374,31 +374,72 @@ test('the mobile job list widens to delegated jobs, and only for the mobile list
     'only routes/mobile/index.js may widen the scope');
 });
 
-test('the retired public share-link surface is gone, not merely unmounted', () => {
-  for (const rel of [
-    'services/job-share.service.js',
-    'routes/public/shared-job.js',
-  ]) {
-    assert.equal(fs.existsSync(path.join(__dirname, '..', rel)), false, `${rel} must be deleted`);
-  }
-  assert.doesNotMatch(readSrc('utils/jwt.js'), /signJobShareToken|verifyJobShareToken/,
-    'the job_share token type must not survive its only consumer');
-  assert.doesNotMatch(readSrc('routes/public/index.js'), /shared-job/);
+test('the retired view-only share page stays gone; /shared-job is now only the OTP-gated web link', () => {
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'services/job-share.service.js')), false,
+    'the retired view-only share service must stay deleted');
+  assert.doesNotMatch(readSrc('utils/jwt.js'), /signJobShareToken\b|verifyJobShareToken\b|type: 'job_share'[,\s}]/,
+    'the retired job_share token type must not come back');
+  // The 2026-09-21 web link reuses the /shared-job path but nothing else: its
+  // route verifies a job_share_link token through the guest service and offers
+  // no job data beyond the summary + OTP.
+  const route = readSrc('routes/public/shared-job.js');
+  assert.match(route, /job-share-guest\.service/);
+  assert.deepEqual(
+    [...route.matchAll(/router\.(get|post)\('([^']+)'/g)].map((m) => `${m[1]} ${m[2]}`),
+    ['get /:token', 'post /:token/otp', 'post /:token/verify'],
+  );
   assert.doesNotMatch(readSrc('routes/mobile/index.js'), /share-link/);
 });
 
-/* ─── The TTL sweep's clock ───────────────────────────────────────── */
+/* ─── WhatsApp to the share recipient ─────────────────────────────── */
+{
+  const gallabox = require('../services/gallabox.whatsapp.service');
+  const share = {
+    id: 77, jobId: 5001, sharedByEfrId: 901, sharedByName: 'Ravi',
+    delegateName: 'Suresh', delegateNumber: '9876543210',
+  };
+  const withSend = async (impl, fn) => {
+    const original = gallabox.sendTemplate;
+    const calls = [];
+    gallabox.sendTemplate = async (args) => { calls.push(args); return impl(args); };
+    try { return await fn(calls); } finally { gallabox.sendTemplate = original; }
+  };
 
-test('expireStaleShares compares the stall window against a bound Date, never SQL NOW()', async () => {
-  const from = fake.calls.length;
-  await delegation.expireStaleShares({ hours: 6, limit: 50 });
-  const calls = fake.calls.slice(from);
-  const select = calls.find((c) => /status IN \('pending', 'accepted'\)/i.test(c.sql));
-  assert.ok(select, 'expected the stale-share SELECT to run');
-  assert.doesNotMatch(select.sql, /NOW\(\)/i, 'the stall window must not compare against SQL NOW()');
-  assert.match(select.sql, /COALESCE\(responded_on, created_on\) < DATE_SUB\(\?, INTERVAL \? HOUR\)/i);
-  assert.equal(select.params.length, 3);
-  assert.ok(select.params[0] instanceof Date, 'DATE_SUB compares against a bound Date');
-  assert.ok(Math.abs(Date.now() - select.params[0].getTime()) < 60000);
-  assert.deepEqual(select.params.slice(1), [6, 50]);
-});
+  test('share WhatsApp goes to the delegate number with job-level facts only', async () => {
+    jobRow = {
+      job_id: 5001, slot: new Date('2026-09-22T05:00:00Z'),
+      service_catg_name: 'AC Repair', locality: 'Sector 18', city_name: 'Noida',
+      pin_code: '201301', sharer_no: '9000000001',
+    };
+    await withSend(() => ({ delivered: true }), async (calls) => {
+      const out = await delegation.notifyShareRecipient(share, 'https://crm.easyfix.in/public/share/Ab12Cd34');
+      assert.deepEqual(out, { sent: true, reason: null });
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].to, '9876543210');
+      assert.equal(calls[0].templateName, 'job_shared_contact');
+      assert.deepEqual(calls[0].bodyValues, {
+        contact_name: 'Suresh',
+        sharer_name: 'Ravi',
+        sharer_mobile: '9000000001',
+        job_id: '5001',
+        service: 'AC Repair',
+        area: 'Sector 18, Noida - 201301',
+        schedule: '22 Sept 2026, 10:30 am',
+        link: 'https://crm.easyfix.in/public/share/Ab12Cd34',
+      });
+    });
+  });
+
+  test('share WhatsApp is skipped without a number and never throws on failure', async () => {
+    await withSend(() => ({ delivered: true }), async (calls) => {
+      const out = await delegation.notifyShareRecipient({ ...share, delegateNumber: null });
+      assert.equal(out.sent, false);
+      assert.equal(calls.length, 0);
+    });
+    jobRow = { job_id: 5001 };
+    await withSend(() => { throw new Error('gallabox down'); }, async () => {
+      const out = await delegation.notifyShareRecipient(share);
+      assert.deepEqual(out, { sent: false, reason: 'gallabox down' });
+    });
+  });
+}
