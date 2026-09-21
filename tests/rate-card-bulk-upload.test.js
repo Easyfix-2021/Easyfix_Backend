@@ -49,7 +49,7 @@ const SERVICES_HEADER = [
   'Overhead Fixed', 'Overhead Variable',
   'Client Fixed', 'Client Variable',
 ];
-const MATERIALS_HEADER = ['Material', 'Brands', 'Client Price', 'State Overrides', 'Master Price Today', 'Review Flag'];
+const MATERIALS_HEADER = ['Material', 'Brand', 'Price', 'State'];
 
 // ═══════════════════════════ Round trip (both tabs) ═══════════════════════
 
@@ -116,12 +116,19 @@ describe('round-trip: export → preview is unchanged, zero blocked', () => {
     }];
     const stateNameById = new Map([[21, 'Maharashtra'], [22, 'Gujarat']]);
     const buf = await xlsxSvc.exportMaterialRates(items, stateNameById);
+    // Base row (No Brand, ₹200) + one row per overridden state (Maharashtra,
+    // Gujarat) — the flat format's own round-trip contract.
     const out = await svc.previewMaterialRatesUpload(buf, CLIENT_ID);
     assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
-    assert.equal(out.summary.unchanged, 1);
-    assert.equal(out.rows[0].outcome, 'unchanged');
-    // Prove the exact grammar round-tripped (₹, 2dp, ", " between states, "; " between groups).
-    assert.equal(out.rows[0].state_overrides, 'Maharashtra, Gujarat: ₹275.00');
+    assert.equal(out.summary.unchanged, 3, JSON.stringify(out.rows));
+    assert.ok(out.rows.every((r) => r.outcome === 'unchanged'));
+    assert.equal(out.materials.length, 1);
+    assert.equal(out.materials[0].outcome, 'unchanged');
+    assert.deepEqual(out.materials[0].lines, [
+      { brand: 'No Brand', state: 'All States', price: 200 },
+      { brand: 'No Brand', state: 'Maharashtra', price: 275 },
+      { brand: 'No Brand', state: 'Gujarat', price: 275 },
+    ]);
   });
 });
 
@@ -176,49 +183,219 @@ describe('Materials — blocked-row reasons', () => {
     return svc.previewMaterialRatesUpload(buf, 1);
   }
 
-  it('unknown material → blocked', async () => {
-    const out = await preview([['Nonexistent Material', '', 100, '', '', '']]);
+  it('unknown material, no close match → blocked, no suggestion', async () => {
+    const out = await preview([['Totally Different Thing', '', 100, '']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Unknown material "Nonexistent Material"/);
+    assert.match(out.rows[0].errors.join(';'), /^Unknown material "Totally Different Thing"$/);
   });
 
-  it('unknown brand → blocked', async () => {
-    const out = await preview([['Material A', 'Nonexistent Brand', 100, '', '', '']]);
+  it('unknown material, close typo → blocked WITH a "did you mean" suggestion', async () => {
+    const out = await preview([['Material A2', '', 100, '']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Unknown brand "Nonexistent Brand"/);
+    assert.match(out.rows[0].errors.join(';'), /Unknown material "Material A2" — did you mean "Material A"\?/);
   });
 
-  it('unknown state in State Overrides → blocked, segment quoted', async () => {
-    const out = await preview([['Material A', '', 100, 'Nonexistent State: ₹50.00', '', '']]);
+  it('unknown brand, close typo → blocked with a suggestion', async () => {
+    const out = await preview([['Material A', 'BrandXX', 100, '']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Unknown state "Nonexistent State" in State Overrides segment "Nonexistent State: ₹50\.00"/);
+    assert.match(out.rows[0].errors.join(';'), /Unknown brand "BrandXX" — did you mean "BrandX"\?/);
   });
 
-  it('malformed State Overrides segment → blocked, segment quoted', async () => {
-    const out = await preview([['Material A', '', 100, 'garbage with no colon', '', '']]);
+  it('unknown state, close typo → blocked with a suggestion', async () => {
+    const out = await preview([['Material A', '', 100, 'Karnatak']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Malformed State Overrides segment "garbage with no colon"/);
+    assert.match(out.rows[0].errors.join(';'), /Unknown state "Karnatak" — did you mean "Karnataka"\?/);
   });
 
   it('missing price → blocked', async () => {
-    const out = await preview([['Material A', '', '', '', '', '']]);
+    const out = await preview([['Material A', '', '', '']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Client Price is required/);
+    assert.match(out.rows[0].errors.join(';'), /Price is required/);
   });
 
   it('negative price → blocked', async () => {
-    const out = await preview([['Material A', '', -10, '', '', '']]);
+    const out = await preview([['Material A', '', -10, '']]);
     assert.equal(out.rows[0].outcome, 'blocked');
-    assert.match(out.rows[0].errors.join(';'), /Client Price must be greater than 0/);
+    assert.match(out.rows[0].errors.join(';'), /Price must be greater than 0/);
   });
 
   it('No Brand mixed with a branded row for the same material → both rows blocked', async () => {
     const out = await preview([
-      ['Material A', '', 100, '', '', ''],
-      ['Material A', 'BrandX', 120, '', '', ''],
+      ['Material A', '', 100, ''],
+      ['Material A', 'BrandX', 120, ''],
     ]);
     assert.equal(out.summary.blocked, 2);
     assert.ok(out.rows.some((r) => /Cannot mix No Brand and brand prices/.test(r.errors.join(';'))));
+    assert.equal(out.materials[0].outcome, 'blocked');
+  });
+
+  it('a state price with no all-states base price for that brand → blocked', async () => {
+    const out = await preview([['Material A', 'BrandX', 275, 'Karnataka']]);
+    assert.equal(out.summary.blocked, 1);
+    assert.match(out.rows[0].errors.join(';'), /BrandX has state prices but no all-states price for "Material A"/);
+  });
+
+  it('conflicting duplicate (same material/brand/state, different price) → both rows blocked, naming both', async () => {
+    const out = await preview([
+      ['Material A', '', 100, ''],
+      ['Material A', '', 120, ''],
+    ]);
+    assert.equal(out.summary.blocked, 2);
+    assert.match(out.rows[0].errors.join(';'), /Conflicting duplicate rows \(2, 3\)/);
+    assert.match(out.rows[1].errors.join(';'), /Conflicting duplicate rows \(2, 3\)/);
+  });
+
+  it('identical duplicate (same material/brand/state/price) → kept once, warned, not blocked', async () => {
+    const out = await preview([
+      ['Material A', '', 100, ''],
+      ['Material A', '', 100, ''],
+    ]);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.equal(out.summary.new, 2, 'both rows still echoed as new — only the SECOND is flagged a duplicate');
+    assert.deepEqual(out.rows[0].warnings, []);
+    assert.match(out.rows[1].warnings.join(';'), /Duplicate of row 2 — identical, ignored/);
+    // The compiled plan has exactly ONE line — the grouping map naturally
+    // collapses two identical (brand, state) rows to a single entry either
+    // way, so this is really a lines-shape check, not proof the duplicate
+    // was specially dropped (the warning assertion above is what proves that).
+    assert.equal(out.materials[0].lines.length, 1);
+  });
+
+  it('grouping: two brands with the SAME base price and state-override map share ONE group', async () => {
+    const out = await preview([
+      ['Material A', 'BrandX', 100, ''],
+      ['Material A', 'BrandX', 275, 'Karnataka'],
+    ]);
+    // Only one brand fixture (BrandX) is seeded in this describe block's fake
+    // pool — the grouping behaviour itself (shared group when signatures
+    // match) is proven in the dedicated grouping describe block below with
+    // two distinct brands. This test just proves the state-override entry
+    // groups Karnataka into ONE {price, state_ids} entry.
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.equal(out.materials[0].lines.length, 2);
+    assert.deepEqual(out.materials[0].lines, [
+      { brand: 'BrandX', state: 'All States', price: 100 },
+      { brand: 'BrandX', state: 'Karnataka', price: 275 },
+    ]);
+  });
+});
+
+// ═══════════════ Materials — grouping (owner spec, 2026-09-21 addition) ════
+
+describe('Materials — grouping into client price groups', () => {
+  // Grouping/signature equality is otherwise invisible from the outside — a
+  // buggy "never merge, always one group per brand" implementation produces
+  // the SAME flattened lines as a correct merge (same values, just attributed
+  // via 2 groups instead of 1). The only externally observable difference is
+  // the 'unchanged'/'update' OUTCOME against a pre-existing card, so these
+  // tests seed the existing card as EXACTLY the shape a correct merge would
+  // produce and assert 'unchanged' — a grouping bug (either direction) then
+  // shows up as 'update' because the compiled signature set no longer matches.
+  let fake;
+  let existingGroupRows;
+  let existingBrandRows;
+  let existingStateRows;
+  let existingStateStateRows;
+
+  before(() => {
+    fake = installFakePool([
+      [/SELECT material_id, material_name FROM tbl_material_master WHERE status = 1/i, () => [{ material_id: 10, material_name: 'Adapter 5A' }]],
+      [/SELECT brand_id, brand_name, brand_key FROM tbl_brand_master WHERE status = 1/i, () => [
+        { brand_id: 1, brand_name: 'Philips', brand_key: 'philips' },
+        { brand_id: 2, brand_name: 'Havells', brand_key: 'havells' },
+      ]],
+      [/SELECT state_id, state_name FROM tbl_state\b/i, () => [
+        { state_id: 21, state_name: 'Maharashtra' }, { state_id: 22, state_name: 'Gujarat' },
+      ]],
+      // materialRatesSvc.list()'s existing-card chain — mutable per test.
+      [/FROM tbl_client_material_price_group g\b/i, () => existingGroupRows],
+      [/FROM tbl_material_master\b/i, () => [{ material_id: 10, material_name: 'Adapter 5A', pricing_type: 'per_unit' }]],
+      [/FROM tbl_client_material_price_group_brand gb/i, () => existingBrandRows],
+      [/FROM tbl_client_material_state_price\s+WHERE/i, () => existingStateRows],
+      [/FROM tbl_client_material_state_price_state/i, () => existingStateStateRows],
+      [/FROM tbl_material_price_group g\b/i, () => []],
+      [/FROM tbl_material_price_group_brand gb/i, () => []],
+    ]);
+  });
+  after(() => fake.restore());
+  beforeEach(() => {
+    fake.reset();
+    existingGroupRows = [];
+    existingBrandRows = [];
+    existingStateRows = [];
+    existingStateStateRows = [];
+  });
+
+  async function preview(rows) {
+    const svc = require('../services/rate-card-bulk-upload.service');
+    const buf = aoaBuffer([MATERIALS_HEADER, ...rows]);
+    return svc.previewMaterialRatesUpload(buf, 1);
+  }
+
+  it('Philips + Havells with the SAME base price and SAME state map → ONE group ("unchanged" against a pre-existing single group covering both brands)', async () => {
+    // The existing card: ONE group (group_id 501), price 100, BOTH brand ids,
+    // with a Maharashtra+Gujarat override at 275 — exactly what a correct
+    // merge of the uploaded rows below compiles to.
+    existingGroupRows = [{ group_id: 501, material_id: 10, price: 100, master_price_seen: 100, status: 1 }];
+    existingBrandRows = [
+      { group_id: 501, brand_id: 1, brand_name: 'Philips' },
+      { group_id: 501, brand_id: 2, brand_name: 'Havells' },
+    ];
+    existingStateRows = [{ state_price_id: 9001, group_id: 501, price: 275 }];
+    existingStateStateRows = [
+      { state_price_id: 9001, state_id: 21 }, { state_price_id: 9001, state_id: 22 },
+    ];
+
+    const out = await preview([
+      ['Adapter 5A', 'Philips', 100, ''],
+      ['Adapter 5A', 'Philips', 275, 'Maharashtra'],
+      ['Adapter 5A', 'Philips', 275, 'Gujarat'],
+      ['Adapter 5A', 'Havells', 100, ''],
+      ['Adapter 5A', 'Havells', 275, 'Maharashtra'],
+      ['Adapter 5A', 'Havells', 275, 'Gujarat'],
+    ]);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.equal(out.materials[0].outcome, 'unchanged',
+      'a grouping bug (merged into the wrong number of groups) changes the compiled signature set, which flips this to "update"');
+    // Readability check: both brand labels carry the identical 3-line shape.
+    const philipsLines = out.materials[0].lines.filter((l) => l.brand === 'Philips');
+    const havellsLines = out.materials[0].lines.filter((l) => l.brand === 'Havells');
+    assert.deepEqual(philipsLines.map((l) => ({ state: l.state, price: l.price })),
+      havellsLines.map((l) => ({ state: l.state, price: l.price })));
+  });
+
+  it('Philips + Havells with DIFFERENT base prices → TWO groups (an "always merge" bug would collapse both brands onto ONE price)', async () => {
+    const out = await preview([
+      ['Adapter 5A', 'Philips', 100, ''],
+      ['Adapter 5A', 'Havells', 150, ''],
+    ]);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.equal(out.materials[0].lines.length, 2);
+    const philipsLine = out.materials[0].lines.find((l) => l.brand === 'Philips');
+    const havellsLine = out.materials[0].lines.find((l) => l.brand === 'Havells');
+    assert.notEqual(philipsLine.price, havellsLine.price);
+  });
+
+  it('state-override grouping: Maharashtra and Gujarat both at ₹275 land in ONE {price, state_ids} entry ("unchanged" against that exact existing shape)', async () => {
+    existingGroupRows = [{ group_id: 501, material_id: 10, price: 100, master_price_seen: 100, status: 1 }];
+    existingBrandRows = [{ group_id: 501, brand_id: 1, brand_name: 'Philips' }];
+    // ONE state_price row covering BOTH states — the shape a correctly-grouped
+    // upload compiles to. If the parser instead emitted TWO override entries
+    // (one per state) this fixture would no longer describe its output and
+    // the outcome would read 'update', not 'unchanged'.
+    existingStateRows = [{ state_price_id: 9001, group_id: 501, price: 275 }];
+    existingStateStateRows = [
+      { state_price_id: 9001, state_id: 21 }, { state_price_id: 9001, state_id: 22 },
+    ];
+
+    const out = await preview([
+      ['Adapter 5A', 'Philips', 100, ''],
+      ['Adapter 5A', 'Philips', 275, 'Maharashtra'],
+      ['Adapter 5A', 'Philips', 275, 'Gujarat'],
+    ]);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.equal(out.materials[0].outcome, 'unchanged');
+    assert.equal(out.materials[0].lines.filter((l) => l.state !== 'All States').length, 2);
   });
 });
 
@@ -378,8 +555,8 @@ describe('commit re-validates: a material that goes inactive between preview and
   it('Material A (processed first) is attempted, Material B 404s, and the whole file rolls back', async () => {
     const svc = require('../services/rate-card-bulk-upload.service');
     const buf = aoaBuffer([MATERIALS_HEADER,
-      ['Material A', '', 100, '', '', ''],
-      ['Material B', '', 200, '', '', ''],
+      ['Material A', '', 100, ''],
+      ['Material B', '', 200, ''],
     ]);
     // Preview sees both materials as active/valid — 'new', zero blocked.
     const preview = await svc.previewMaterialRatesUpload(buf, 1);
