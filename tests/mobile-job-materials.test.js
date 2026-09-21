@@ -6,10 +6,20 @@
  *   1. GET /:id/materials is scoped to the job's service category, and each
  *      resolved price matches resolveMaterialPrice() for the job's client +
  *      state (client override / master state / master group).
- *   2. POST /:id/quotation stores the RESOLVED price for a material line,
- *      never the payload's — positive control: send a different price.
+ *   2. POST /:id/quotation stores the TECHNICIAN'S amount as unit_price and
+ *      the RESOLVED rate-card price as client_charge (a snapshot) — positive
+ *      control: the two values differ, so a swap of the columns is caught.
  *   3. A material line without materialId is rejected with 422.
  *   4. Idempotency: the same key twice creates one quotation line.
+ *
+ * OWNER DECISION (2026-09-21) retired the old rule pinned by an earlier
+ * version of this file ("the payload price is IGNORED; the server always
+ * re-resolves and stores that"). The technician's own quoted amount is now
+ * what gets billed — a material priced ₹500 in the rate card but bought for
+ * ₹550 must quote ₹550 — and the resolved rate-card price moves to
+ * client_charge as a same-transaction snapshot so the CRM can show Rate Card
+ * vs Amount Quoted vs Approved side by side. See
+ * services/mobile-job-estimate.service.js addQuotationLine's own comment.
  *
  * resolveMaterialPrice() (services/material-price-resolver.js) is NOT
  * reimplemented here — it is the real module, run against fake tables shaped
@@ -218,35 +228,68 @@ test('getJobMaterials 404s when the job is not this technician\'s', async () => 
   await assert.rejects(estimateService.getJobMaterials(201, 42, {}), (e) => { assert.equal(e.status, 404); return true; });
 });
 
-// ─── 2. POST /:id/quotation: resolved price stored, payload price ignored ─
+// ─── 2. POST /:id/quotation: technician amount → unit_price,
+//        resolved rate-card price → client_charge (snapshot) ─────────────
+//
+// Bound params for every INSERT INTO quotation_details below (tx_charge/
+// margin/status are literal 0/0/1 in the SQL, not bound):
+//   type, name, unit, unit_price, client_charge, easyfxer_id, sent_on,
+//   job_id, client_service_id, material_id.
 
-test('addQuotationLine: material line stores the RESOLVED price — positive control on a different payload price', async () => {
-  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 12 });
+test('addQuotationLine: unit_price = technician amount, client_charge = resolved rate-card price (positive control, different values)', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
   const out = await estimateService.addQuotationLine(200, 42, {
-    type: 'material', materialId: 10, quantity: 3, amount: 9999, // 9999 must be ignored
+    type: 'material', materialId: 10, quantity: 3, amount: 550, // technician actually paid 550, rate card says 500
   });
   assert.ok(out.lineId);
   const ins = QUOTATIONS[out.lineId];
-  // Bound params (tx_charge/client_charge/margin/status are literal 0/0/0/1
-  // in the SQL, not bound): type, name, unit, unit_price, easyfxer_id,
-  // sent_on, job_id, client_service_id, material_id.
-  const [type, name, unit, unitPrice, , , jobId, clientServiceId, materialId] = ins.params;
+  const [type, name, unit, unitPrice, clientCharge, , , jobId, clientServiceId, materialId] = ins.params;
   assert.equal(type, 'material');
   assert.equal(name, 'Screw', 'material line name comes from the master, not the payload');
   assert.equal(unit, 3);
-  assert.equal(unitPrice, 12, 'stored price must be the RESOLVED price, never the payload amount');
+  assert.equal(unitPrice, 550, 'unit_price must be the TECHNICIAN\'S own quoted amount');
+  assert.equal(clientCharge, 500, 'client_charge must be the RESOLVED rate-card price, as a snapshot');
   assert.equal(jobId, 200);
   assert.equal(clientServiceId, null);
   assert.equal(materialId, 10);
 });
 
-test('addQuotationLine: material line with source "none" falls back to the payload amount', async () => {
+test('addQuotationLine: missing amount defaults unit_price to the resolved price (client_charge matches)', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
+  const out = await estimateService.addQuotationLine(200, 42, {
+    type: 'material', materialId: 10, quantity: 1, // amount omitted entirely
+  });
+  const ins = QUOTATIONS[out.lineId];
+  assert.equal(ins.params[3], 500, 'with no technician amount, unit_price falls back to the resolved price');
+  assert.equal(ins.params[4], 500, 'client_charge is always the resolved price, regardless of the fallback');
+});
+
+test('addQuotationLine: a non-positive amount (0) is treated as missing and also falls back to the resolved price', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
+  const out = await estimateService.addQuotationLine(200, 42, {
+    type: 'material', materialId: 10, quantity: 1, amount: 0,
+  });
+  const ins = QUOTATIONS[out.lineId];
+  assert.equal(ins.params[3], 500, 'amount=0 is not a positive quote, so unit_price falls back to the resolved price');
+});
+
+test('addQuotationLine: amount present with source "none" stores the amount as unit_price and NULL as client_charge', async () => {
   // No client override, no master group/state anywhere for material 10 in this test.
   const out = await estimateService.addQuotationLine(200, 42, {
     type: 'material', materialId: 10, quantity: 1, amount: 77,
   });
   const ins = QUOTATIONS[out.lineId];
-  assert.equal(ins.params[3], 77, 'with no resolvable price, the payload amount is the only source');
+  assert.equal(ins.params[3], 77, 'with no resolvable price, the technician amount is the only source for unit_price');
+  assert.equal(ins.params[4], null, 'client_charge must be NULL — distinguishable from a real ₹0 rate-card price — when the resolver has no price at all');
+});
+
+test('addQuotationLine: neither a positive amount nor a resolvable price → 422, no row written', async () => {
+  // No fixtures set for material 10 anywhere → resolveMaterialPrice source 'none'.
+  await assert.rejects(
+    estimateService.addQuotationLine(200, 42, { type: 'material', materialId: 10, quantity: 1 }), // amount omitted
+    (e) => { assert.equal(e.status, 422); return true; },
+  );
+  assert.equal(Object.keys(QUOTATIONS).length, 0, 'no line may be written for a rejected request');
 });
 
 // ─── 3. A material line without materialId → 422 ──────────────────────────
@@ -318,4 +361,24 @@ test('the materials picker only offers ACTIVE brands', async () => {
     /JOIN\s+tbl_brand_master\s+bm\s+ON\s+bm\.brand_id\s*=\s*gb\.brand_id\s+AND\s+bm\.status\s*=\s*1/i,
     'inactive brands must not reach the picker',
   );
+});
+
+/* quotation_details.unit_price is a legacy INT column, so MySQL would truncate
+   a fractional quote with no error. The service must refuse it rather than
+   let ₹550.50 land as ₹550 — and a fractional rate-card FALLBACK is rounded,
+   not truncated, for the same column. */
+test('addQuotationLine refuses a fractional technician amount (422) instead of letting MySQL truncate it', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
+  await assert.rejects(
+    estimateService.addQuotationLine(200, 42, { type: 'material', materialId: 10, quantity: 1, amount: 550.5 }),
+    (e) => { assert.equal(e.status, 422); assert.match(e.message, /whole rupees/); return true; },
+  );
+});
+
+test('addQuotationLine rounds a fractional rate-card fallback rather than truncating it', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 180.5 });
+  const out = await estimateService.addQuotationLine(200, 42, { type: 'material', materialId: 10, quantity: 1 });
+  const [, , , unitPrice, clientCharge] = QUOTATIONS[out.lineId].params;
+  assert.equal(unitPrice, 181, 'the INT unit_price gets the rounded rate, not a truncated 180');
+  assert.equal(clientCharge, 180.5, 'client_charge is FLOAT and keeps the exact rate');
 });

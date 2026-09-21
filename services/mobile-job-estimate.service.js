@@ -263,12 +263,26 @@ async function getJobMaterials(jobId, efrId, { search } = {}) {
  *              material_name is used regardless of what the client sends —
  *              this is a master-list picker now, not free text.
  *   quantity   → quotation_details.unit  (legacy column name for qty)
- *   amount     → quotation_details.unit_price for PRODUCT lines. For a
- *              MATERIAL line this is only a suggestion: the server
- *              re-resolves the price via resolveMaterialPrice() and stores
- *              THAT, ignoring `amount` unless the resolver has no price at
- *              all (source 'none' — phase-1 "Price Pending"), so a modified
- *              app can never quote an arbitrary number.
+ *   amount     → quotation_details.unit_price for PRODUCT lines, unchanged.
+ *
+ *              OWNER DECISION (2026-09-21): for a MATERIAL line, the
+ *              technician's own quoted `amount` is now what gets billed as
+ *              unit_price — a material priced ₹500 in the rate card but
+ *              actually bought for ₹550 must quote ₹550. The OLD rule (the
+ *              server re-resolved the price and ignored `amount`) is
+ *              RETIRED. `amount` is required (> 0); when it is absent (or
+ *              not a positive number) it defaults to the resolver's price,
+ *              and only 422s when NEITHER is available.
+ *
+ *              `client_charge` now carries the resolveMaterialPrice() result
+ *              as a SNAPSHOT of what the rate card said at quote time (NULL
+ *              when the resolver has no price at all — source 'none' —
+ *              because client_charge is a nullable float column and NULL is
+ *              the only value a reader can tell apart from a genuine ₹0
+ *              rate-card price). This lets the CRM show Rate Card
+ *              (client_charge) vs Amount Quoted (unit_price) vs Approved
+ *              (approved_charge) side by side — see routes/admin/jobs.js's
+ *              job/transaction view, which already reads client_charge.
  *
  * status defaults to 1 (active, pending approval) — same default the admin
  * route uses. easyfxer_id (legacy typo) stamps the technician who raised
@@ -287,6 +301,7 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
   let materialIdOut = null;
   let lineName = name || null;
   let unitPrice = amount;
+  let clientCharge = 0; // product lines: unchanged, always 0 (out of scope of this change)
 
   if (isProduct) {
     clientServiceId = itemId || null;
@@ -314,7 +329,31 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
     const resolved = await resolveMaterialPrice({
       clientId: job.fk_client_id, materialId, brandId: brandId || null, stateId: ctx.state_id,
     });
-    unitPrice = resolved.source === 'none' ? (Number(amount) || 0) : (Number(resolved.price) || 0);
+    // resolvedPrice is the rate-card snapshot: NULL for 'none' (no price
+    // anywhere), a real number — possibly 0 — otherwise.
+    const resolvedPrice = resolved.source === 'none' ? null : (Number(resolved.price) || 0);
+
+    const quotedAmount = Number(amount);
+    const hasQuote = Number.isFinite(quotedAmount) && quotedAmount > 0;
+    if (!hasQuote && resolvedPrice === null) {
+      logger.warn('Add quotation line rejected · no technician amount and no resolvable rate-card price · jobId=' + jobId + ' · materialId=' + materialId);
+      const e = new Error('amount is required for material lines with no resolvable rate-card price'); e.status = 422; throw e;
+    }
+    /*
+     * quotation_details.unit_price is a legacy INT column: a fractional quote
+     * would be TRUNCATED by MySQL with no error (₹550.50 → ₹550). Refuse it
+     * instead — the app only offers whole rupees — so a technician's money is
+     * never silently rounded down. client_charge / approved_charge are FLOAT
+     * and keep their paise.
+     */
+    if (hasQuote && !Number.isInteger(quotedAmount)) {
+      const e = new Error('amount must be in whole rupees'); e.status = 422; throw e;
+    }
+    // The technician's own quote wins when given; the rate-card price is only
+    // a fallback for a line with no quote at all (owner decision, 2026-09-21).
+    // The fallback is rounded for the same INT column, rather than truncated.
+    unitPrice = hasQuote ? quotedAmount : Math.round(resolvedPrice);
+    clientCharge = resolvedPrice;
     materialIdOut = materialId;
     lineName = material.material_name;
   }
@@ -325,9 +364,10 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
         tx_charge, client_charge, margin,
         status, easyfxer_id, sent_on,
         job_id, client_service_id, material_id)
-     VALUES (?, ?, ?, ?, 0, 0, 0, 1, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, 0, ?, 0, 1, ?, ?, ?, ?, ?)`,
     [
       type, lineName, quantity, unitPrice,
+      clientCharge,
       efrId, new Date(),
       jobId, clientServiceId, materialIdOut,
     ],
