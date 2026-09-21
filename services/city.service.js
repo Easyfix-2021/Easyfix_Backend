@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const stateService = require('./state.service');
 
 /*
  * Manage Cities — generic master.
@@ -223,10 +224,15 @@ async function createCity({ city_name, state_id, district, tier, reference_pinco
   );
   if (dup) throw mkErr(409, `City "${trimmed}" already exists in this state`);
 
+  // The city's zonal manager is its state's (services/state.service.js). This
+  // path used to set none at all, so every hand-added city started unowned and
+  // fell out of every zonal-scoped report until someone patched it in the DB.
+  const stateUser = await stateService.stateManagerFor(state_id);
+
   const [r] = await pool.query(
     `INSERT INTO tbl_city
-       (city_name, state_id, district, tier, reference_pincode, city_status)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (city_name, state_id, district, tier, reference_pincode, city_status, state_user)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       trimmed,
       Number(state_id),
@@ -234,9 +240,10 @@ async function createCity({ city_name, state_id, district, tier, reference_pinco
       tier || null,
       reference_pincode || null,
       STATUS_ACTIVE,
+      stateUser,
     ]
   );
-  logger.info('City created · id=' + r.insertId);
+  logger.info('City created · id=' + r.insertId + ' state_user=' + (stateUser ?? 'none'));
   return getCityById(r.insertId);
 }
 
@@ -265,6 +272,14 @@ async function updateCity(cityId, fields) {
     const [[s]] = await pool.query('SELECT state_id FROM tbl_state WHERE state_id = ? LIMIT 1', [fields.state_id]);
     if (!s) throw mkErr(400, `Unknown state_id ${fields.state_id}`);
     sets.push('state_id = ?'); params.push(Number(fields.state_id));
+    /*
+     * The city takes its state's zonal manager. The edit dialog always sends
+     * state_id, so saving any city also realigns its manager with its state —
+     * intended: the state is the only place a manager is set. A state with no
+     * manager yet leaves the city's current one alone rather than blanking it.
+     */
+    const stateUser = await stateService.stateManagerFor(fields.state_id);
+    if (stateUser != null) { sets.push('state_user = ?'); params.push(stateUser); }
   }
   if (fields.district !== undefined)          { sets.push('district = ?');          params.push(fields.district || null); }
   if (fields.tier !== undefined)              { sets.push('tier = ?');              params.push(fields.tier || null); }
@@ -431,6 +446,16 @@ async function approveCity(cityId, userId) {
     sets.push('approved_by = ?', 'approved_at = ?', "approval_decision = 'approved'",
       'merged_into_city_id = NULL');
     params.push(userId || null, new Date());
+  }
+  /*
+   * Re-read the manager from the state at approval, not creation. The city
+   * copied it when it was minted, but it may have sat in the queue while the
+   * state was reassigned — and the approver only clicks Approve, there is no
+   * manager field to fill. COALESCE keeps the copy if the state has none.
+   * (Correlated to the outer row but reading tbl_state, so no ER_UPDATE_TABLE_USED.)
+   */
+  if (await stateService.hasStateManagerCols()) {
+    sets.push('state_user = COALESCE((SELECT s.state_user FROM tbl_state s WHERE s.state_id = tbl_city.state_id), state_user)');
   }
   params.push(cityId, STATUS_PENDING);
 

@@ -544,6 +544,15 @@ async function findOrCreateStateByName(stateName, { userId = null } = {}) {
  */
 async function resolveInheritedStateUser(stateId, district = null) {
   if (!stateId) return null;
+  /*
+   * The state's own zonal manager wins (2026-09-21, services/state.service.js).
+   * The majority guess below is now only the fallback for a database where
+   * migrations/2026-09-21-state-zonal-manager.sql has not run, or a state that
+   * has no manager assigned yet. Lazy require: state.service lazily requires
+   * this module for indiaCountryId, so neither may do it at load time.
+   */
+  const own = await require('./state.service').stateManagerFor(stateId);
+  if (own != null) return own;
   const d = String(district || '').trim();
   if (d) {
     const [[byDistrict]] = await pool.query(
@@ -1521,6 +1530,8 @@ module.exports = {
   // caller gets the same { city_id, created } shape either way), so it has to
   // be driven directly as well as through the resolvers.
   resolveMergedCity,
+  // Shared with services/state.service.js createState — one India resolver.
+  indiaCountryId,
   listPincodes,
   getPincodeById,
   getPincodeByValue,
