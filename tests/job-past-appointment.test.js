@@ -12,8 +12,10 @@
  *     in the SAME call is always allowed (both routes accept a schedule edit);
  *   - a DATE-ONLY appointment is judged by date, never coerced to 00:00 — today
  *     with no promised time is not "past";
- *   - /assign is deliberately NOT gated: reassigning a running-late job (tech
- *     no-show at 09:00, swap at 12:44) is a legitimate ops recovery.
+ *   - /assign is gated too since 2026-09-17 (owner decision): with the offer
+ *     flow on, an assign or reassign sends an OFFER, and an offer for a slot
+ *     that has already gone is the same defect /offer refuses. Reschedule first;
+ *     a future requestedDateTime in the same body still passes.
  *
  * Fixtures are RELATIVE to now — a hardcoded date would rot into a false red.
  * No DB: fake-pool answers the reads and stops at the first write, so a request
@@ -187,10 +189,23 @@ test('a PAST requestedDateTime in the body does not sneak past a valid stored sl
   assert.equal(res.status, 400);
 });
 
-// ── Deliberately NOT gated ───────────────────────────────────────────
+// ── Assign / reassign: reschedule first (2026-09-17) ─────────────────
 
-test('assign/reassign stays OPEN on a past appointment (late-job recovery)', async () => {
+test('assign/reassign on a past appointment is refused 400 — reschedule first', async () => {
   scenario.appointment = `${PAST}:00`;
   const res = await send('PATCH', '/jobs/42/assign', { easyfixerId: 7 });
-  assert.notEqual(res.status, 400, 'ops must still be able to swap a tech on a running-late job');
+  assert.equal(res.status, 400, 'a reassign offers the job — an offer for a gone slot is refused, as on /offer');
+  assert.match(String(res.body?.message ?? res.body?.error ?? JSON.stringify(res.body)), /Reschedule it to a future slot/);
+});
+
+test('assign/reassign on a future appointment passes the gate', async () => {
+  scenario.appointment = `${FUTURE}:00`;
+  const res = await send('PATCH', '/jobs/42/assign', { easyfixerId: 7 });
+  assert.notEqual(res.status, 400);
+});
+
+test('a future requestedDateTime in the assign body unblocks a stale slot', async () => {
+  scenario.appointment = `${PAST}:00`;
+  const res = await send('PATCH', '/jobs/42/assign', { easyfixerId: 7, requestedDateTime: FUTURE.replace(' ', 'T') });
+  assert.notEqual(res.status, 400, 'fixing the time in the same call is allowed');
 });

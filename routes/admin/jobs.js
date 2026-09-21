@@ -2,6 +2,11 @@ const router = require('express').Router();
 
 const validate = require('../../middleware/validate');
 const job = require('../../services/job.service');
+// tbl_job_notes — the legacy free-text ops notepad, read+add only. Deliberately
+// separate from jobComments below: audit trail vs. operator-to-operator notes.
+const jobNotes = require('../../services/job-notes.service');
+// The one-list services editor (Uplifted tab): catalog read + complete-set PUT.
+const servicesEditor = require('../../services/job-services-editor.service');
 const clientRequest = require('../../services/client-request.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
@@ -10,6 +15,7 @@ const logger = require('../../logger');
 const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
   appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
+  pendingSchedulingCountsQuery, pendingStartCountsQuery,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
@@ -287,6 +293,49 @@ router.get('/:id/candidates',
         assignable: assignability.assignable,
         assignBlockReason: assignability.reason,
       });
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * GET /api/admin/jobs/:id/header
+ *
+ * The Schedule & Assign console's job header with NONE of the ranking work
+ * /candidates does: no stale-offer expiry, no technician ranking, no offer-flow
+ * or offerability resolution. Accepted jobs (status 1) are the main consumer —
+ * they already have a technician, so ranking the pool to draw their header was
+ * pure cost.
+ *
+ *   { job }   where job =
+ *     exactly the object buildJobHeader produces for /candidates (services with
+ *     unit_price / line_total, timeline, managers, age, payment), PLUS
+ *     job_status, is_cancelled_by_app, is_rescheduled_by_app, cancel_date_time,
+ *     reschedule_at_app, reschedule_date_time_app, app_request_reason — under
+ *     the /admin/jobs LIST's names, so the CRM's appRequestOf(job) works on it
+ *     unchanged — PLUS efr_id, efr_name, efr_mobile for the assigned technician
+ *     (nulls while unassigned; efr_mobile masked in transit).
+ *
+ * Guarded exactly as /candidates is: the /api/admin/* chain plus scopedJob,
+ * which 404s a job outside the caller's scope before the header is built. Not a
+ * write, so no stage or action guard — the same as /candidates.
+ *
+ * Read-only by construction: /candidates' lazy expireStaleOffers is a WRITE and
+ * is deliberately NOT called here. A header is drawn on every console open, and
+ * a GET that mutates offer state on a mouse-driven path is the hover-card bug
+ * listOffers' `sweep:false` was added to avoid.
+ *
+ * Literal second segment "header", so no collision with `/:id`.
+ */
+router.get('/:id/header',
+  validate(idParam, 'params'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      logger.info('Build console header · jobId=' + req.params.id);
+      const header = await candidateRanking.consoleHeaderForJob(req.scopedJob);
+      modernOk(res, { job: header });
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
@@ -675,6 +724,95 @@ router.get('/counts', async (req, res, next) => {
     // (routes/admin/index.js). Admin/Finance get undefined → no row filter.
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
+      scope: req.scope,
+      allowedStages: req.allowedStages,
+    });
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/pending-scheduling/counts
+ *
+ * The four tab counts above My Orders → Pending for Scheduling:
+ *
+ *   { all, pending, offered, expired }        all = pending + offered + expired
+ *
+ * The keys ARE the `offerState` values the list endpoint takes, so each tab is
+ * one query-string change on the grid beneath it:
+ *   all      → (no offerState)   the bucket, unfiltered
+ *   pending  → offerState=pending   "Not offered"      nobody asked yet
+ *   offered  → offerState=offered   "Offered-waiting"  an offer is still open
+ *   expired  → offerState=expired   "No takers"        offered, none open
+ *
+ * Accepts the SAME filters the grid sends (q, categoryId, cityId, clientId,
+ * zonalManagerId — validated by schemas extracted from listQuery itself) and
+ * NOT offerState, which would collapse three of the four numbers to zero; the
+ * schema drops it rather than 400ing a client that forwards its whole query
+ * string. The bucket (status 0 + unassigned), the RBAC scope and Job Stage
+ * Access are applied by the service through job.list()'s own WHERE, so the
+ * strip and the page can never describe different populations.
+ *
+ * `all` is the sum of the three rather than a COUNT(*) — see
+ * getPendingSchedulingCounts for the one row shape where those differ.
+ *
+ * Mounted beside /counts, i.e. ABOVE the bare `/:id` route: two static segments,
+ * so `idParam` never sees "pending-scheduling" (the /counts, /escalated and
+ * /export.xlsx gotcha).
+ */
+router.get('/pending-scheduling/counts', validate(pendingSchedulingCountsQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info('Fetch pending-for-scheduling tab counts · clientId=' + (req.query.clientId ?? '-')
+      + ' cityId=' + (req.query.cityId ?? '-') + ' q=' + (req.query.q ? 'yes' : '-'));
+    /*
+     * req.scope — the hierarchy-unioned scope the global admin middleware
+     * already built for THIS request (routes/admin/index.js), the same value
+     * the list handler recomputes from the same function on the same request.
+     * Admin/Finance get undefined → no row filter. Same source as the sibling
+     * /counts and /attention-summary handlers.
+     */
+    const counts = await job.getPendingSchedulingCounts({
+      ...req.query,
+      scope: req.scope,
+      allowedStages: req.allowedStages,
+    });
+    modernOk(res, counts);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/pending-start/counts
+ *
+ * The six tab counts above My Orders → Pending to Start:
+ *
+ *   { all, cancel, reschedule, missed, today, future }   all = sum of the five
+ *
+ * Each key (bar `all`) IS a `ptsState` value the list endpoint takes, so each
+ * tab is one query-string change on the grid beneath it, and the five partition
+ * status-1 jobs — every accepted job is counted in exactly one tab, in the
+ * priority order cancel → reschedule → missed → today → future. Day boundaries
+ * are IST, computed server-side. See ptsStateSql in services/job.service.js for
+ * the predicates, and why a job with no appointment counts as `missed`.
+ *
+ * Accepts the grid's filters — q, categoryId, cityId, clientId, zonalManagerId,
+ * ownerId — validated by schemas extracted from listQuery; NOT ptsState, which
+ * the schema strips. Status 1, RBAC scope and Job Stage Access are applied by
+ * the service through job.list()'s own WHERE, and the counts are ONE GROUP BY
+ * whose CASE arms are the ptsState filter fragments, so a tab's number and the
+ * rows that tab lists are the same SQL.
+ *
+ * Two static segments, mounted beside /counts and /pending-scheduling/counts,
+ * above the bare `/:id` route.
+ */
+router.get('/pending-start/counts', validate(pendingStartCountsQuery, 'query'), async (req, res, next) => {
+  try {
+    logger.info('Fetch pending-to-start tab counts · clientId=' + (req.query.clientId ?? '-')
+      + ' cityId=' + (req.query.cityId ?? '-') + ' ownerId=' + (req.query.ownerId ?? '-')
+      + ' q=' + (req.query.q ? 'yes' : '-'));
+    // req.scope: the hierarchy-unioned scope routes/admin/index.js built for
+    // THIS request — the same source the pending-scheduling strip reads.
+    const counts = await job.getPendingStartCounts({
+      ...req.query,
       scope: req.scope,
       allowedStages: req.allowedStages,
     });
@@ -1230,7 +1368,9 @@ router.patch('/escalated/:tableId', async (req, res, next) => {
  */
 // DUE_TO_USER_TYPE + ACTION_TYPE_BY_MODE now live in services/reason-codes.js
 // — promoted from this file 2026-06-04 so cross-tier callers share one map.
-const { DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE } = require('../../services/reason-codes');
+const {
+  DUE_TO_USER_TYPE, ACTION_TYPE_BY_MODE, ACTION_TYPE, DUE_TO_ANY, MODES_ALLOWING_DUE_TO_ANY,
+} = require('../../services/reason-codes');
 
 router.get('/comment-reasons', async (req, res, next) => {
   try {
@@ -1493,6 +1633,18 @@ router.get('/:id/transaction', validate(idParam, 'params'), scopedJob, async (re
  * user_type=2 (Client) so older callers without the param still get a
  * sensible list (matches the comment-reasons default).
  *
+ * `type=reschedule` serves action_type 29 ("Reschedule Before Start from CRM"),
+ * whose 16 rows cover all four parties — NOT action_type 8, which
+ * /reschedule-reasons below still serves unfiltered for the older dialog. The
+ * evidence for that split is in services/reason-codes.js.
+ *
+ * ONE EXCEPTION, AND IT IS TEMPORARY: `?type=reschedule&dueTo=any` returns that
+ * mode's WHOLE bucket with no user_type filter. It was added while the mode
+ * pointed at 8, whose rows all sit under one party; on 29 nothing needs it, and
+ * it is kept only so a CRM already calling it keeps working. See DUE_TO_ANY in
+ * services/reason-codes.js. `any` is NOT a general value: on every other mode
+ * it is an unrecognised string and behaves exactly as one.
+ *
  * Route-order note: declared BEFORE `/:id` so Express doesn't try to
  * validate the literal string "action-reasons" as a numeric job id —
  * same gotcha as `/bulk` vs `/:jobId` in routes/admin/auto-assign.js.
@@ -1501,7 +1653,16 @@ router.get('/action-reasons', async (req, res, next) => {
   try {
     const type = String(req.query.type || '').trim().toLowerCase();
     logger.info('Fetch action reasons · type=' + (type || '-') + ' dueTo=' + (req.query.dueTo || '-'));
-    if (!type) return modernError(res, 400, 'type is required (unreachable|enquiry)');
+    /*
+     * The accepted modes are LISTED FROM THE MAP, not typed out. The literal
+     * read "(unreachable|enquiry)" and was already one mode short the moment
+     * `reschedule` was registered — an error message that names a smaller set
+     * than the code accepts sends the caller looking for an endpoint that is
+     * right in front of them.
+     */
+    if (!type) {
+      return modernError(res, 400, 'type is required (' + Object.keys(ACTION_TYPE_BY_MODE).join('|') + ')');
+    }
     // Strip whitespace/underscores/dashes so 'un_reachable' / 'un-reachable' /
     // 'unreachable' / 'Un Reachable' all map to the same bucket.
     const modeKey = type.replace(/[\s_-]/g, '');
@@ -1510,18 +1671,33 @@ router.get('/action-reasons', async (req, res, next) => {
 
     const dueRaw = String(req.query.dueTo || '').toLowerCase().replace(/\s+/g, '');
     const userType = DUE_TO_USER_TYPE[dueRaw] || 2; // default = Customer (user_type 2); matches the pre-checked "By Customer" radio
+    /*
+     * `dueTo=any` — the WHOLE bucket, no party filter. TEMPORARY, and scoped to
+     * the modes that opt in (reschedule alone today). See DUE_TO_ANY in
+     * services/reason-codes.js for why it exists — the action_type = 8 rows'
+     * user_types were seeded against a mapping this repo later disproved, so
+     * dueTo=customer is legitimately empty until the catalogue is corrected —
+     * and delete both halves together when it is.
+     *
+     * The mode gate is what keeps this from leaking: for addremarks / enquiry /
+     * unreachable, `any` is not in DUE_TO_USER_TYPE and not in the opt-in list,
+     * so it falls through to the user_type = 2 default exactly as any other
+     * unrecognised value does today. Their behaviour is unchanged.
+     */
+    const unfiltered = dueRaw === DUE_TO_ANY && MODES_ALLOWING_DUE_TO_ANY.includes(modeKey);
 
     const [reasonRows] = await pool.query(
       `SELECT id, action_desc FROM action_taken_reason
-        WHERE action_type = ? AND user_type = ?
+        WHERE action_type = ?${unfiltered ? '' : ' AND user_type = ?'}
               AND (status IS NULL OR status = 1)
         ORDER BY id ASC`,
-      [actionTypeId, userType],
+      unfiltered ? [actionTypeId] : [actionTypeId, userType],
     );
     const items = reasonRows
       .map((r) => ({ id: r.id, label: String(r.action_desc || '').trim() }))
       .filter((x) => x.label);
-    logger.info('Returning ' + items.length + ' action reasons · type=' + type);
+    logger.info('Returning ' + items.length + ' action reasons · type=' + type
+      + (unfiltered ? ' · dueTo=any (unfiltered)' : ' · userType=' + userType));
     modernOk(res, items);
   } catch (e) { next(e); }
 });
@@ -1537,6 +1713,17 @@ router.get('/action-reasons', async (req, res, next) => {
  * UNLIKE /action-reasons this deliberately does NOT filter by user_type — the
  * Reschedule dialog has a single reason dropdown (no "due to" Customer/Client/
  * EasyFix/Technician radio), so ALL active action_type=8 reasons are offered.
+ *
+ * ⚠ THE DUE-TO-FILTERED ANSWER EXISTS, IT IS NOT THIS ENDPOINT, AND IT IS NOT
+ * EVEN THIS BUCKET.
+ *     GET /action-reasons?type=reschedule&dueTo=<customer|client|easyfix|technician>
+ * serves action_type 29, whose 16 rows cover all four parties correctly. This
+ * endpoint deliberately stays on action_type 8: its 7 rows all sit under
+ * user_type 1, so it can only ever be served unfiltered, and the Current tab's
+ * dialog calls it that way today. Repointing it at 29 would swap the list under
+ * a live screen; narrowing it in place would shrink that list to one party.
+ * Both buckets stand until the owner retires this one. See the `reschedule`
+ * note in services/reason-codes.js for the row-by-row evidence.
  *
  * Literal-segment route — declared before the `/:id` wildcard (same reason as
  * /action-reasons above, so Express doesn't try to parse "reschedule-reasons"
@@ -1680,7 +1867,21 @@ router.patch('/:id/status', validate(idParam, 'params'), validate(statusBody), s
   } catch (e) { next(e); }
 });
 
-router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'), async (req, res, next) => {
+/*
+ * PAST-APPOINTMENT GATE ON ASSIGN / REASSIGN (owner decision, 2026-09-17).
+ *
+ * This route used to stay open on a passed appointment so ops could swap a
+ * technician on a running-late job. That reasoning belonged to the old DIRECT
+ * assign. With the offer flow on, an assign here is an OFFER (and a reassign
+ * releases the current technician and offers the job to the new one), so it
+ * would send a technician an offer for a time that has already gone — exactly
+ * what /offer already refuses. The rule is now the same everywhere: reschedule
+ * first. A future requestedDateTime in the same body still passes (fixing the
+ * time and assigning in one call).
+ */
+router.patch('/:id/assign', validate(idParam, 'params'), validate(assignBody), scopedJob, requireStageForTransition('assign'),
+  blockPastAppointment('This job\'s appointment time has already passed. Reschedule it to a future slot before assigning or reassigning a technician.'),
+  async (req, res, next) => {
   try {
     logger.info('Assign technician · jobId=' + req.params.id + ' efrId=' + (req.body?.easyfixerId ?? req.body?.efr_id ?? '-'));
     const updated = await job.assign(req.params.id, req.body, req.user);
@@ -1794,8 +1995,14 @@ router.post('/:id/offer', validate(idParam, 'params'), validate(offerBody), scop
  * GET /api/admin/jobs/:id/offers
  *
  * Lists the technicians a job has been offered to (the "Offered to Tx" panel
- * on My Orders). Each item: { efr_id, efr_name, offered_at }. Returns an empty
- * list when the offer table is absent (service falls back to legacy behaviour).
+ * on My Orders), live + rejected + expired. Returns an empty list when the
+ * offer table is absent (service falls back to legacy behaviour).
+ *
+ * An EXPIRED row also carries `closed_reason` and `closed_reason_label` — WHY
+ * it closed, which the status cannot say on its own: eight code paths write
+ * EXPIRED and only one is the timeout. Both are null on an offer closed before
+ * the column existed, and the label is null for a token this deploy has no
+ * wording for. See listOffers + services/offer-closed-reason.js.
  *
  * Literal-segment route under `/:id/` — second segment "offers" disambiguates
  * it from `/:id` and from the sibling POST `/:id/offer`.
@@ -2423,6 +2630,85 @@ router.post('/:id/services',
     } catch (e) { next(e); }
   });
 
+/*
+ * ─── THE ONE-LIST SERVICES EDITOR (Uplifted tab) ──────────────────────────
+ *
+ *   GET /api/admin/jobs/:id/service-catalog[?categoryId=]
+ *     → { category, categories, types, products, foreign }
+ *   PUT /api/admin/jobs/:id/services   { categoryId?, services: [{ service_id, quantity }] }
+ *     → { added, updated, removed }
+ *
+ * A NEW editor for the Schedule & Assign Uplifted tab only. POST /:id/services
+ * above and every other services writer are deliberately untouched — including
+ * POST's silent quantity overwrite, which is exactly what this pair avoids by
+ * taking the COMPLETE desired set and diffing it against the ACTIVE rows.
+ * services/job-services-editor.service.js carries the rules and the QA
+ * measurements that shaped them.
+ *
+ * Guards match the existing services endpoints: the /api/admin/* chain plus
+ * scopedJob (404 outside the caller's scope). The write also takes
+ * servicesEditable, so a completed job's services — its billing lines — cannot
+ * be changed, and the service re-checks that on the row it locks.
+ */
+/*
+ * require('joi') inline, as the neighbouring services routes do: this file's
+ * `const Joi` is declared further down, and these schemas are built at module
+ * load — reading it here would be a temporal-dead-zone ReferenceError at
+ * require time.
+ */
+const serviceCatalogQuery = require('joi').object({
+  // Used ONLY while the job resolves no category of its own (see the service).
+  categoryId: require('joi').number().integer().positive().optional(),
+});
+
+router.get('/:id/service-catalog',
+  validate(idParam, 'params'),
+  validate(serviceCatalogQuery, 'query'),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const catalog = await servicesEditor.getServiceCatalog(req.scopedJob, { categoryId: req.query.categoryId });
+      modernOk(res, catalog);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * Joi guards the SHAPE; the service owns the business rules and answers them in
+ * plain sentences (an empty set, a duplicate service, a foreign add, a category
+ * that cannot change). `services: []` is therefore valid here on purpose — it is
+ * refused one layer down with "A job needs at least one service." rather than
+ * as an opaque "Validation failed".
+ */
+const QUANTITY_MESSAGE = 'Quantity must be a whole number from 1 to 100.';
+const replaceServicesBody = require('joi').object({
+  categoryId: require('joi').number().integer().positive().allow(null).optional(),
+  services: require('joi').array().items(require('joi').object({
+    service_id: require('joi').number().integer().positive().required(),
+    quantity: require('joi').number().integer().min(1).max(100).required().messages({
+      'number.base': QUANTITY_MESSAGE, 'number.integer': QUANTITY_MESSAGE,
+      'number.min': QUANTITY_MESSAGE, 'number.max': QUANTITY_MESSAGE,
+    }),
+  })).max(200).required(),
+});
+
+router.put('/:id/services',
+  validate(idParam, 'params'),
+  validate(replaceServicesBody),
+  scopedJob,
+  servicesEditable,
+  async (req, res, next) => {
+    try {
+      const result = await servicesEditor.replaceJobServices(req.params.id, req.body, req.user);
+      modernOk(res, result, 'Services saved');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.post('/:id/estimate/send-for-approval',
   validate(idParam, 'params'),
   validate(require('joi').object({
@@ -2618,6 +2904,102 @@ router.post('/:id/comments',
 // submit (after the status + comment writes). scopedJob ensures the job is in
 // the caller's scope. Non-fatal on the FE: a provider failure must not fail the
 // operator's outcome, so the FE wraps this call in try/catch.
+/*
+ * ─── INTERNAL JOB NOTES — GET/POST /api/admin/jobs/:id/notes ───────────────
+ *
+ * The legacy CRM's free-text ops notepad (tbl_job_notes), re-opened. READ AND
+ * ADD ONLY — no PATCH, no DELETE (the owner's call, and the only contract the
+ * table can honestly support: it has no updated_at, no status column and no
+ * author id to check an edit against). A note is a line in a log.
+ *
+ * NOT the comment thread. tbl_job_comment is the audited lifecycle trail —
+ * every row produced by an action, carrying that action's reason FK, mirrored
+ * onto tbl_job.remarks. These are operators writing to each other. See
+ * services/job-notes.service.js for why the two stay apart.
+ *
+ * GUARDED EXACTLY AS THE COMMENT ENDPOINTS ARE: the /api/admin/* chain
+ * (requireAuth → role(['admin']) → maskMobile → scope) plus `scopedJob`, which
+ * 404s a job outside the operator's client/city/vertical patch before either
+ * handler runs. No requireAction, for the same reason GET/POST /:id/comments
+ * has none — reading and appending narrative on a job you can already open is
+ * not a separately-granted capability in this CRM.
+ *
+ * Literal second segment "notes", so no collision with `/:id`.
+ */
+/*
+ * `notes` is the only field a caller supplies. Everything else on the row is
+ * derived server-side and deliberately NOT accepted: the author is the acting
+ * user (a body-supplied name is a forgeable byline on a table with no id to
+ * check it against), the stage is a snapshot of the job's own status, and the
+ * timestamp is the server's.
+ *
+ * `.trim()` before `.min(1)`, so a body of spaces is a 400 and not a blank row
+ * in the log. The 2000-char cap matches commentBody above rather than the
+ * column's TEXT ceiling: these are operator one-liners, the CRM renders them in
+ * a list, and an unbounded free-text field behind an authenticated POST is a
+ * storage-growth problem with no owner.
+ */
+const noteBody = Joi.object({
+  notes: Joi.string().trim().min(1).max(2000).required(),
+});
+
+router.get('/:id/notes', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    const notes = await jobNotes.listNotes(req.params.id);
+    modernOk(res, notes);
+  } catch (e) { next(e); }
+});
+
+router.post('/:id/notes',
+  validate(idParam, 'params'),
+  validate(noteBody),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      /*
+       * req.scopedJob is the row the guard already fetched — the note's stage
+       * snapshot comes off it, so recording "where this job sat when the note
+       * was written" costs no second read. req.user supplies the author NAME
+       * (the column holds names, not ids); a body-supplied author would be an
+       * attribution anyone could forge.
+       */
+      const created = await jobNotes.addNote(req.params.id, req.body, req.scopedJob, req.user);
+      res.status(201);
+      modernOk(res, created, 'Note added');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
+/*
+ * PATCH /jobs/:id/notes/:noteId/pin  { pinned: boolean }
+ *
+ * The one change a note allows after it is written: pin it on top, or unpin
+ * it. The TEXT stays read-and-add-only — a pin changes where a note sits, not
+ * what it says or who wrote it — so the log contract above still holds.
+ * Same guard chain as the two note routes; the note must belong to :id.
+ */
+const notePinParams = Joi.object({
+  id: Joi.number().integer().positive().required(),
+  noteId: Joi.number().integer().positive().required(),
+});
+const notePinBody = Joi.object({ pinned: Joi.boolean().required() });
+
+router.patch('/:id/notes/:noteId/pin',
+  validate(notePinParams, 'params'),
+  validate(notePinBody),
+  scopedJob,
+  async (req, res, next) => {
+    try {
+      const result = await jobNotes.setPinned(req.params.id, req.params.noteId, req.body.pinned, req.user);
+      modernOk(res, result, req.body.pinned ? 'Note pinned' : 'Note unpinned');
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  });
+
 router.post('/:id/notify-unreachable', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
   try {
     logger.info('Notify customer unreachable · jobId=' + req.params.id);
