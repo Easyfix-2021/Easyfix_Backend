@@ -2403,7 +2403,21 @@ router.get('/notices/unread-count', async (req, res, next) => {
           )`,
       [now, now, req.spoc.id]
     );
-    modernOk(res, { count: Number(unread) || 0 });
+    // Job-linked dashboard notifications (booking confirmed, material
+    // approval needed, …) — SAME client scoping as GET /notices above
+    // (job_id -> tbl_job.fk_client_id, not user_id). Without this half the
+    // bell never moved for those events even though GET /notices showed
+    // them — "hard to miss" needs the count to include them too.
+    const [[{ unread: jobsUnread }]] = await pool.query(
+      `SELECT COUNT(DISTINCT n.job_id) AS unread
+         FROM dashboard_notification_log n
+         JOIN tbl_job j ON j.job_id = n.job_id
+        WHERE j.fk_client_id = ? AND n.status <> 'read'`,
+      [req.spoc.client_id]
+    );
+    const notices = Number(unread) || 0;
+    const jobs = Number(jobsUnread) || 0;
+    modernOk(res, { count: notices + jobs, notices, jobs });
   } catch (e) { next(e); }
 });
 

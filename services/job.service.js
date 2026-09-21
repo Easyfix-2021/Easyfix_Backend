@@ -1403,6 +1403,35 @@ async function resolveClientPrimarySpoc(clientId, conn) {
 }
 
 /*
+ * The client's Primary (user_type 1) and Secondary (user_type 2) EasyFix SPOCs
+ * WITH their emails — the same tbl_vertical_mapping rule the job console's
+ * Primary/Secondary SPOC names read (latest active mapping per type), so a mail
+ * CC and the header can never disagree about who the SPOCs are. Either may be
+ * null. Used to CC both on the material "Send Request to Client" email.
+ */
+async function resolveClientSpocUsers(clientId, conn) {
+  if (!clientId) return { primary: null, secondary: null };
+  const db = conn || pool;
+  const orderBy = (await hasVerticalMappingInsertedOnColumn())
+    ? 'vm.inserted_on DESC, vm.id DESC'
+    : 'vm.id DESC';
+  const one = async (userType) => {
+    const [[row]] = await db.query(
+      `SELECT u.user_id, u.user_name, u.official_email AS email
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id
+        WHERE vm.client_id = ? AND vm.user_type = ?
+          AND (vm.status IS NULL OR vm.status = 1)
+        ORDER BY ${orderBy}
+        LIMIT 1`,
+      [clientId, userType],
+    );
+    return row || null;
+  };
+  return { primary: await one(1), secondary: await one(2) };
+}
+
+/*
  * ─── THE TWO MANAGER NAMES A JOB CARRIES ──────────────────────────────────
  *
  * Neither is a column on tbl_job. A job INHERITS both — the Project Manager
@@ -8535,6 +8564,8 @@ module.exports = {
   getJobTimelineActors,
   // The console header's client-side extras (SPOCs, vertical, escalation) — see its docblock.
   getJobConsoleExtras,
+  // Primary + Secondary SPOC users with emails — the material client-request CC.
+  resolveClientSpocUsers,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and
