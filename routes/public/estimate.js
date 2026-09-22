@@ -41,7 +41,10 @@ const { rateLimit } = require('../../middleware/rate-limit');
 const logger = require('../../logger');
 const emailService = require('../../services/email.service');
 const jobService = require('../../services/job.service');
-const { isEstimateApprovable, assertEstimateApprovable, stampApprovalPendingLines } = require('../../services/job-estimate-approval');
+const {
+  isEstimateApprovable, assertEstimateApprovable, stampApprovalPendingLines,
+  approveEstimateLinesAndStatus, afterApprovalCommitted,
+} = require('../../services/job-estimate-approval');
 
 // Peek-the-token middleware. Runs the signature check WITHOUT any
 // downstream SQL so the rate limiter can key its bucket on jobId.
@@ -249,8 +252,7 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next
           WHERE job_id = ?`,
         [clientContactId, new Date(), jobId]
       );
-      await stampApprovalPendingLines(conn, jobId, true);
-      await jobService.setStatus(jobId, { status: 1 }, { user_id: linkedUserId }, { conn });
+      await approveEstimateLinesAndStatus(conn, jobId, { user_id: linkedUserId });
       await conn.commit();
     } catch (e) {
       try { await conn.rollback(); } catch { /* connection may already be gone */ }
@@ -258,6 +260,9 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next
     } finally {
       conn.release();
     }
+    // Auto-reschedule (2026-09-22 amendment) — after commit, never able to
+    // fail this response. See services/job-estimate-approval.js#afterApprovalCommitted.
+    await afterApprovalCommitted(jobId);
     logger.info({ jobId, clientContactId }, 'public-estimate: approved via token link');
     return modernOk(res, { approved: true });
   } catch (e) {

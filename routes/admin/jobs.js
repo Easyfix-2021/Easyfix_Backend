@@ -3771,6 +3771,180 @@ router.post(
   },
 );
 
+// ─── NEW — Admin "approve on client's behalf" (Material Request Flow v2,
+// 2026-09-22 amendment) ─────────────────────────────────────────────────
+// POST /:id/client-approval-on-behalf (multipart/form-data)
+//   comment : string, trimmed, 10..1000 chars, required
+//   files   : 1..5 files, each <=10MB — audio (mp3/m4a/wav/aac/ogg), image
+//             (jpeg/png/webp/heic) or application/pdf, validated by BOTH
+//             mimetype AND extension. Deliberately NOT job-image.service's
+//             byte-sniff gate (assertUploadableFile) — that allowlist is
+//             image/PDF only (see its own header) and every one of its four
+//             callers is a photo or a document upload; this is the first
+//             caller that can legitimately carry a phone-call recording, so
+//             widening the shared sniffer for everyone was rejected in favour
+//             of this route validating its own (wider) allowlist and handing
+//             job-image.service an already-resolved contentType.
+//
+// Ops sometimes gets a client's approval over a phone call or a WhatsApp
+// voice note rather than through the portal/magic-link — this endpoint lets
+// an authorised PM (isJobMaterialReview) record that proof and apply the
+// SAME approval the client would have applied themselves. Guarded to status
+// 15 (ESTIMATE_PENDING_APPROVAL) exactly like every other estimate-approval
+// surface (services/job-estimate-approval.js's isEstimateApprovable), with
+// its own 409 message per the API contract.
+//
+// Storage: routes/admin/job-documents.js's own storage path —
+// job-image.service's storeJobImageFile (the shared S3-or-local helper) +
+// tbl_job_image (the SAME table Job Sheet / Purchase Order documents use)
+// under a NEW category, 'ClientApprovalProof'.
+// utils/job-image-buckets.js#DOCUMENT_CATEGORIES classifies it as a
+// document, not a before/after work photo — same treatment as 'jobsheet' /
+// 'po'. Categories are a plain in-code allowlist (job-charges.service.js's
+// DOC_CATEGORIES is the Billing-tab example), not a DB table, so adding one
+// is a code change, not a migration.
+//
+// Then: a job comment (services/job-comment.service.js#addComment,
+// comment_on=1) prefixed "Approved on client's behalf: <comment>", and the
+// SAME shared approval writer the client portal and public magic-link use
+// (services/job-estimate-approval.js#approveEstimateLinesAndStatus) — never a
+// second approval writer (lines client_status=1, job -> 1, same technician).
+// The post-commit auto-reschedule trigger (#afterApprovalCommitted) runs
+// exactly like the other two surfaces; this route is the only one that
+// SURFACES its result, in the `schedule` response field.
+const clientApprovalMulter = require('multer');
+const clientApprovalUpload = clientApprovalMulter({
+  storage: clientApprovalMulter.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+});
+
+// mimetype -> allowed extension(s). Both must agree — a mismatched pair (a
+// .wav renamed .mp3, or vice versa) is refused rather than guessed at.
+const CLIENT_APPROVAL_PROOF_TYPES = {
+  'audio/mpeg': ['.mp3'],
+  'audio/mp3': ['.mp3'],
+  'audio/x-m4a': ['.m4a'],
+  'audio/m4a': ['.m4a'],
+  'audio/mp4': ['.m4a'],
+  'audio/wav': ['.wav'],
+  'audio/x-wav': ['.wav'],
+  'audio/wave': ['.wav'],
+  'audio/aac': ['.aac'],
+  'audio/x-aac': ['.aac'],
+  'audio/ogg': ['.ogg'],
+  'application/ogg': ['.ogg'],
+  'image/jpeg': ['.jpg', '.jpeg'],
+  'image/png': ['.png'],
+  'image/webp': ['.webp'],
+  'image/heic': ['.heic'],
+  'image/heif': ['.heic', '.heif'],
+  'application/pdf': ['.pdf'],
+};
+
+function clientApprovalProofError(file) {
+  const mime = String(file.mimetype || '').trim().toLowerCase();
+  const exts = CLIENT_APPROVAL_PROOF_TYPES[mime];
+  if (!exts) return `"${file.originalname}": unsupported file type (${file.mimetype})`;
+  const ext = require('node:path').extname(file.originalname || '').toLowerCase();
+  if (!exts.includes(ext)) return `"${file.originalname}": file extension does not match its declared type (${file.mimetype})`;
+  return null;
+}
+
+// Same MulterError-mapping reason as imageUploadOr400 below: a size/count
+// rejection throws from INSIDE multer's own middleware, before the handler's
+// try/catch can see it, and MulterError has no .status.
+function clientApprovalUploadOr400(req, res, next) {
+  clientApprovalUpload.array('files', 5)(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'each file must be 10MB or smaller');
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return modernError(res, 400, 'attach between 1 and 5 files');
+    }
+    return next(err);
+  });
+}
+
+const clientApprovalOnBehalfBody = Joi.object({
+  comment: Joi.string().trim().min(10).max(1000).required(),
+});
+
+router.post(
+  '/:id/client-approval-on-behalf',
+  validate(idParam, 'params'),
+  scopedJob,
+  requireAction('isJobMaterialReview'),
+  clientApprovalUploadOr400,
+  validate(clientApprovalOnBehalfBody),
+  async (req, res, next) => {
+    const jobId = Number(req.params.id);
+    try {
+      if (Number(req.scopedJob.job_status) !== job.STATUS.ESTIMATE_PENDING_APPROVAL) {
+        logger.warn('Client-approval-on-behalf refused · jobId=' + jobId + ' · job_status=' + req.scopedJob.job_status);
+        return modernError(res, 409, 'This job is not waiting for client approval');
+      }
+
+      const files = Array.isArray(req.files) ? req.files : [];
+      if (files.length < 1) return modernError(res, 400, 'attach at least 1 file (up to 5)');
+      for (const file of files) {
+        const fileErr = clientApprovalProofError(file);
+        if (fileErr) return modernError(res, 400, fileErr);
+      }
+
+      logger.info('Client-approval-on-behalf · jobId=' + jobId + ' · files=' + files.length
+        + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      const { storeJobImageFile } = require('../../services/job-image.service');
+      for (const file of files) {
+        const mime = String(file.mimetype || '').trim().toLowerCase();
+        await storeJobImageFile({ jobId, file, category: 'ClientApprovalProof', contentType: mime });
+      }
+
+      // Required, not best-effort: the comment IS the recorded proof text —
+      // a failure here must surface (500), unlike the material-review reject
+      // reason comment above, which is a nicety on an already-committed move.
+      await jobComments.addComment(jobId, {
+        comments: `Approved on client's behalf: ${req.body.comment}`,
+        comment_on: 1,
+        commented_by: req.user?.user_id ?? null,
+      });
+
+      const jobEstimateApproval = require('../../services/job-estimate-approval');
+      const { pool } = require('../../db');
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await jobEstimateApproval.approveEstimateLinesAndStatus(conn, jobId, req.user);
+        await conn.commit();
+      } catch (e) {
+        try { await conn.rollback(); } catch { /* connection may already be gone */ }
+        throw e;
+      } finally {
+        conn.release();
+      }
+
+      const updated = await job.getById(jobId);
+      // Auto-reschedule (2026-09-22 amendment) — after commit, never able to
+      // fail this response; this route is the one caller that SURFACES the
+      // outcome (the other two approval surfaces call this and ignore it).
+      const scheduleResult = await jobEstimateApproval.afterApprovalCommitted(jobId);
+
+      logger.info('Client-approval-on-behalf done · jobId=' + jobId + ' · status->' + updated.job_status
+        + ' · rescheduled=' + scheduleResult.rescheduled);
+      return modernOk(res, {
+        job_status: updated.job_status,
+        schedule: {
+          rescheduled: scheduleResult.rescheduled,
+          requested_date_time: scheduleResult.requestedDateTime,
+          needs_scheduling: scheduleResult.needsScheduling,
+        },
+      }, "approved on client's behalf");
+    } catch (e) {
+      logger.warn('Client-approval-on-behalf failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
+
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');
 // VERIFIED against tbl_customer_feedback (see services/job-feedback.service.js).

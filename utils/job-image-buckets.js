@@ -34,7 +34,12 @@ const PROOF_AFTER_CATEGORIES = ['completion', 'after', 'checkout'];
  * "not a work photo" positively instead of by falling off the end of an if/else
  * — and so the next category added here is a decision, not an accident.
  */
-const DOCUMENT_CATEGORIES = ['feedback', 'po', 'jobsheet', 'questionaire', 'customer signature'];
+// 'clientapprovalproof' (2026-09-22, Material Request Flow v2 on-behalf
+// approval — routes/admin/jobs.js POST /:id/client-approval-on-behalf) is the
+// lowercased form of the `ClientApprovalProof` tbl_job_image category, same
+// convention as 'jobsheet' / 'po' below (uploadJobImage/storeJobImageFile
+// always lowercases `category` on write).
+const DOCUMENT_CATEGORIES = ['feedback', 'po', 'jobsheet', 'questionaire', 'customer signature', 'clientapprovalproof'];
 
 /** Lowercased, whitespace-normalised category — 'Customer Signature' → 'customer_signature'. */
 function normaliseCategory(value) {

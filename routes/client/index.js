@@ -6,7 +6,9 @@ const requireSpocAuth = require('../../middleware/client-auth');
 const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
-const { isEstimateApprovable, stampApprovalPendingLines } = require('../../services/job-estimate-approval');
+const {
+  isEstimateApprovable, stampApprovalPendingLines, approveEstimateLinesAndStatus, afterApprovalCommitted,
+} = require('../../services/job-estimate-approval');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const otpAttempts = require('../../services/otp-attempts.service');
@@ -1093,16 +1095,15 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
     // Material Request Flow v2 (2026-09-21): the tbl_job stamp, the
     // approval_pending quotation_details lines and the status move to 1 all
     // land in ONE transaction — see services/job-estimate-approval.js's
-    // stampApprovalPendingLines header for why this is a SHARED function
-    // rather than a copy per surface.
+    // approveEstimateLinesAndStatus header for why the line-stamp + status
+    // move is a SHARED function rather than a copy per surface.
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
       await conn.query(
         'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
         [req.spoc.id, new Date(), job.job_id]);
-      await stampApprovalPendingLines(conn, job.job_id, true);
-      await jobService.setStatus(job.job_id, { status: 1 }, { user_id: link?.user_id ?? null }, { conn });
+      await approveEstimateLinesAndStatus(conn, job.job_id, { user_id: link?.user_id ?? null });
       await conn.commit();
     } catch (e) {
       try { await conn.rollback(); } catch { /* connection may already be gone */ }
@@ -1110,6 +1111,9 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
     } finally {
       conn.release();
     }
+    // Auto-reschedule (2026-09-22 amendment) — after commit, never able to
+    // fail this response. See services/job-estimate-approval.js#afterApprovalCommitted.
+    await afterApprovalCommitted(job.job_id);
     logger.info('Estimate approved · id=' + job.job_id);
     modernOk(res, { approved: true });
   } catch (e) { next(e); }

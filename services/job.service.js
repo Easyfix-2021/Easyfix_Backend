@@ -609,7 +609,21 @@ function materialStateColumns() {
   ) AS material_count,
   (SELECT COUNT(*) FROM quotation_details mdc
      WHERE mdc.job_id = j.job_id AND ${quotationLineState.statePredicateSql('mdc', quotationLineState.STATE.DRAFT)}
-  ) AS material_draft_count`;
+  ) AS material_draft_count,
+  /*
+   * needs_scheduling (Material Request Flow v2, 2026-09-22 amendment) — set
+   * by services/material-auto-schedule.service.js when a post-approval
+   * auto-reschedule found no open slot in the technician's next 7 days;
+   * cleared by job.service.js#reschedule() the next time anyone successfully
+   * reschedules the job. CAST AS SIGNED: EXISTS already returns 0/1, but every
+   * other flag this codebase reads back through mysql2's typeCast follows the
+   * same explicit-cast convention (see quotation-line-state.js's header) so a
+   * driver-config change can never silently turn this into a boolean.
+   */
+  CAST(EXISTS (
+    SELECT 1 FROM tbl_job_auto_schedule jas
+     WHERE jas.job_id = j.job_id AND jas.status = 'needs_scheduling' AND jas.cleared_at IS NULL
+  ) AS SIGNED) AS needs_scheduling`;
 }
 
 // ─── Projections ────────────────────────────────────────────────────
@@ -8191,6 +8205,21 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
     });
   } catch (e) {
     logger.warn('Reschedule audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
+  }
+
+  // Clear any pending "needs manual scheduling" flag (Material Request Flow
+  // v2, 2026-09-22 amendment) — ANY successful reschedule answers it, not
+  // just one material-auto-schedule.service.js itself raised. Best-effort:
+  // tbl_job_auto_schedule may not exist yet on a deploy that hasn't run
+  // migrations/2026-09-22-material-approval-auto-schedule.sql, and a missing
+  // flag to clear is not an error.
+  try {
+    await pool.query(
+      `UPDATE tbl_job_auto_schedule SET cleared_at = ? WHERE job_id = ? AND cleared_at IS NULL`,
+      [new Date(), jobId],
+    );
+  } catch (e) {
+    logger.warn('Reschedule: clearing auto-schedule flag failed (non-fatal) · id=' + jobId + ' · ' + e.message);
   }
 
   fireWebhook('RescheduleTech', jobId);
