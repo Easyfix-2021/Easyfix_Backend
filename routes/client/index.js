@@ -7,8 +7,10 @@ const { pool } = require('../../db');
 const clientAuth = require('../../services/client-auth.service');
 const jobService = require('../../services/job.service');
 const {
-  isEstimateApprovable, stampApprovalPendingLines, approveEstimateLinesAndStatus, afterApprovalCommitted,
+  isEstimateApprovable, stampApprovalPendingLines, approveWithVisitSchedule,
 } = require('../../services/job-estimate-approval');
+const visitSlots = require('../../services/visit-slots.service');
+const multer = require('multer');
 const clientRequest = require('../../services/client-request.service');
 const { modernOk, modernError, otpGuessCapError } = require('../../utils/response');
 const otpAttempts = require('../../services/otp-attempts.service');
@@ -1048,6 +1050,33 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
   } catch (e) { next(e); }
 });
 
+// Material Request Flow v2, 2026-09-22 correction — the visit date/time +
+// site-access permission choice ride on the SAME approve call, as
+// multipart/form-data (permission_file is a file field; the rest is text).
+// One-file, memory-storage upload — see services/job-estimate-approval.js's
+// PERMISSION_FILE_TYPES header for why this isn't job-image.service's
+// byte-sniff gate (heic isn't in that allowlist).
+const permissionFileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+function permissionFileUploadOr400(req, res, next) {
+  permissionFileUpload.single('permission_file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'the permission document must be 10MB or smaller');
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') return modernError(res, 400, 'attach at most 1 permission document');
+    return next(err);
+  });
+}
+
+// GET the technician's free visit hours for the next 30 days — same scope
+// rule as every other /jobs/:id route (loadJobInScope).
+router.get('/jobs/:id/visit-slots', async (req, res, next) => {
+  try {
+    const job = await loadJobInScope(req, res, 'Visit-slots');
+    if (!job) return;
+    const slots = await visitSlots.listVisitSlots(job.job_id);
+    modernOk(res, slots);
+  } catch (e) { next(e); }
+});
+
 // Estimate approve/reject — legacy stored in approve_job_doc workflow.
 // Refuse approval on terminal states (cancelled / completed) and on
 // estimates already responded to. Mirrors legacy idempotency guards.
@@ -1065,7 +1094,12 @@ router.patch('/jobs/:id/reject', validate(Joi.object({ reason: Joi.string().min(
 // release precedent of a fixed target rather than trying to recall which of
 // 2/20 the job was in before 16 overwrote it — no column stores that).
 // See docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
-router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
+//
+// Material Request Flow v2, 2026-09-22 correction: now multipart/form-data —
+// visit_date_time + permission (+ permission_file iff permission='now') ride
+// on this same call. See services/job-estimate-approval.js#approveWithVisitSchedule
+// for the shared writer and its documented validation-before-write order.
+router.patch('/jobs/:id/estimate/approve', permissionFileUploadOr400, async (req, res, next) => {
   try {
     logger.info('SPOC approve estimate · id=' + req.params.id);
     const job = await loadJobInScope(req, res, 'Estimate-approve');
@@ -1092,30 +1126,31 @@ router.patch('/jobs/:id/estimate/approve', async (req, res, next) => {
     // Legacy stamps cancel_by/etc with the SPOC's linked USER — same
     // resolution as the client cancel route above.
     const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
-    // Material Request Flow v2 (2026-09-21): the tbl_job stamp, the
-    // approval_pending quotation_details lines and the status move to 1 all
-    // land in ONE transaction — see services/job-estimate-approval.js's
-    // approveEstimateLinesAndStatus header for why the line-stamp + status
-    // move is a SHARED function rather than a copy per surface.
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      await conn.query(
+    // approveWithVisitSchedule validates visit_date_time/permission/file and
+    // re-checks slot availability BEFORE writing anything (see its header),
+    // then runs the approval txn (stamp callback below writes THIS route's
+    // own idempotency columns inside it), then reschedules to the chosen
+    // slot and records the permission choice, post-commit.
+    const result = await approveWithVisitSchedule(job.job_id, { user_id: link?.user_id ?? null }, {
+      visitDateTime: req.body.visit_date_time,
+      permissionChoice: req.body.permission,
+      permissionFile: req.file || null,
+      technicianId: job.fk_easyfixter_id,
+      rescheduleActor: null, // system — never a client-contact id in a tbl_user FK
+      permissionSpocId: req.spoc.id,
+      stamp: (conn) => conn.query(
         'UPDATE tbl_job SET approved_by_client_contact = ?, approved_on_date_time = ? WHERE job_id = ?',
-        [req.spoc.id, new Date(), job.job_id]);
-      await approveEstimateLinesAndStatus(conn, job.job_id, { user_id: link?.user_id ?? null });
-      await conn.commit();
-    } catch (e) {
-      try { await conn.rollback(); } catch { /* connection may already be gone */ }
-      throw e;
-    } finally {
-      conn.release();
-    }
-    // Auto-reschedule (2026-09-22 amendment) — after commit, never able to
-    // fail this response. See services/job-estimate-approval.js#afterApprovalCommitted.
-    await afterApprovalCommitted(job.job_id);
-    logger.info('Estimate approved · id=' + job.job_id);
-    modernOk(res, { approved: true });
+        [req.spoc.id, new Date(), job.job_id],
+      ),
+    });
+    logger.info('Estimate approved · id=' + job.job_id + ' · rescheduled=' + result.rescheduled);
+    modernOk(res, {
+      approved: true,
+      visit_date_time: result.visitDateTime,
+      permission: { choice: result.permission.choice, request_id: result.permission.requestId },
+      schedule_error: result.scheduleError,
+      permission_error: result.permissionError,
+    });
   } catch (e) { next(e); }
 });
 
