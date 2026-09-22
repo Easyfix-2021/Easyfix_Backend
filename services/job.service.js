@@ -2762,6 +2762,13 @@ async function list({
    */
   delegatedToEfrId,
   /*
+   * `sendBackToTx` (2026-09-22) — the tech app's "Waiting for Me" chip: jobs
+   * the CRM sent back (send_back_to_tx = 1). Same predicate as the dashboard's
+   * actionRequired count, so the chip's list and its count agree. Passed only
+   * by GET /api/mobile/jobs?actionRequired=true.
+   */
+  sendBackToTx,
+  /*
    * `readyForBilling` (2026-08-26) — the client portal's "In-Warranty Orders"
    * tab. Two predicates, always together: ready_for_billing = 'Yes' AND
    * sub_job_id IS NULL. They travel as ONE filter because the second is not a
@@ -3122,6 +3129,8 @@ async function list({
       params.push(easyfixerId);
     }
   }
+  // No column → nothing can have been sent back, so an empty list, not a 500.
+  if (sendBackToTx) clauses.push(await hasSendBackToTxColumn() ? 'j.send_back_to_tx = 1' : '1 = 0');
   if (ownerId != null)     { clauses.push('j.job_client_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
