@@ -1893,6 +1893,10 @@ function homeJobStatus(jobStatus, efrId, subJobId) {
     case 7:  return 'Failed Orders';
     case 9:  return 'Unconfirmed';
     case 15: return 'Orders in Follow UP';
+    // 2026-09-18, Material Management phase 2 sub-project D: its own bucket,
+    // not folded into 'Orders in Follow UP' — the CRM gains a dedicated
+    // "Pending for Material" tab for this status (see the design's "UI").
+    case 16: return 'Pending for Material';
     case 21: return 'Orders in Follow UP';
     case 100: return 'UnKnown Reciever';
     default: return '';
@@ -2064,6 +2068,7 @@ function jobCurrentStatus(r) {
     case 7:  return 'Enquiry';
     case 21: return 'Fulfillment On Hold';
     case 15: return 'Pending for Approval';
+    case 16: return 'Pending for Material';
     default: return `Undefined : ${status}`;
   }
 }
@@ -2087,7 +2092,7 @@ function agingDaysWithTime(r) {
   if (!ticketDt) return 0;
   const status = jdbcInt(r.job_status);
 
-  if ([9, 1, 0, 2, 20, 10, 15, 21].includes(status)) return calculateAgingDays(ticketDt, new Date());
+  if ([9, 1, 0, 2, 20, 10, 15, 16, 21].includes(status)) return calculateAgingDays(ticketDt, new Date());
   if (status === 3 || status === 5) {
     const end = sheetDate(r.checkout_date_time);
     return end ? calculateAgingDays(ticketDt, end) : 0;
@@ -2222,10 +2227,11 @@ function mapExportRow(r, seqNumber) {
 
   /*
    * SDA ("Same Day Arrival") and Estimate TAT are only computed for jobs that
-   * have reached the field — statuses 2, 20, 10, 21, 15, 3, 5. Every other job
-   * leaves both cells blank.
+   * have reached the field — statuses 2, 20, 10, 21, 15, 16, 3, 5. Every other
+   * job leaves both cells blank. 16 (Pending for Material, 2026-09-18) is
+   * reachable only from 2/20, so it is on-site by construction, same as 15.
    */
-  const sdaEligible = [2, 20, 10, 21, 15, 3, 5].includes(jobStatus);
+  const sdaEligible = [2, 20, 10, 21, 15, 16, 3, 5].includes(jobStatus);
   let sdaStatus = null;
   let estimateTAT = null;
   if (sdaEligible) {

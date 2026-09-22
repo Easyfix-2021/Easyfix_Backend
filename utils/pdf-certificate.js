@@ -674,6 +674,10 @@ module.exports = {
   certificateSvg,
   formatDate,
   OUTPUT_FORMATS,
+  // The brand red every other letterhead/PDF artifact should match — see
+  // utils/pdf-letterhead.js, which imports this rather than re-declaring the
+  // hex so the two files cannot drift apart.
+  BRAND_RED,
   ARTWORK_DIR,
   ARTWORK_PNG,
   ARTWORK_SVG,

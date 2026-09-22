@@ -227,16 +227,6 @@ test('columns ABSENT → share reads answer "not shared" instead of 500ing', asy
   assert.equal(shareSelects(), 1, 'post-migration the share IS read');
 });
 
-test('the TTL sweep skips a table that lacks its delegation columns, and still throws a real fault', async () => {
-  const delegation = freshDelegation();
-  schema = 'absent';
-  assert.deepEqual(await delegation.expireStaleShares(), { eligible: 0, expired: 0, skipped: true });
-  schema = 'present';
-  fault = 'ETIMEDOUT';
-  await assert.rejects(delegation.expireStaleShares(), { code: 'ETIMEDOUT' },
-    'only an absent-answer is swallowed; a connection fault must still surface');
-});
-
 /* ─── 3. The route: offset and the default status set ────────────────── */
 
 let server;

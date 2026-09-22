@@ -64,6 +64,7 @@ const {
   overlayOpenJobCapabilities,
   OPEN_JOB_STATUSES,
 } = lifecycle._internals;
+const { capabilitiesForStatus, lifecycleFromRow } = lifecycle;
 const {
   decide,
   dateMs,
@@ -558,7 +559,7 @@ test('negative-wallet management email is queued only for an actual cron transit
   assert.equal(managementAlertForTransition({
     changed: true,
     transitionedFrom: 'ACTIVE',
-    lifecycle: { status: 'DORMANT', reasonCode: 'NO_ATTENDANCE_OR_JOB_ACTIVITY' },
+    lifecycle: { status: 'DORMANT', reasonCode: 'NO_ATTENDANCE_OR_OFFER_ACCEPTED' },
   }, { source: 'CRON' }), null);
 });
 
@@ -610,8 +611,9 @@ test('BLACKLISTED is fully reversible from CRM (admin decision) and SUSPENDED re
 });
 
 test('technician re-application is allowed only from documented states', () => {
+  const longAgo = new Date(Date.now() - 91 * 86400000).toISOString();
   for (const status of ['INACTIVE', 'DORMANT', 'APPLICATION_REJECTED', 'REAPPLIED']) {
-    assert.doesNotThrow(() => assertTransition({ status }, 'REAPPLIED', {
+    assert.doesNotThrow(() => assertTransition({ status, changedAt: longAgo }, 'REAPPLIED', {
       source: 'APP', reason: 'Please review',
     }));
   }
@@ -620,6 +622,35 @@ test('technician re-application is allowed only from documented states', () => {
       source: 'APP', reason: 'Please review',
     }),
     /not allowed|cannot move/,
+  );
+});
+
+test('a rejected profile cannot re-apply for 90 days after the rejection', () => {
+  const day = 86400000;
+  const recent = new Date(Date.now() - 89 * day).toISOString();
+  const old = new Date(Date.now() - 91 * day).toISOString();
+  for (const changedAt of [recent, undefined]) {
+    assert.throws(
+      () => assertTransition({ status: 'APPLICATION_REJECTED', changedAt }, 'REAPPLIED', {
+        source: 'APP', reason: 'Please review',
+      }),
+      /90 days after profile rejection/,
+    );
+  }
+  assert.equal(capabilitiesForStatus('APPLICATION_REJECTED', recent).reapply, false);
+  assert.equal(capabilitiesForStatus('APPLICATION_REJECTED', old).reapply, true);
+  // INACTIVE/DORMANT carry no rejection cooldown.
+  assert.equal(capabilitiesForStatus('DORMANT', recent).reapply, true);
+
+  const snapshot = lifecycleFromRow({
+    lifecycle_status: 'APPLICATION_REJECTED',
+    lifecycle_changed_at: recent,
+    efr_status: 0,
+  });
+  assert.equal(snapshot.canReapply, false);
+  assert.equal(
+    Date.parse(snapshot.reapplyAvailableAt) - Date.parse(recent),
+    90 * day,
   );
 });
 
@@ -713,7 +744,7 @@ test('server transition graph enforces reapplication before second verification'
 function emptySignals() {
   return {
     attendance: new Map(),
-    jobs: new Map(),
+    offers: new Map(),
     grades: new Map(),
     escalations: new Map(),
     margins: new Map(),
@@ -752,7 +783,7 @@ test('lifecycle evaluator applies 90-day inactivity and D/E grade rules', () => 
     current_balance: 0,
     insert_date: '2026-01-01 00:00:00',
   }, emptySignals(), CFG, now);
-  assert.equal(dormant.reasonCode, 'NO_ATTENDANCE_OR_JOB_ACTIVITY');
+  assert.equal(dormant.reasonCode, 'NO_ATTENDANCE_OR_OFFER_ACCEPTED');
 
   const signals = emptySignals();
   signals.grades.set(9, {
@@ -766,6 +797,16 @@ test('lifecycle evaluator applies 90-day inactivity and D/E grade rules', () => 
     insert_date: '2026-08-01 00:00:00',
   }, signals, CFG, now);
   assert.equal(paused.reasonCode, 'LOW_PERFORMANCE_GRADE');
+});
+
+test('an accepted offer inside 90 days keeps a technician out of DORMANT', () => {
+  const now = Date.parse('2026-08-10T00:00:00Z');
+  const signals = emptySignals();
+  signals.offers.set(12, { efr_id: 12, last_accepted: '2026-07-01 10:00:00' });
+  const row = { efr_id: 12, current_balance: 0, insert_date: '2026-01-01 00:00:00' };
+  assert.equal(decide(row, signals, CFG, now), null);
+  signals.offers.set(12, { efr_id: 12, last_accepted: '2026-04-01 10:00:00' });
+  assert.equal(decide(row, signals, CFG, now).reasonCode, 'NO_ATTENDANCE_OR_OFFER_ACCEPTED');
 });
 
 test('stale D grade snapshot cannot automatically pause a technician', () => {
@@ -888,8 +929,12 @@ test('INACTIVE with open jobs keeps assigned work but never receives new jobs', 
   // dashboard counter's (1, 2, 20) and stranded a technician whose only work
   // sat in 15 / 21 / 10. "Work in hand" is now derived from the job status
   // model — see the OPEN_JOB_STATUSES comment in the service.
-  assert.deepEqual([...OPEN_JOB_STATUSES], [1, 2, 10, 15, 20, 21]);
-  assert.deepEqual(params, [77, 1, 2, 10, 15, 20, 21]);
+  // ASSERTION UPDATED (2026-09-18, deliberately): 16 "Pending for Material"
+  // joins the set — a technician whose job is waiting on a material quote is
+  // still holding that work, and dropping it here would strand the job the
+  // same way 15 / 21 / 10 were stranded before.
+  assert.deepEqual([...OPEN_JOB_STATUSES], [1, 2, 10, 15, 16, 20, 21]);
+  assert.deepEqual(params, [77, 1, 2, 10, 15, 16, 20, 21]);
 });
 
 /*
@@ -1082,6 +1127,11 @@ test('loadSignals no-show window compares tbl_easyfixer_attendance.created_on ag
     assert.match(escalationCall.sql, /insert_date_time >= DATE_SUB\(\?, INTERVAL \? DAY\)/i);
     assert.deepEqual([escalationCall.params[0], escalationCall.params[2]], [10, cfg.escalationWindowDays]);
     assert.ok(escalationCall.params[1] instanceof Date);
+
+    const offerCall = calls.find((c) => /tbl_job_offer/i.test(c.sql));
+    assert.ok(offerCall, 'expected the accepted-offer query to run');
+    assert.match(offerCall.sql, /offer_status = \?/);
+    assert.deepEqual(offerCall.params, [10, 1]);
   } finally {
     pool.query = originalQuery;
   }

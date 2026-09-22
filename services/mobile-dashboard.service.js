@@ -93,9 +93,15 @@ const STARTED_STATUSES = '2,20';
  * checkin_date_time alone, so this does too. Every other open status can be late,
  * including any status added to the open set later: jobStage's default is "not
  * started", the conservative direction, and this matches it.
+ *
+ * 16 "Pending for Material" (2026-09-18) joins 15 in the checkin_date_time
+ * carve-out: it is reachable only from 2/20, so the technician is on-site
+ * (already checked in) the entire time the job sits at 16, in either
+ * sub-state — same "began, just not by the STARTED_STATUSES definition"
+ * shape 15 already had.
  */
 const NOT_STARTED_SQL = `(job_status NOT IN (2, 10, 20)
-                          AND NOT (job_status = 15 AND checkin_date_time IS NOT NULL))`;
+                          AND NOT (job_status IN (15, 16) AND checkin_date_time IS NOT NULL))`;
 const WORK_DATE_SQL = `DATE(CASE WHEN job_status IN (${STARTED_STATUSES})
                                  THEN COALESCE(checkin_date_time, requested_date_time)
                                  ELSE requested_date_time END)`;

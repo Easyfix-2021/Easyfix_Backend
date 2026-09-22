@@ -3,6 +3,7 @@ const logger = require('../logger');
 const lifecycle = require('./easyfixer-lifecycle.service');
 const { withMysqlNamedLock } = require('./mysql-named-lock.service');
 const { drainBatches } = require('./bounded-batch-drain');
+const { OFFER_STATUS } = require('./offer-status');
 
 /*
  * Bounded automatic lifecycle evaluator.
@@ -124,7 +125,7 @@ async function loadSignals(candidates, cfg) {
   // this instant instead of reading NOW(). insert_date_time
   // (tbl_easyfixer_rating_by_customer) is written by the legacy feedback flow on
   // the IST app clock, so the escalation window binds it too.
-  const [attendanceResult, jobsResult, gradesResult, escalationsResult,
+  const [attendanceResult, offersResult, gradesResult, escalationsResult,
     marginResult, noShowResult] = await Promise.all([
     pool.query(
       `SELECT easyfixer_id AS efr_id, MAX(created_on) AS last_attendance
@@ -133,14 +134,16 @@ async function loadSignals(candidates, cfg) {
         GROUP BY easyfixer_id`,
       ids,
     ),
+    // Activity = an offer the technician ACCEPTED, not any job row carrying
+    // his id: ops-assigned or reassigned jobs are not his own activity.
+    // Served by idx_job_offer_efr_status (fk_easyfixter_id, offer_status).
     pool.query(
-      `SELECT fk_easyfixter_id AS efr_id,
-              MAX(COALESCE(checkout_date_time, checkin_date_time,
-                           scheduled_date_time, created_date_time)) AS last_job
-         FROM tbl_job
+      `SELECT fk_easyfixter_id AS efr_id, MAX(responded_at) AS last_accepted
+         FROM tbl_job_offer
         WHERE fk_easyfixter_id IN (${placeholders})
+          AND offer_status = ?
         GROUP BY fk_easyfixter_id`,
-      ids,
+      [...ids, OFFER_STATUS.ACCEPTED],
     ),
     pool.query(
       `SELECT efr_id, grade, computed_at FROM tbl_efr_grade_snapshot
@@ -184,7 +187,7 @@ async function loadSignals(candidates, cfg) {
 
   return {
     attendance: mapById(attendanceResult[0]),
-    jobs: mapById(jobsResult[0]),
+    offers: mapById(offersResult[0]),
     grades: mapById(gradesResult[0]),
     escalations: mapById(escalationsResult[0]),
     margins: mapById(marginResult[0]),
@@ -220,14 +223,14 @@ function decide(candidate, signals, cfg, now = Date.now()) {
     dateMs(candidate.insert_date) || 0,
     dateMs(candidate.lifecycle_changed_at) || 0,
     dateMs(signals.attendance?.get(id)?.last_attendance) || 0,
-    dateMs(signals.jobs?.get(id)?.last_job) || 0,
+    dateMs(signals.offers?.get(id)?.last_accepted) || 0,
   );
   const dormantCutoff = now - cfg.dormantDays * 24 * 60 * 60 * 1000;
   if (baseline > 0 && baseline < dormantCutoff) {
     return {
       status: 'DORMANT',
-      reasonCode: 'NO_ATTENDANCE_OR_JOB_ACTIVITY',
-      reason: `No attendance or job activity for ${cfg.dormantDays} days`,
+      reasonCode: 'NO_ATTENDANCE_OR_OFFER_ACCEPTED',
+      reason: `No attendance or accepted offer for ${cfg.dormantDays} days`,
       metadata: { dormantDays: cfg.dormantDays },
     };
   }

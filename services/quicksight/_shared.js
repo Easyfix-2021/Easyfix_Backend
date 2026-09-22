@@ -160,6 +160,12 @@ const JOB_STATUS = {
   // Terminal jobs excluded from "open orders" aging buckets.
   //   3 = completed, 5 = completed_alt, 7 = enquiry, 6 = cancelled.
   // Used as:  WHERE j.job_status NOT IN (3,5,7,6)
+  //
+  // 16 "Pending for Material" (2026-09-18, Material Management phase 2
+  // sub-project D) needs NO entry anywhere in this block: it is not
+  // terminal, so it already falls into "open orders" by not being excluded
+  // here, exactly like 15 (never a member of any bucket below either) — the
+  // same non-membership, not new code.
   TERMINAL_EXCLUSION: [3, 5, 7, 6],
 
   // Completed-for-revenue/billing/rating eligibility.  IN (3,5)

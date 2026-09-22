@@ -3,7 +3,8 @@
  *
  * One file covers three operator-facing flows:
  *   - Client list export   → exportClientList(rows, scope)
- *   - Rate card export     → exportRateCards(client, rows)
+ *   - Rate card export     → exportRateCards(client, rows) / exportMaterialRates(items) /
+ *                             exportRateCardWorkbook(rows, items) (combined 2-sheet download)
  *   - SPOC bulk import     → parseSpocUpload(buffer) → row-result report
  *   - SPOC list report     → exportSpocList(rows)
  *
@@ -29,10 +30,9 @@ const logger = require('../logger');
 
 /* ─── Shared workbook setup ───────────────────────────────────────── */
 
-function newWorkbook(sheetName) {
-  const wb = new ExcelJS.Workbook();
-  wb.creator = 'EasyFix';
-  wb.created = new Date();
+function newWorkbook(sheetName, existingWb) {
+  const wb = existingWb || new ExcelJS.Workbook();
+  if (!existingWb) { wb.creator = 'EasyFix'; wb.created = new Date(); }
   const ws = wb.addWorksheet(sheetName);
   return { wb, ws };
 }
@@ -91,9 +91,15 @@ async function exportClientList(rows) {
 
 /* ─── 2. Rate card export ─────────────────────────────────────────── */
 
-async function exportRateCards(clientName, rateCards) {
-  logger.info('Export rate cards to XLSX · rateCards=' + (rateCards ? rateCards.length : 0));
-  const { wb, ws } = newWorkbook('Rate Cards');
+/*
+ * Writes the Services rate-card columns onto `sheetName` of `wb`. Pulled out
+ * of exportRateCards so the combined workbook export (below) can add a
+ * "Services" sheet without a second copy of this column list — the single-
+ * sheet download (sheet name "Rate Cards") and the combined download (sheet
+ * name "Services") both call this.
+ */
+function addRateCardsSheet(wb, sheetName, rateCards) {
+  const { ws } = newWorkbook(sheetName, wb);
   applyHeader(ws, [
     'Service Type ID', 'Service Type Name',
     'Easyfix Direct Fixed', 'Easyfix Direct Variable',
@@ -111,12 +117,94 @@ async function exportRateCards(clientName, rateCards) {
       Number(r.client_variable)         || 0,
     ]);
   }
-  // A header line for client identity at the top — overwrite row 1
-  // with a banner row, push real header down. Decided against this to
-  // keep the file CSV-parseable; client name lives in the filename
-  // instead.
+  return wb;
+}
+
+async function exportRateCards(clientName, rateCards) {
+  logger.info('Export rate cards to XLSX · rateCards=' + (rateCards ? rateCards.length : 0));
+  // A header line for client identity at the top — overwrite row 1 with a
+  // banner row, push the real header down. Decided against this to keep the
+  // file CSV-parseable; client name lives in the filename instead.
   void clientName;
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'EasyFix';
+  wb.created = new Date();
+  addRateCardsSheet(wb, 'Rate Cards', rateCards);
   logger.info('Returning rate cards XLSX · rateCards=' + rateCards.length);
+  return toBuffer(wb);
+}
+
+/* ─── 2b. Material rate card export ───────────────────────────────── */
+
+/*
+ * Flat Material | Brand | Price | State format (2026-09-21 redesign —
+ * replaces the earlier "one row per price group, State Overrides packed
+ * into one cell" grammar). Owner's rationale: a typo'd brand/state name
+ * inside a packed cell was invisible until upload; one bare name per cell is
+ * both easier to eyeball AND lets the upload template offer a dropdown per
+ * cell (see rate-card-bulk-upload.service.js#generateMaterialRatesTemplate).
+ *
+ * `items` is the exact shape returned by
+ * services/client-material-rates.service.js#list(). Expansion, per the
+ * owner's spec: for every brand in a price group, one row with State blank
+ * at the group's base price, plus one row per OVERRIDDEN STATE (never a
+ * comma-joined state list — "single row for each material of each brand in
+ * each state") at that state's override price. A No Brand group emits rows
+ * with Brand blank. "Master Price Today" / "Review Flag" are dropped from
+ * this sheet — they were read-only noise; the review flag stays visible in
+ * the CRM table, it just isn't part of the round-trippable file anymore.
+ */
+function addMaterialRatesSheet(wb, sheetName, items, stateNameById = new Map()) {
+  const { ws } = newWorkbook(sheetName, wb);
+  applyHeader(ws, ['Material', 'Brand', 'Price', 'State']);
+  let rowCount = 0;
+  for (const item of (items || [])) {
+    for (const g of (item.groups || [])) {
+      const brandNames = (g.brands || []).length === 0 ? [''] : g.brands.map((b) => b.brand_name);
+      for (const brandName of brandNames) {
+        ws.addRow([item.material_name ?? '', brandName, Number(g.price) || 0, '']);
+        rowCount++;
+        for (const s of (g.states || [])) {
+          for (const stateId of (s.state_ids || [])) {
+            const stateName = stateNameById.get(stateId) || `#${stateId}`;
+            ws.addRow([item.material_name ?? '', brandName, Number(s.price) || 0, stateName]);
+            rowCount++;
+          }
+        }
+      }
+    }
+  }
+  logger.info('Material rates sheet "' + sheetName + '" · rows=' + rowCount);
+  return wb;
+}
+
+async function exportMaterialRates(items, stateNameById = new Map()) {
+  logger.info('Export material rates to XLSX · materials=' + (items ? items.length : 0));
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'EasyFix';
+  wb.created = new Date();
+  addMaterialRatesSheet(wb, 'Material Rates', items, stateNameById);
+  return toBuffer(wb);
+}
+
+/* ─── 2c. Combined Services + Materials workbook ──────────────────── */
+
+/*
+ * ONE workbook, sheet "Services" (exactly addRateCardsSheet's columns) +
+ * sheet "Materials" (exactly addMaterialRatesSheet's columns) — backs
+ * GET /:clientId/rate-cards/export.xlsx, the single Download button that
+ * replaced the two per-tab Download buttons. Reuses the same two sheet-
+ * builders the per-tab downloads use, just under different sheet names, so
+ * there is one definition of each column list, not three.
+ */
+async function exportRateCardWorkbook(rateCards, materialItems, stateNameById = new Map()) {
+  logger.info('Export combined rate-card workbook · services=' + (rateCards ? rateCards.length : 0)
+    + ' materials=' + (materialItems ? materialItems.length : 0));
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'EasyFix';
+  wb.created = new Date();
+  addRateCardsSheet(wb, 'Services', rateCards);
+  addMaterialRatesSheet(wb, 'Materials', materialItems, stateNameById);
   return toBuffer(wb);
 }
 
@@ -475,6 +563,8 @@ async function buildSpocTemplate() {
 module.exports = {
   exportClientList,
   exportRateCards,
+  exportMaterialRates,
+  exportRateCardWorkbook,
   exportSpocList,
   parseSpocUpload,
   buildSpocTemplate,

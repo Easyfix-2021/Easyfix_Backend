@@ -113,22 +113,88 @@ const LINE_JOINS = `LEFT JOIN tbl_client_service   CS ON CS.client_service_id = 
  *   material_subtotal         material_charge        — parts
  *   grand_total               both                   — what is owed
  */
-function totalsFor(lines) {
+/*
+ * `materials` are Ops-APPROVED quotation_details rows (Ops Material Approval,
+ * sub-project E, 2026-09-18 — see
+ * docs/superpowers/specs/2026-09-18-ops-material-approval-design.md). They
+ * join the same material_subtotal / grand_total that tbl_job_services.
+ * material_charge already fed — a second source of "material", not a
+ * competing one. Defaulted so every existing caller (none of which pass a
+ * second argument) keeps its exact prior totals.
+ */
+function totalsFor(lines, materials = []) {
+  const approvedMaterialSum = materials.reduce((s, m) => s + Number(m.approved_charge || 0), 0);
   return {
     service_charge_subtotal: lines.reduce((s, l) => s + serviceCharge(l), 0),
-    material_subtotal: lines.reduce((s, l) => s + Number(l.material_charge || 0), 0),
-    grand_total: lines.reduce((s, l) => s + l.line_total, 0),
+    material_subtotal: lines.reduce((s, l) => s + Number(l.material_charge || 0), 0) + approvedMaterialSum,
+    grand_total: lines.reduce((s, l) => s + l.line_total, 0) + approvedMaterialSum,
   };
 }
 
+/*
+ * Ops-approved material lines — the client-facing half of Ops Material
+ * Approval (sub-project E, 2026-09-18 — see
+ * docs/superpowers/specs/2026-09-18-ops-material-approval-design.md).
+ *
+ * `status = 1 AND action_on IS NOT NULL` is the gate, NOT `status = 1`
+ * alone. quotation_details has no 3-value pending/approved/rejected scheme
+ * anywhere in this codebase (grepped: routes/admin/quotations.js,
+ * services/job.service.js's dashboard filters, services/job-export.
+ * service.js, and mobile-job-estimate.service.js's own
+ * `quotation_actioned_on` all agree) — a technician's material line is
+ * INSERTED at status = 1 with action_on NULL (mobile-job-estimate.service.js
+ * addQuotationLine), so status = 1 alone would return an UNREVIEWED line
+ * exactly as readily as an approved one. `action_on IS NOT NULL` is what
+ * "Ops has acted on this row" actually means (quotations.js PATCH
+ * /:id/approve stamps it; reject sets status = 0 instead of touching this
+ * gate at all). `status` is TINYINT(1) — db.js's typeCast hands back a JS
+ * boolean unless CAST, so it is CAST here even though we filter on the
+ * literal (a raw `= 1` would silently become `= true`, which mysql2 still
+ * binds correctly, but CASTing keeps this query legible next to every other
+ * status read in the codebase that needs it for a returned column, not just
+ * a WHERE literal).
+ *
+ * The technician's `unit_price` is NEVER selected — only what Ops approved.
+ */
+const MATERIAL_LINE_COLUMNS = `qd.id AS line_id, qd.job_id, qd.name, qd.unit, qd.approved_charge`;
+
+/** Ops-approved material lines for MANY jobs in ONE query. */
+async function approvedMaterialLinesForJobs(jobIds) {
+  const ids = [...new Set((jobIds || []).map(Number).filter(Number.isFinite))];
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => '?').join(',');
+  const [rows] = await pool.query(
+    `SELECT ${MATERIAL_LINE_COLUMNS}
+       FROM quotation_details qd
+      WHERE qd.job_id IN (${placeholders})
+        AND qd.type = 'material'
+        AND CAST(qd.status AS SIGNED) = 1
+        AND qd.action_on IS NOT NULL
+      ORDER BY qd.job_id, qd.id`,
+    ids,
+  );
+  const byJob = new Map();
+  for (const r of rows) {
+    if (!byJob.has(r.job_id)) byJob.set(r.job_id, []);
+    byJob.get(r.job_id).push({
+      line_id: r.line_id,
+      name: r.name,
+      unit: r.unit,
+      approved_charge: Number(r.approved_charge || 0),
+    });
+  }
+  return byJob;
+}
+
 /**
- * Priced service lines for MANY jobs in ONE query.
+ * Priced service lines + Ops-approved material lines for MANY jobs in ONE
+ * round trip apiece.
  *
  * @param {number[]} jobIds
- * @returns {Promise<Map<number, { lines: object[], totals: object }>>}
- *   Jobs with no active services are absent from the map — callers that must
- *   render a row for every job should treat a miss as an empty line set rather
- *   than as an error.
+ * @returns {Promise<Map<number, { lines: object[], materials: object[], totals: object }>>}
+ *   Jobs with neither active services nor approved material lines are absent
+ *   from the map — callers that must render a row for every job should treat
+ *   a miss as an empty line set rather than as an error.
  */
 async function estimateLinesForJobs(jobIds) {
   const ids = [...new Set((jobIds || []).map(Number).filter(Number.isFinite))];
@@ -149,15 +215,20 @@ async function estimateLinesForJobs(jobIds) {
     if (!byJob.has(r.job_id)) byJob.set(r.job_id, []);
     byJob.get(r.job_id).push(line);
   }
+  const materialsByJob = await approvedMaterialLinesForJobs(ids);
   const out = new Map();
-  for (const [jobId, lines] of byJob) out.set(jobId, { lines, totals: totalsFor(lines) });
+  for (const jobId of new Set([...byJob.keys(), ...materialsByJob.keys()])) {
+    const lines = byJob.get(jobId) || [];
+    const materials = materialsByJob.get(jobId) || [];
+    out.set(jobId, { lines, materials, totals: totalsFor(lines, materials) });
+  }
   return out;
 }
 
-/** Priced service lines for ONE job. Empty lines + zero totals when it has none. */
+/** Priced service + material lines for ONE job. Empty lines + zero totals when it has none. */
 async function estimateLinesForJob(jobId) {
   const byJob = await estimateLinesForJobs([jobId]);
-  return byJob.get(Number(jobId)) || { lines: [], totals: totalsFor([]) };
+  return byJob.get(Number(jobId)) || { lines: [], materials: [], totals: totalsFor([]) };
 }
 
 module.exports = {
@@ -167,4 +238,5 @@ module.exports = {
   serviceCharge,
   estimateLinesForJob,
   estimateLinesForJobs,
+  approvedMaterialLinesForJobs,
 };

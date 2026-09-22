@@ -53,7 +53,10 @@ router.post('/:id/share', validate(idParam, 'params'), validate(createBody), asy
       contactName:   req.body.contactName || null,
       contactNumber: req.body.contactNumber || null,
     });
-    return res.status(201).json({ success: true, data: { share } });
+    // The web link the recipient works the job from (services/job-share-guest.service.js).
+    const link = await require('../../services/job-share-guest.service').shareLink(share.id);
+    const whatsapp = await delegation.notifyShareRecipient(share, link);
+    return res.status(201).json({ success: true, data: { share, whatsapp } });
   } catch (e) { return handleErr(res, next, e); }
 });
 

@@ -6,7 +6,7 @@
  * Populates req.user with a fresh row from tbl_user.
  */
 
-const { verifyToken } = require('../utils/jwt');
+const { verifyToken, jobShareGuestClaims } = require('../utils/jwt');
 const { findUserById } = require('../services/auth.service');
 const techAuth = require('../services/tech-auth.service');
 const { modernError } = require('../utils/response');
@@ -66,6 +66,32 @@ async function requireAuth(req, res, next) {
   // take the unchanged tbl_user path below.
   let user;
   const sub = String(payload.sub == null ? '' : payload.sub);
+  // Shared-job web-link GUEST: the order screens read reason lists from
+  // /api/shared/lookup/*, and that is ALL a guest may reach through this
+  // middleware — never uploads/files, never admin or client routes. Anything
+  // else is refused here, before the numeric-sub path below could try to read
+  // `share:<id>` as a tbl_user id.
+  const guestClaims = jobShareGuestClaims(payload);
+  if (guestClaims || sub.startsWith('share')) {
+    const url = String(req.originalUrl || '');
+    if (!guestClaims || req.method !== 'GET' || !url.startsWith('/api/shared/lookup')) {
+      return modernError(res, 403, 'not allowed for a shared-job link');
+    }
+    const shareGuest = require('../services/job-share-guest.service');
+    const share = await shareGuest.resolveGuest(guestClaims);
+    if (!share) return modernError(res, 401, 'This job is no longer shared with you.');
+    req.user = {
+      user_id: `share:${guestClaims.shareId}`,
+      efr_id: Number(share.fk_easyfixer_id),
+      user_name: share.contact_name || null,
+      user_role: 19, // 'mobile' group — same reads a technician bearer gets
+      user_type_id: null,
+      user_status: 1,
+      __principal: 'mobile',
+    };
+    req.tokenPayload = payload;
+    return next();
+  }
   if (sub.startsWith('efr:')) {
     const efrId = Number(sub.slice('efr:'.length));
     const tech = Number.isInteger(efrId) ? await techAuth.findById(efrId) : null;

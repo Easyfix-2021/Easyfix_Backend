@@ -78,7 +78,7 @@ function assertSurvivesDbFault(name, result) {
 }
 
 test('requireAuth routes a pool fault to next() instead of exiting the process', async () => {
-  stub('utils/jwt', { verifyToken: () => ({ sub: 42 }) });
+  stub('utils/jwt', { verifyToken: () => ({ sub: 42 }), jobShareGuestClaims: () => null });
   stub('services/auth.service', { findUserById: async () => { throw POOL_ERROR(); } });
   stub('services/tech-auth.service', { findById: async () => null });
   uncache('middleware/auth.js');

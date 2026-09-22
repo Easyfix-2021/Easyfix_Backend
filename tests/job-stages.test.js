@@ -20,12 +20,43 @@ const {
   stageVisible,
 } = require('../lib/job-stages');
 
-test('STAGE_KEYS is the pinned set of 9 keys', () => {
+test('STAGE_KEYS is the pinned set of 10 keys', () => {
+  // REPINNED 2026-09-18: 'pending-material' (status 16) added here and in the
+  // CRM's mirror in the same change — without a stage, a stage-restricted PM
+  // could never see the jobs they are meant to review.
   assert.deepEqual([...STAGE_KEYS].sort(), [
     'audit-complete', 'cancelled', 'completed', 'estimate-pending', 'onhold',
-    'pending-close', 'pending-feedback', 'pending-scheduling',
-    'pending-start', 'unconfirmed',
+    'pending-close', 'pending-feedback', 'pending-material',
+    'pending-scheduling', 'pending-start', 'unconfirmed',
   ]);
+});
+
+test('status 16 is owned by pending-material, and pending-close can reach it', () => {
+  assert.equal(stageOfStatus(16), 'pending-material');
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-close'] }, 2, 16), true);
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-material'] }, 16, 15), true);
+  // A PM holding only pending-material can see a 16 job and send it to 15,
+  // but cannot reach an unrelated status from it.
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['pending-material'] }, 16, 10), false);
+});
+
+// Material Request Flow v2 (2026-09-21) — pending-material's `visible` widens
+// to [16, 15] so the CRM's merged Pending for Material tab can list BOTH
+// sub-states for a PM restricted to only this stage. This is a DELIBERATE
+// overlap with estimate-pending (also [15]) — see lib/job-stages.js's own
+// comment. stageOfStatus's single-owner reverse map must stay unaffected:
+// estimate-pending, not pending-material, still owns 15 for
+// labelling purposes (stageOfStatus), but ACCESS checks every owned stage
+// that lists the status — the PM's own page lists 15, so they may act on it.
+test('pending-material covers 15: listed, actionable, only its own moves; stageOfStatus(15) stays estimate-pending', () => {
+  const pm = { mode: 'list', stages: ['pending-material'] };
+  assert.deepEqual([...stageVisibleStatuses(['pending-material'])].sort((a, b) => a - b), [15, 16]);
+  assert.equal(stageOfStatus(15), 'estimate-pending', 'the overlap must not change the label owner of 15');
+  assert.equal(stageVisible(pm, 15), true, 'a PM must act on the Approval Pending job their page lists');
+  assert.equal(transitionAllowed(pm, 15, 15), true, 'CRM add-material keeps a 15 job at 15');
+  assert.equal(transitionAllowed(pm, 15, 6), true, 'cancel is a pending-material target');
+  assert.equal(transitionAllowed(pm, 15, 1), false, "15 -> 1 is estimate-pending's move, not pending-material's");
+  assert.equal(transitionAllowed({ mode: 'list', stages: ['estimate-pending'] }, 15, 1), true);
 });
 
 test('stageOfStatus maps statuses to their single stage; unknowns → null', () => {
