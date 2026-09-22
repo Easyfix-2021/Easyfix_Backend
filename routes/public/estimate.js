@@ -41,7 +41,25 @@ const { rateLimit } = require('../../middleware/rate-limit');
 const logger = require('../../logger');
 const emailService = require('../../services/email.service');
 const jobService = require('../../services/job.service');
-const { isEstimateApprovable, assertEstimateApprovable, stampApprovalPendingLines } = require('../../services/job-estimate-approval');
+const {
+  isEstimateApprovable, assertEstimateApprovable, stampApprovalPendingLines,
+  approveWithVisitSchedule,
+} = require('../../services/job-estimate-approval');
+const visitSlots = require('../../services/visit-slots.service');
+const multer = require('multer');
+
+// Material Request Flow v2, 2026-09-22 correction — same one-file upload as
+// routes/client/index.js's permission_file field. See
+// services/job-estimate-approval.js's PERMISSION_FILE_TYPES header.
+const permissionFileUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+function permissionFileUploadOr400(req, res, next) {
+  permissionFileUpload.single('permission_file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'the permission document must be 10MB or smaller');
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') return modernError(res, 400, 'attach at most 1 permission document');
+    return next(err);
+  });
+}
 
 // Peek-the-token middleware. Runs the signature check WITHOUT any
 // downstream SQL so the rate limiter can key its bucket on jobId.
@@ -190,6 +208,23 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
 });
 
 /*
+ * GET /api/public/estimate/:token/visit-slots
+ *
+ * Same token auth + rate limit as GET /:token above — this is a read on the
+ * same job the token pins, not a new trust surface. See
+ * services/visit-slots.service.js#listVisitSlots.
+ */
+router.get('/:token/visit-slots', peekToken, tokenRateLimit, async (req, res, next) => {
+  try {
+    const { jobId } = verify(req);
+    const slots = await visitSlots.listVisitSlots(jobId);
+    return modernOk(res, slots);
+  } catch (e) {
+    return mapKnownError(res, next, e);
+  }
+});
+
+/*
  * PATCH /api/public/estimate/:token/approve
  *
  * Terminal action. Writes:
@@ -208,12 +243,16 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
  * State mirror rule at the top of this file applies to this move too: either
  * surface reaching approved_on_date_time first wins, and the OTHER surface's
  * idempotency guard (above) stops a second status move from firing.
+ *
+ * Material Request Flow v2, 2026-09-22 correction: now multipart/form-data —
+ * visit_date_time + permission (+ permission_file iff permission='now') ride
+ * on this same call, exactly like routes/client/index.js's authed approve.
  */
-router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next) => {
+router.patch('/:token/approve', peekToken, tokenRateLimit, permissionFileUploadOr400, async (req, res, next) => {
   try {
     const { jobId, clientContactId } = verify(req);
     const [[job]] = await pool.query(
-      `SELECT job_id, job_status, approved_on_date_time, approval_reject_date_time
+      `SELECT job_id, job_status, approved_on_date_time, approval_reject_date_time, fk_easyfixter_id
          FROM tbl_job WHERE job_id = ? LIMIT 1`,
       [jobId]
     );
@@ -236,30 +275,34 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, async (req, res, next
       const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [clientContactId]);
       linkedUserId = link?.user_id ?? null;
     }
-    // Material Request Flow v2 (2026-09-21) — same shared transaction shape
-    // as the authed client flow (routes/client/index.js): the tbl_job stamp,
-    // the approval_pending line stamps and the status move all land together.
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-      await conn.query(
+    // approveWithVisitSchedule validates visit_date_time/permission/file and
+    // re-checks slot availability BEFORE writing anything (see its header),
+    // then runs the approval txn (stamp callback writes THIS route's own
+    // idempotency columns inside it), then reschedules to the chosen slot
+    // and records the permission choice, post-commit.
+    const result = await approveWithVisitSchedule(jobId, { user_id: linkedUserId }, {
+      visitDateTime: req.body.visit_date_time,
+      permissionChoice: req.body.permission,
+      permissionFile: req.file || null,
+      technicianId: job.fk_easyfixter_id,
+      rescheduleActor: null, // system — never a client-contact id in a tbl_user FK
+      permissionSpocId: clientContactId,
+      stamp: (conn) => conn.query(
         `UPDATE tbl_job
             SET approved_by_client_contact = ?,
                 approved_on_date_time      = ?
           WHERE job_id = ?`,
-        [clientContactId, new Date(), jobId]
-      );
-      await stampApprovalPendingLines(conn, jobId, true);
-      await jobService.setStatus(jobId, { status: 1 }, { user_id: linkedUserId }, { conn });
-      await conn.commit();
-    } catch (e) {
-      try { await conn.rollback(); } catch { /* connection may already be gone */ }
-      throw e;
-    } finally {
-      conn.release();
-    }
-    logger.info({ jobId, clientContactId }, 'public-estimate: approved via token link');
-    return modernOk(res, { approved: true });
+        [clientContactId, new Date(), jobId],
+      ),
+    });
+    logger.info({ jobId, clientContactId, rescheduled: result.rescheduled }, 'public-estimate: approved via token link');
+    return modernOk(res, {
+      approved: true,
+      visit_date_time: result.visitDateTime,
+      permission: { choice: result.permission.choice, request_id: result.permission.requestId },
+      schedule_error: result.scheduleError,
+      permission_error: result.permissionError,
+    });
   } catch (e) {
     return mapKnownError(res, next, e);
   }

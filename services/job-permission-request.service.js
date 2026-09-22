@@ -1,7 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
-const { uploadJobImage, resolveImageType } = require('./job-image.service');
+const { uploadJobImage, storeJobImageFile, resolveImageType } = require('./job-image.service');
 const pushDelivery = require('./push-delivery.service');
 const emailService = require('./email.service');
 
@@ -305,12 +305,22 @@ async function create({ jobId, efrId, kind, note = null }) {
  * Fulfil — the client uploads the document. Returns null when the request is
  * not open (already answered), so the route can 409 rather than silently
  * overwrite an answer.
+ *
+ * `contentType` (2026-09-22, Material Request Flow v2 correction) lets a
+ * caller that already validated the file itself (routes/*.js's approve
+ * paths — mimetype AND extension, including heic/heif, which
+ * uploadJobImage()'s byte-sniff gate does not recognise) hand the storage
+ * write its own resolved type via storeJobImageFile directly, bypassing the
+ * sniff rather than widening it for every caller. Omit it (the technician
+ * upload path, routes/client/index.js) and this sniffs as before.
  */
-async function fulfil({ id, jobId, file, spocId }) {
+async function fulfil({ id, jobId, file, spocId, contentType = null }) {
   const row = await rowById(id);
   if (!row || row.status !== STATUS.REQUESTED) return null;
 
-  const uploaded = await uploadJobImage({ jobId, file, category: DOCUMENT_CATEGORY });
+  const uploaded = contentType
+    ? await storeJobImageFile({ jobId, file, category: DOCUMENT_CATEGORY, contentType })
+    : await uploadJobImage({ jobId, file, category: DOCUMENT_CATEGORY });
   await pool.query(
     `UPDATE tbl_job_permission_request
         SET status = ?, document_image_id = ?, fulfilled_by_contact_id = ?, resolved_on = ?
@@ -438,6 +448,47 @@ async function notifyTechOfAnswer(row) {
   }
 }
 
+/*
+ * Raise (and, for 'now', immediately fulfil) an "Entry Permission" ask FROM
+ * THE APPROVAL ITSELF — Material Request Flow v2, 2026-09-22 correction. The
+ * client/CRM approving the material estimate says whether the technician will
+ * need help getting on site for the chosen visit; this is the one place all
+ * three approve surfaces (client portal, public link, admin on-behalf) land
+ * that choice, exactly the way approveEstimateLinesAndStatus is the one place
+ * they land the estimate approval itself.
+ *
+ * THE RAISER. create() above assumes a technician raises his own request
+ * (`efrId` is the caller, checked at the mobile route). Here the CLIENT/CRM is
+ * raising it, and requested_by_efr_id is NOT NULL with no column for "raised
+ * by someone else" — this change ships no migration to add one. So the ask is
+ * attributed to the JOB'S OWN assigned technician: an entry-permission ask
+ * only ever matters for whoever ends up standing at the gate, so that
+ * attribution is honest even though he did not personally raise it. Returns
+ * null when the job has no technician (nobody to attribute it to, and nobody
+ * who needs to get in yet) — this never throws for that reason alone.
+ *
+ * NEVER NOTIFIES THE CLIENT. create()'s own notifyClientOfRequest() is an
+ * opt-in the CALLER fires (see routes/mobile/permission-requests.js) — this
+ * function simply never calls it, so "a technician requested a document" can
+ * never be emailed to the very client who just raised the ask themselves. The
+ * technician still sees the row through the existing job-scoped
+ * GET /api/mobile/jobs/:jobId/permission-requests, unaffected by who raised it.
+ */
+async function raiseForApproval({
+  jobId, efrId, kind = 'Entry Permission', note = null,
+  fulfilNow = false, file = null, fileContentType = null, spocId = null,
+}) {
+  if (!efrId) return null;
+  const { row } = await create({ jobId, efrId, kind, note });
+  if (!row) return null;
+  if (fulfilNow && file) {
+    await fulfil({
+      id: row.id, jobId, file, spocId, contentType: fileContentType,
+    });
+  }
+  return { requestId: row.id };
+}
+
 module.exports = {
   STATUS,
   DOCUMENT_CATEGORY,
@@ -449,6 +500,7 @@ module.exports = {
   create,
   fulfil,
   decline,
+  raiseForApproval,
   notifyClientOfRequest,
   notifyTechOfAnswer,
 };

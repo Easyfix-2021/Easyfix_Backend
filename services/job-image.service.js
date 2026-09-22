@@ -211,16 +211,16 @@ async function resolveImageType(storedValue) {
   return { mimeType, kind: kindOfMime(mimeType) };
 }
 
-async function uploadJobImage({ jobId, file, category = 'Booking' }) {
-  if (!file || !file.buffer) {
-    const err = new Error('missing "file" upload');
-    err.status = 400;
-    throw err;
-  }
-  // Above the storage fork on purpose — see the block comment. The STORED type
-  // is the sniffed one, so a lying Content-Type cannot reach the bucket.
-  const contentType = assertUploadableFile(file);
-
+/*
+ * The S3-or-local write + tbl_job_image insert — extracted from
+ * uploadJobImage() (2026-09-22, Material Request Flow v2 on-behalf approval)
+ * so a caller with its OWN content-type gate (routes/admin/jobs.js's
+ * client-approval-on-behalf route validates audio + image + PDF by mimetype
+ * AND extension, not the image/PDF-only byte-sniff below) can reuse the exact
+ * storage + row-insert path without re-deriving it. `contentType` is
+ * therefore the caller's job to establish; this function trusts it.
+ */
+async function storeJobImageFile({ jobId, file, category, contentType }) {
   // Next seq from existing rows (human-readable key; not a uniqueness key).
   const [[{ existing }]] = await pool.query(
     'SELECT COUNT(*) AS existing FROM tbl_job_image WHERE job_id = ?', [jobId]);
@@ -262,6 +262,18 @@ async function uploadJobImage({ jobId, file, category = 'Booking' }) {
     // without a second round trip through resolveImageType().
     mime_type: contentType, kind: kindOfMime(contentType),
   };
+}
+
+async function uploadJobImage({ jobId, file, category = 'Booking' }) {
+  if (!file || !file.buffer) {
+    const err = new Error('missing "file" upload');
+    err.status = 400;
+    throw err;
+  }
+  // Above the storage fork on purpose — see the block comment. The STORED type
+  // is the sniffed one, so a lying Content-Type cannot reach the bucket.
+  const contentType = assertUploadableFile(file);
+  return storeJobImageFile({ jobId, file, category, contentType });
 }
 
 /**
@@ -389,6 +401,9 @@ async function deleteJobImage({ imageId, jobId = null, categories = null }) {
 
 module.exports = {
   uploadJobImage, serveResolvedImage, deleteJobImage,
+  // The shared storage+insert tail — see its own header for why a caller
+  // with its own content-type gate reuses this instead of uploadJobImage.
+  storeJobImageFile,
   // Upload allowlist (GAP 2) + type read-back (GAP 1) — exported for the
   // permission-request service's wire item and for the tests that pin them.
   ALLOWED_UPLOAD_MIME, sniffMime, assertUploadableFile, resolveImageType, kindOfMime,

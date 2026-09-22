@@ -8,6 +8,13 @@ const {
   sqlCategoryList,
 } = require('../utils/job-image-buckets');
 const { OFFER_STATUS } = require('./offer-status');
+const { estimateTechnicianShares } = require('./job-ledger.service');
+// Module object, not a destructure: the column probe is stubbed in tests.
+const offerClosedReason = require('./offer-closed-reason');
+const { ACTION_TYPE, DUE_TO_USER_TYPE } = require('./reason-codes');
+// migrations/2026-09-10-job-offer-closed-reason.sql: offers closed before this
+// carry no reason, so a window starting earlier under-counts expiries.
+const CLOSED_REASON_SINCE = '2026-09-10';
 const {
   JOB_AGE_DAYS_EXPR,
   JOB_AGE_SECS_EXPR,
@@ -377,16 +384,28 @@ async function getOverview(efrId, { before, limit = 6 } = {}, db = pool) {
   ) : Promise.resolve([[]]);
 
   const offersPromise = monthKeys.length ? db.query(
-    `SELECT DATE_FORMAT(jo.offered_at, '%Y-%m') AS month_key,
-            COUNT(DISTINCT jo.job_id) AS given_count,
-            COUNT(DISTINCT CASE WHEN jo.offer_status = ${OFFER_STATUS.ACCEPTED}
-                                THEN jo.job_id END) AS accepted_count
-       FROM tbl_job_offer jo
-      WHERE jo.fk_easyfixter_id = ?
-        AND jo.offered_at >= ?
-        AND jo.offered_at < ?
-      GROUP BY month_key`,
-    [efrId, from, to],
+    // "Given" = offered OR completed that month (a direct assignment has no
+    // offer row) — the same cohort getMonthJobs lists, so card and page agree.
+    `SELECT g.month_key,
+            COUNT(DISTINCT g.job_id) AS given_count,
+            COUNT(DISTINCT CASE WHEN g.accepted = 1 THEN g.job_id END) AS accepted_count
+       FROM (
+         SELECT DATE_FORMAT(jo.offered_at, '%Y-%m') AS month_key, jo.job_id,
+                (jo.offer_status = ${OFFER_STATUS.ACCEPTED}) AS accepted
+           FROM tbl_job_offer jo
+          WHERE jo.fk_easyfixter_id = ?
+            AND jo.offered_at >= ?
+            AND jo.offered_at < ?
+         UNION ALL
+         SELECT DATE_FORMAT(j.checkout_date_time, '%Y-%m'), j.job_id, 0
+           FROM tbl_job j
+          WHERE j.fk_easyfixter_id = ?
+            AND j.job_status IN (3, 5)
+            AND j.checkout_date_time >= ?
+            AND j.checkout_date_time < ?
+       ) g
+      GROUP BY g.month_key`,
+    [efrId, from, to, efrId, from, to],
   ).catch((error) => {
     if (error?.code === 'ER_NO_SUCH_TABLE') return [[]];
     throw error;
@@ -564,22 +583,58 @@ async function getInQa(efrId, paging = {}, db = pool) {
   };
 }
 
+/*
+ * A month's jobs = the same cohort the month card counts as "Given": every job
+ * OFFERED to this technician that month, plus every job they COMPLETED that
+ * month (a direct assignment has no offer row). So the card's count and this
+ * list always agree, and a month with zero completions is not an empty page.
+ * Per-visit facts (rating, on-time, same day, amount) are only reported for the
+ * technician's OWN jobs — a job a sibling took must not show their check-in.
+ */
+const MONTH_COHORT_SQL = `
+  SELECT g.job_id, MAX(g.given_at) AS given_at
+    FROM (
+      SELECT jo.job_id, jo.offered_at AS given_at
+        FROM tbl_job_offer jo
+       WHERE jo.fk_easyfixter_id = ? AND jo.offered_at >= ? AND jo.offered_at < ?
+      UNION ALL
+      SELECT j.job_id, j.checkout_date_time
+        FROM tbl_job j
+       WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)
+         AND j.checkout_date_time >= ? AND j.checkout_date_time < ?
+    ) g
+   GROUP BY g.job_id`;
+
+function monthJobOutcome(r, efrId) {
+  const mine = Number(r.fk_easyfixter_id) === Number(efrId);
+  const status = Number(r.job_status);
+  if (mine && (status === 3 || status === 5)) return 'completed';
+  if (mine && status === 6) return 'cancelled';
+  if (mine) return 'accepted';
+  return Number(r.my_offer_status) === OFFER_STATUS.REJECTED ? 'declined' : 'missed';
+}
+
 async function getMonthJobs(efrId, month, paging = {}, db = pool) {
   const { start, end } = monthBounds(month);
   const { page, limit, offset } = pageValues(paging);
+  const cohortParams = [efrId, start, end, efrId, start, end];
 
   const [rowsResult, countResult] = await Promise.all([
     db.query(
-      `SELECT j.job_id,
+      `SELECT j.job_id, j.fk_easyfixter_id, j.job_status, g.given_at,
               COALESCE(sc.service_catg_name, st.service_type_name, CONCAT('Job #', j.job_id)) AS title,
               cl.client_name, j.ticket_created_date_time, j.created_date_time,
-              j.checkout_date_time,
+              j.checkout_date_time, j.checkin_date_time,
+              (SELECT jo.offer_status FROM tbl_job_offer jo
+                WHERE jo.job_id = j.job_id AND jo.fk_easyfixter_id = ?
+                ORDER BY jo.job_offer_id DESC LIMIT 1) AS my_offer_status,
               (SELECT MIN(et.transaction_date)
                  FROM tbl_easyfixer_transaction et
                 WHERE et.easyfixer_id = ?
                   AND et.transaction_type = 2
                   AND et.job_id = j.job_id) AS paid_at,
-              COALESCE(SUM(tjt.efr_charge), 0) AS technician_earning,
+              (SELECT COALESCE(SUM(tjt.efr_charge), 0)
+                 FROM tbl_job_transaction tjt WHERE tjt.fk_job_id = j.job_id) AS technician_earning,
               ${JOB_AGE_DAYS_EXPR()} AS age_days,
               ${JOB_AGE_SECS_EXPR()} AS age_secs,
               j.visit_number, r.job_rating, COALESCE(r.is_escalated, 0) AS is_escalated,
@@ -587,8 +642,8 @@ async function getMonthJobs(efrId, month, paging = {}, db = pool) {
                 AND j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time,
               (j.checkin_date_time IS NOT NULL
                 AND DATE(j.checkin_date_time) = DATE(COALESCE(j.original_appointment_date_time, j.requested_date_time))) AS same_day
-         FROM tbl_job j
-         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+         FROM (${MONTH_COHORT_SQL}) g
+         JOIN tbl_job j ON j.job_id = g.job_id
          LEFT JOIN tbl_client cl ON cl.client_id = j.fk_client_id
          LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
          LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
@@ -599,50 +654,47 @@ async function getMonthJobs(efrId, month, paging = {}, db = pool) {
             WHERE rc.easyfixer_id = ?
             GROUP BY rc.job_id
          ) r ON r.job_id = j.job_id
-        WHERE j.fk_easyfixter_id = ?
-          AND j.job_status IN (3, 5)
-          AND j.checkout_date_time >= ?
-          AND j.checkout_date_time < ?
-        GROUP BY j.job_id, sc.service_catg_name, st.service_type_name,
-                 cl.client_name, j.ticket_created_date_time, j.created_date_time,
-                 j.checkout_date_time, j.job_status, j.cancel_date_time,
-                 j.enquiry_date_time, j.visit_number, r.job_rating, r.is_escalated,
-                 j.checkin_date_time, j.requested_date_time,
-                 j.original_appointment_date_time
-        ORDER BY j.checkout_date_time DESC, j.job_id DESC
+        ORDER BY g.given_at DESC, j.job_id DESC
         LIMIT ? OFFSET ?`,
-      [efrId, efrId, efrId, start, end, limit, offset],
-    ),
-    db.query(
-      `SELECT COUNT(*) AS total
-         FROM tbl_job j
-        WHERE j.fk_easyfixter_id = ?
-          AND j.job_status IN (3, 5)
-          AND j.checkout_date_time >= ?
-          AND j.checkout_date_time < ?`,
-      [efrId, start, end],
-    ),
+      [efrId, efrId, ...cohortParams, efrId, limit, offset],
+    ).catch((error) => {
+      if (error?.code === 'ER_NO_SUCH_TABLE') return [[]];
+      throw error;
+    }),
+    db.query(`SELECT COUNT(*) AS total FROM (${MONTH_COHORT_SQL}) g`, cohortParams)
+      .catch((error) => {
+        if (error?.code === 'ER_NO_SUCH_TABLE') return [[{ total: 0 }]];
+        throw error;
+      }),
   ]);
 
   return {
     month,
-    items: (rowsResult[0] || []).map((r) => ({
-      jobId: Number(r.job_id),
-      title: r.title,
-      clientName: r.client_name || null,
-      bookedAt: r.ticket_created_date_time || null,
-      recordCreatedAt: r.created_date_time || null,
-      ageDays: num(r.age_days),
-      ageSecs: num(r.age_secs),
-      completedAt: r.checkout_date_time || null,
-      paidAt: r.paid_at || null,
-      amount: money(r.technician_earning),
-      rating: r.job_rating == null ? null : Number(num(r.job_rating).toFixed(1)),
-      onTime: Boolean(r.on_time),
-      sameDay: Boolean(r.same_day),
-      visitNumber: r.visit_number == null ? null : num(r.visit_number),
-      isEscalated: Boolean(r.is_escalated),
-    })),
+    items: (rowsResult[0] || []).map((r) => {
+      const outcome = monthJobOutcome(r, efrId);
+      const mine = outcome === 'completed' || outcome === 'accepted' || outcome === 'cancelled';
+      const visited = mine && r.checkin_date_time != null;
+      return {
+        jobId: Number(r.job_id),
+        title: r.title,
+        clientName: r.client_name || null,
+        outcome,
+        givenAt: r.given_at || null,
+        bookedAt: r.ticket_created_date_time || null,
+        recordCreatedAt: r.created_date_time || null,
+        ageDays: num(r.age_days),
+        ageSecs: num(r.age_secs),
+        completedAt: outcome === 'completed' ? r.checkout_date_time || null : null,
+        paidAt: r.paid_at || null,
+        // Only a completed job has a real share; anything else would read as "₹0 earned".
+        amount: outcome === 'completed' ? money(r.technician_earning) : null,
+        rating: r.job_rating == null ? null : Number(num(r.job_rating).toFixed(1)),
+        onTime: visited ? Boolean(r.on_time) : null,
+        sameDay: visited ? Boolean(r.same_day) : false,
+        visitNumber: mine && r.visit_number != null ? num(r.visit_number) : null,
+        isEscalated: Boolean(r.is_escalated),
+      };
+    }),
     total: num(countResult[0]?.[0]?.total),
     page,
     limit,
@@ -865,89 +917,93 @@ async function getJobDetail(efrId, jobId, db = pool) {
   };
 }
 
-async function missedWindow(efrId, from, to, db) {
+async function missedWindow(efrId, from, to, db, hasClosedReason) {
+  // One row per job: its missed category and the share actually posted, if any.
+  // The status filter sits OUTSIDE the MAX, so a job whose latest offer to this
+  // technician was ACCEPTED (an earlier round expired) is not a miss.
+  //
+  // EXPIRED counts only when the 30-minute window actually ran out. The other
+  // seven EXPIRED writers (sibling accepted, re-offered, assigned, rescheduled…)
+  // are not something the technician could have improved. Without the
+  // closed_reason column (pre-2026-09-10 deploy) no expiry can be attributed,
+  // so none is counted; rows closed before the column existed are NULL and
+  // likewise not counted.
+  const expiredPredicate = hasClosedReason
+    ? `(jo.offer_status = ${OFFER_STATUS.EXPIRED} AND jo.closed_reason = '${offerClosedReason.OFFER_CLOSED_REASON.TTL_ELAPSED}')`
+    : 'FALSE';
   const offersQuery = db.query(
-    `SELECT
-       SUM(x.offer_status = ${OFFER_STATUS.EXPIRED}) AS expired_jobs,
-       SUM(x.offer_status = ${OFFER_STATUS.REJECTED}) AS rejected_jobs,
-       SUM(CASE WHEN x.offer_status = ${OFFER_STATUS.EXPIRED} THEN x.known_amount ELSE 0 END) AS expired_amount,
-       SUM(CASE WHEN x.offer_status = ${OFFER_STATUS.REJECTED} THEN x.known_amount ELSE 0 END) AS rejected_amount,
-       SUM(CASE WHEN x.offer_status = ${OFFER_STATUS.EXPIRED} AND x.has_amount = 1 THEN 1 ELSE 0 END) AS expired_known,
-       SUM(CASE WHEN x.offer_status = ${OFFER_STATUS.REJECTED} AND x.has_amount = 1 THEN 1 ELSE 0 END) AS rejected_known
-     FROM (
-       SELECT jo.job_id, jo.offer_status,
-              COALESCE(SUM(tjt.efr_charge), 0) AS known_amount,
-              (COUNT(tjt.fk_job_id) > 0) AS has_amount
-         FROM tbl_job_offer jo
-         JOIN (
-           SELECT job_id, MAX(job_offer_id) AS latest_offer_id
-             FROM tbl_job_offer
-            WHERE fk_easyfixter_id = ?
-              AND offer_status IN (${OFFER_STATUS.REJECTED}, ${OFFER_STATUS.EXPIRED})
-              AND responded_at >= ?
-              AND responded_at < ?
-            GROUP BY job_id
-         ) latest ON latest.latest_offer_id = jo.job_offer_id
-         LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = jo.job_id
-        GROUP BY jo.job_id, jo.offer_status
-     ) x`,
+    `SELECT jo.job_id, jo.offer_status,
+            SUM(tjt.efr_charge) AS posted_amount, COUNT(tjt.fk_job_id) AS posted
+       FROM tbl_job_offer jo
+       JOIN (
+         SELECT job_id, MAX(job_offer_id) AS latest_offer_id
+           FROM tbl_job_offer
+          WHERE fk_easyfixter_id = ?
+          GROUP BY job_id
+       ) latest ON latest.latest_offer_id = jo.job_offer_id
+       LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = jo.job_id
+      WHERE (jo.offer_status = ${OFFER_STATUS.REJECTED} OR ${expiredPredicate})
+        AND jo.responded_at >= ?
+        AND jo.responded_at < ?
+      GROUP BY jo.job_id, jo.offer_status`,
     [efrId, from, to],
   ).catch((error) => {
-    if (error?.code === 'ER_NO_SUCH_TABLE') return [[{}]];
+    if (error?.code === 'ER_NO_SUCH_TABLE') return [[]];
     throw error;
   });
 
+  // Only cancellations ops attributed to the technician: the CRM Cancel dialog's
+  // "Cancellation Due To" = Technician picks from action_type CANCEL /
+  // user_type technician. Customer / client / EasyFix cancellations are not
+  // the technician's miss, whoever the job was assigned to.
   const cancelledQuery = db.query(
-    `SELECT COUNT(*) AS cancelled_jobs,
-            SUM(x.known_amount) AS cancelled_amount,
-            SUM(x.has_amount = 1) AS cancelled_known
-       FROM (
-         SELECT j.job_id, COALESCE(SUM(tjt.efr_charge), 0) AS known_amount,
-                (COUNT(tjt.fk_job_id) > 0) AS has_amount
-           FROM tbl_job j
-           LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
-          WHERE j.fk_easyfixter_id = ?
-            AND j.job_status = 6
-            AND j.cancel_date_time >= ?
-            AND j.cancel_date_time < ?
-          GROUP BY j.job_id
-       ) x`,
+    `SELECT j.job_id, SUM(tjt.efr_charge) AS posted_amount, COUNT(tjt.fk_job_id) AS posted
+       FROM tbl_job j
+       JOIN action_taken_reason atr
+         ON atr.id = j.cancel_reason_id
+        AND atr.action_type = ${ACTION_TYPE.CANCEL}
+        AND atr.user_type = ${DUE_TO_USER_TYPE.technician}
+       LEFT JOIN tbl_job_transaction tjt ON tjt.fk_job_id = j.job_id
+      WHERE j.fk_easyfixter_id = ?
+        AND j.job_status = 6
+        AND j.cancel_date_time >= ?
+        AND j.cancel_date_time < ?
+      GROUP BY j.job_id`,
     [efrId, from, to],
   );
 
-  const [offerResult, cancelResult] = await Promise.all([offersQuery, cancelledQuery]);
-  const o = offerResult[0]?.[0] || {};
-  const c = cancelResult[0]?.[0] || {};
-  const expiredJobs = num(o.expired_jobs);
-  const rejectedJobs = num(o.rejected_jobs);
-  const cancelledJobs = num(c.cancelled_jobs);
-  const expiredKnown = num(o.expired_known);
-  const rejectedKnown = num(o.rejected_known);
-  const cancelledKnown = num(c.cancelled_known);
+  const [[offerRows], [cancelRows]] = await Promise.all([offersQuery, cancelledQuery]);
+  const rows = [
+    ...offerRows.map((r) => ({ ...r, key: Number(r.offer_status) === OFFER_STATUS.REJECTED ? 'rejected' : 'expired' })),
+    ...cancelRows.map((r) => ({ ...r, key: 'cancelledAfterAssignment' })),
+  ];
+  // A job that never completed has no posted share: price its service lines
+  // through the same rate card a completion would use.
+  const unposted = rows.filter((r) => !num(r.posted)).map((r) => Number(r.job_id));
+  const estimates = await estimateTechnicianShares(db, [...new Set(unposted)]);
 
   const categories = [
-    {
-      key: 'expired', label: 'Offer expired', jobs: expiredJobs,
-      knownAmount: money(o.expired_amount), amountCoverageComplete: expiredKnown === expiredJobs,
-    },
-    {
-      key: 'rejected', label: 'Offer declined', jobs: rejectedJobs,
-      knownAmount: money(o.rejected_amount), amountCoverageComplete: rejectedKnown === rejectedJobs,
-    },
-    {
-      key: 'cancelledAfterAssignment', label: 'Cancelled after assignment', jobs: cancelledJobs,
-      knownAmount: money(c.cancelled_amount), amountCoverageComplete: cancelledKnown === cancelledJobs,
-    },
-  ];
-  const totalJobs = expiredJobs + rejectedJobs + cancelledJobs;
-  const knownJobs = expiredKnown + rejectedKnown + cancelledKnown;
+    ['expired', 'Offer expired'],
+    ['rejected', 'Offer declined'],
+    ['cancelledAfterAssignment', 'Cancelled after assignment'],
+  ].map(([key, label]) => {
+    let jobs = 0; let known = 0; let amount = 0;
+    for (const r of rows) {
+      if (r.key !== key) continue;
+      jobs += 1;
+      const value = num(r.posted) ? num(r.posted_amount) : estimates.get(Number(r.job_id));
+      if (value != null) { known += 1; amount += value; }
+    }
+    return { key, label, jobs, knownAmount: money(amount), amountCoverageComplete: known === jobs, known };
+  });
+  const byKey = Object.fromEntries(categories.map((c) => [c.key, c]));
   return {
-    expiredOffers: expiredJobs,
-    rejectedOffers: rejectedJobs,
-    cancelledJobs,
+    expiredOffers: byKey.expired.jobs,
+    rejectedOffers: byKey.rejected.jobs,
+    cancelledJobs: byKey.cancelledAfterAssignment.jobs,
     knownPotentialAmount: money(categories.reduce((sum, item) => sum + item.knownAmount, 0)),
-    amountCoverageComplete: knownJobs === totalJobs,
-    categories,
+    amountCoverageComplete: categories.every((c) => c.amountCoverageComplete),
+    categories: categories.map(({ known, ...c }) => c),
   };
 }
 
@@ -957,9 +1013,10 @@ async function getMissed(efrId, { days = 30 } = {}, db = pool) {
   const currentTo = shiftYmd(today, 1);
   const currentFrom = shiftYmd(currentTo, -windowDays);
   const previousFrom = shiftYmd(currentFrom, -windowDays);
+  const hasClosedReason = await offerClosedReason.hasOfferClosedReasonCol();
   const [current, previous] = await Promise.all([
-    missedWindow(efrId, currentFrom, currentTo, db),
-    missedWindow(efrId, previousFrom, currentFrom, db),
+    missedWindow(efrId, currentFrom, currentTo, db, hasClosedReason),
+    missedWindow(efrId, previousFrom, currentFrom, db, hasClosedReason),
   ]);
   return {
     period: { days: windowDays, from: currentFrom, to: today },
@@ -971,6 +1028,9 @@ async function getMissed(efrId, { days = 30 } = {}, db = pool) {
       amountCoverageComplete: current.amountCoverageComplete,
     },
     previousPeriod: {
+      // False while the previous window predates closed_reason: its expiries
+      // cannot be attributed, so "you improved" would be an artefact.
+      comparable: hasClosedReason && previousFrom >= CLOSED_REASON_SINCE,
       expiredOffers: previous.expiredOffers,
       rejectedOffers: previous.rejectedOffers,
       cancelledJobs: previous.cancelledJobs,
