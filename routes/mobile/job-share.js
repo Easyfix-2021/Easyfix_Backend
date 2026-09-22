@@ -21,6 +21,15 @@ const logger = require('../../logger');
  *   GET    /:id/share         read   (either party; null for anyone else)
  *   POST   /:id/share/accept  accept (delegate only, pending only)
  *   POST   /:id/share/reject  reject (delegate only, pending only)
+ *   POST   /:id/share/link    the recipient's web link again (original only, live)
+ *
+ * THE LINK REACHES THE CONTACT FROM THE SHARER'S OWN WHATSAPP. Create returns
+ * `link`; the app opens WhatsApp on the sharer's phone addressed to the
+ * contact with it filled in, and /share/link re-issues it for a resend. Safe to
+ * hand the sharer: the link only opens the OTP screen, and the code goes to the
+ * contact's phone. The server-side WhatsApp template send stays available but
+ * OFF until JOB_SHARE_WA_TEMPLATE names an approved template (Meta rejected
+ * every Utility wording for a message to someone with no EasyFix relationship).
  *
  * Every status rule is enforced in the service's transition table, not here —
  * these handlers only resolve WHO is asking.
@@ -55,8 +64,19 @@ router.post('/:id/share', validate(idParam, 'params'), validate(createBody), asy
     });
     // The web link the recipient works the job from (services/job-share-guest.service.js).
     const link = await require('../../services/job-share-guest.service').shareLink(share.id);
-    const whatsapp = await delegation.notifyShareRecipient(share, link);
-    return res.status(201).json({ success: true, data: { share, whatsapp } });
+    const data = { share, link };
+    if (delegation.shareTemplateName()) data.whatsapp = await delegation.notifyShareRecipient(share, link);
+    return res.status(201).json({ success: true, data });
+  } catch (e) { return handleErr(res, next, e); }
+});
+
+router.post('/:id/share/link', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    const jobId = Number(req.params.id);
+    const share = await delegation.requireSharerLiveShare(jobId, req.tech.efr_id);
+    logger.info('Share link re-issued · jobId=' + jobId + ' · shareId=' + share.share_id);
+    const link = await require('../../services/job-share-guest.service').shareLink(share.share_id);
+    return modernOk(res, { link });
   } catch (e) { return handleErr(res, next, e); }
 });
 

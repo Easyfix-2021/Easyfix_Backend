@@ -282,12 +282,15 @@ async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactNa
  * never the customer's name, phone or street address, because the number is
  * whatever the technician typed.
  *
- * `job_shared_contact` must match the Gallabox template name exactly, and
+ * JOB_SHARE_WA_TEMPLATE must match an approved Gallabox template exactly, and
  * bodyValues keys must match its {{variables}}. `link` is a plain URL in the
  * BODY (not a URL button) so the contact can reopen it as often as the job
  * needs — start work today, add materials tomorrow.
  */
-const SHARE_TEMPLATE = 'job_shared_contact';
+// Off unless configured: no Utility wording was approved by Meta, so the link
+// is sent from the sharer's own WhatsApp by the app. Set JOB_SHARE_WA_TEMPLATE
+// to an APPROVED template name to turn the server send back on.
+const shareTemplateName = () => String(process.env.JOB_SHARE_WA_TEMPLATE || '').trim() || null;
 
 function istSlot(value) {
   if (!value) return 'To be confirmed';
@@ -332,6 +335,7 @@ async function shareJobFacts(share) {
 
 async function notifyShareRecipient(share, link) {
   const to = share && share.delegateNumber;
+  if (!shareTemplateName()) return { sent: false, reason: 'server WhatsApp send not configured' };
   if (!to) return { sent: false, reason: 'no recipient number' };
   try {
     const facts = await shareJobFacts(share);
@@ -340,7 +344,7 @@ async function notifyShareRecipient(share, link) {
     const result = await gallabox.sendTemplate({
       to,
       recipientName: share.delegateName || undefined,
-      templateName: SHARE_TEMPLATE,
+      templateName: shareTemplateName(),
       bodyValues: {
         contact_name: share.delegateName || 'there',
         sharer_name: share.sharedByName || 'An EasyFix technician',
@@ -366,6 +370,14 @@ async function notifyShareRecipient(share, link) {
 async function requireLiveShare(jobId) {
   const share = await findLiveShare(jobId);
   if (!share) throw err(404, 'This job is not shared.', { code: 'share_not_found' });
+  return share;
+}
+
+/* The live share on a job, but only for its SHARER; 404 otherwise (a stranger
+ * must not learn whether a job is delegated). */
+async function requireSharerLiveShare(jobId, sharerEfrId) {
+  const share = await requireLiveShare(jobId);
+  if (Number(share.fk_easyfixer_id) !== Number(sharerEfrId)) throw err(404, 'This job is not shared.');
   return share;
 }
 
@@ -481,7 +493,8 @@ module.exports = {
   findShareById,
   notifyShareRecipient,
   shareJobFacts,
-  SHARE_TEMPLATE,
+  shareTemplateName,
+  requireSharerLiveShare,
   cancelShare,
   acceptShare,
   rejectShare,
