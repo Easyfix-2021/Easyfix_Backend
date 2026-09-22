@@ -115,6 +115,9 @@ const fake = installFakePool([
   // material-review tests assert on an EMPTY `lines` review).
   [/^\s*SELECT id FROM quotation_details(?!.*type\s*=\s*'material')/is, () => [{ id: 1 }]],
   [/^\s*SELECT id FROM quotation_details.*type\s*=\s*'material'/is, () => []],
+  // One-timestamp-per-send lookup (2026-09-22 amendment) — no prior sent_on
+  // in this file's world, so nextSentOn falls straight through to `now`.
+  [/^\s*SELECT MAX\(sent_on\)/i, () => [{ maxSentOn: null }]],
   [/^\s*UPDATE quotation_details\b/i, () => ({ affectedRows: 1 })],
   // Client/public approve-reject: the approval_pending line stamp — no line
   // fixtures in THIS file's world, so an UPDATE that touches 0 rows is
@@ -200,14 +203,17 @@ test('materialRequired: 20 (IN_PROGRESS_ALT) also qualifies', async () => {
   assert.equal(out.status, 16);
 });
 
-// 15 -> 409 "Waiting for client approval" (Material Request Flow v2's
-// job-level write lock — every OTHER status still refuses too, but 15 is the
-// one with its own contract message).
+// 15 -> 409 "Your previous quotation is with the client — send this one
+// after they decide" (2026-09-22 amendment — SEND is refused at 15 with its
+// own contract message; adding/drafting is allowed there now, but
+// materialRequired has no drafts of its own to add — see the fixture, which
+// carries no quotation line at all — so it hits this message, not the 422
+// "no draft" one).
 test('materialRequired refuses a job at 15 — nothing is written', async () => {
   jobFixture = makeJob({ job_status: 15, fk_easyfixter_id: TECH_EFR_ID });
   await assert.rejects(
     () => estimateService.materialRequired(jobFixture.job_id, TECH_EFR_ID),
-    (e) => { assert.equal(e.status, 409); assert.match(e.message, /Waiting for client approval/); return true; },
+    (e) => { assert.equal(e.status, 409); assert.match(e.message, /send this one after they decide/); return true; },
   );
   assert.equal(jobUpdates(fake.calls).length, 0);
 });

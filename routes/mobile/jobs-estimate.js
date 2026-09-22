@@ -133,7 +133,10 @@ router.post('/:id/quotation', validate(idParam, 'params'), validate(quotationBod
 // ─── Quotation: list (Material Request Flow v2) ────────────────────────
 // GET /:id/quotation → { items: [{ lineId, type, name, quantity, amount,
 //   materialId, itemId, clientCharge, approvedCharge, sentOn, actionOn,
-//   state }] } — each line's `state` from services/quotation-line-state.js.
+//   state, quotationNo }] } — each line's `state` from
+//   services/quotation-line-state.js; `quotationNo` (owner decision,
+//   2026-09-22) is 1..n by ascending distinct sent_on within the job, null
+//   for a draft.
 router.get('/:id/quotation', validate(idParam, 'params'), async (req, res, next) => {
   try {
     logger.info('List quotation lines · jobId=' + req.params.id);

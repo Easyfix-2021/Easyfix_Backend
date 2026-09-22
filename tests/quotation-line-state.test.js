@@ -83,15 +83,67 @@ test('OPEN_STATES is exactly draft + review_pending + approval_pending (the mate
   assert.deepEqual([...qls.OPEN_STATES].sort(), ['approval_pending', 'draft', 'review_pending'].sort());
 });
 
-test('TECH_EDITABLE_STATES is exactly draft + review_pending (approval_pending is OPEN for counting but LOCKED for tech writes)', () => {
-  assert.deepEqual([...qls.TECH_EDITABLE_STATES].sort(), ['draft', 'review_pending'].sort());
+// AMENDMENT (owner decision, 2026-09-22): once sent, a line is locked to the
+// technician — "Save" is for drafts; anything more is a NEW quotation. So
+// TECH_EDITABLE_STATES shrank from [draft, review_pending] to [draft] only.
+test('TECH_EDITABLE_STATES is exactly [draft] (2026-09-22: review_pending is no longer tech-editable)', () => {
+  assert.deepEqual([...qls.TECH_EDITABLE_STATES], ['draft']);
+  assert.equal(qls.isTechEditable('review_pending'), false, 'review_pending must not be tech-editable — once sent, a line is locked to the technician');
   assert.equal(qls.isTechEditable('approval_pending'), false, 'approval_pending must not be tech-editable — the client already has it');
 });
 
-test('isTechEditable is true only for draft/review_pending', () => {
+test('isTechEditable is true only for draft', () => {
   for (const state of Object.values(qls.STATE)) {
     assert.equal(qls.isTechEditable(state), qls.TECH_EDITABLE_STATES.includes(state));
   }
+});
+
+// ─── nextSentOn — one-timestamp-per-send, strictly later (2026-09-22) ───
+
+test('nextSentOn: no prior sent_on on the job -> uses `now` as-is', () => {
+  const now = new Date('2026-09-22T10:00:00Z');
+  assert.equal(qls.nextSentOn(now, null).getTime(), now.getTime());
+});
+
+test('nextSentOn: `now` already strictly after the last sent_on -> uses `now` as-is', () => {
+  const lastSentOn = new Date('2026-09-22T10:00:00Z');
+  const now = new Date('2026-09-22T10:05:00Z');
+  assert.equal(qls.nextSentOn(now, lastSentOn).getTime(), now.getTime());
+});
+
+test('nextSentOn: `now` in the SAME second as the last sent_on -> bumped to lastSentOn + 1s, never equal', () => {
+  const lastSentOn = new Date('2026-09-22T10:00:00.000Z');
+  const now = new Date('2026-09-22T10:00:00.900Z'); // same whole second, later ms
+  const result = qls.nextSentOn(now, lastSentOn);
+  assert.equal(result.getTime(), lastSentOn.getTime() + 1000);
+  assert.ok(result.getTime() > lastSentOn.getTime(), 'must be strictly later — two sends must never share a quotation');
+});
+
+test('nextSentOn: `now` BEFORE the last sent_on (clock skew) -> still bumped past it, never regresses', () => {
+  const lastSentOn = new Date('2026-09-22T10:00:05Z');
+  const now = new Date('2026-09-22T10:00:00Z');
+  const result = qls.nextSentOn(now, lastSentOn);
+  assert.equal(result.getTime(), lastSentOn.getTime() + 1000);
+});
+
+// ─── quotationNumbers — 1..n by ascending distinct sent_on, null for draft ─
+
+test('quotationNumbers: two distinct sends number 1 and 2; a draft (null sent_on) numbers null', () => {
+  const firstSend = new Date('2026-09-22T09:00:00Z');
+  const secondSend = new Date('2026-09-22T10:00:00Z');
+  // Order deliberately NOT sorted — numbering is by sent_on value, not row order.
+  const out = qls.quotationNumbers([secondSend, null, firstSend, secondSend]);
+  assert.deepEqual(out, [2, null, 1, 2]);
+});
+
+test('quotationNumbers: all drafts -> all null', () => {
+  assert.deepEqual(qls.quotationNumbers([null, null]), [null, null]);
+});
+
+test('quotationNumbers: a string and a Date for the SAME instant collapse to one quotation number', () => {
+  const d = new Date('2026-09-22T09:00:00Z');
+  const out = qls.quotationNumbers([d, d.toISOString()]);
+  assert.deepEqual(out, [1, 1]);
 });
 
 test('openLineSql ORs exactly the three OPEN_STATES predicates', () => {

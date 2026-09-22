@@ -19,6 +19,9 @@ const fake = installFakePool([
   // row (sent_on IS NULL) so this file keeps testing what it always tested
   // (the Date-sharing behaviour), not the new 422 guard (covered elsewhere).
   [/^\s*SELECT id FROM quotation_details/i, () => [{ id: 1 }]],
+  // One-timestamp-per-send lookup (2026-09-22 amendment) — no prior sent_on
+  // in this file's world, so nextSentOn falls straight through to `now`.
+  [/^\s*SELECT MAX\(sent_on\)/i, () => [{ maxSentOn: null }]],
   [/^\s*UPDATE quotation_details\b/i, () => ({ affectedRows: 1 })],
   [/^\s*UPDATE tbl_job\b/i, () => ({ affectedRows: 1 })],
   [/^\s*INSERT INTO tbl_job_image/i, () => ({ affectedRows: 1 })],
