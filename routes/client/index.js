@@ -437,8 +437,22 @@ router.get('/action-queue', async (req, res, next) => {
       estimateValue: r.estimate_value == null ? null : Number(r.estimate_value),
       // The action that clears this row, so the FE does not hard-code a mapping
       // from type to endpoint.
+      //
+      // Approve is no longer a bare PATCH (2026-09-22): the approval also books
+      // the next visit and records the entry permission, so the descriptor says
+      // how to call it — multipart, the required fields, and where the bookable
+      // slots come from. A caller following the old shape would get a 400.
       action: isEstimateApprovable(r.job_status)
-        ? { label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve` }
+        ? {
+          label: 'Approve', method: 'PATCH', path: `/api/client/jobs/${r.job_id}/estimate/approve`,
+          contentType: 'multipart/form-data',
+          fields: {
+            visit_date_time: 'required · YYYY-MM-DD HH:00:00 (IST), a free slot from slotsPath',
+            permission: "required · 'now' | 'later' | 'not_required'",
+            permission_file: "required when permission = 'now' · pdf/jpeg/png/webp/heic, max 10 MB",
+          },
+          slotsPath: `/api/client/jobs/${r.job_id}/visit-slots`,
+        }
         // GET, not PATCH: there is nothing to clear. The card opens the job
         // drawer either way, but a row that offers to approve something the
         // server would reject is a button that lies.

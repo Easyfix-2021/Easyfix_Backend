@@ -128,6 +128,11 @@ test('a status-15 row is an approval with the PATCH that clears it', async () =>
   assert.equal(d.items[0].action.method, 'PATCH');
   assert.match(d.items[0].action.path, /\/estimate\/approve$/,
     'queue membership and the action that empties it must describe one set');
+  // Approve now books the visit + permission too — the descriptor must say so,
+  // or a caller following it sends a bodyless PATCH and gets a 400.
+  assert.equal(d.items[0].action.contentType, 'multipart/form-data');
+  assert.deepEqual(Object.keys(d.items[0].action.fields).sort(), ['permission', 'permission_file', 'visit_date_time']);
+  assert.equal(d.items[0].action.slotsPath, '/api/client/jobs/1/visit-slots');
 });
 
 test('the label is DERIVED, so loosening the filter cannot resurrect the bug', async () => {

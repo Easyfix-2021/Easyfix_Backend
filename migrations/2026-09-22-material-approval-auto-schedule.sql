@@ -34,8 +34,14 @@ SELECT id, action_desc, user_type, status FROM action_taken_reason
 
 -- ─── 2. The seeded reason row ───────────────────────────────────────────────
 
-INSERT INTO action_taken_reason (action_type, action_desc, user_type, status)
-SELECT 8, 'Material Approved — Visit Chosen', 1, 1
+-- status = 0: a SYSTEM reason. rescheduleReasons() (the CRM Schedule & Assign
+-- and technician-app Reschedule dropdowns) lists only status = 1, so an active
+-- row would let someone pick it for an unrelated manual reschedule. The approval
+-- path finds it by action_desc and reschedule() does not check status.
+-- is_new: the column is NOT NULL with no default (every action_type 8 row has 0);
+-- omitting it fails with ER_NO_DEFAULT_FOR_FIELD (1364) under strict mode.
+INSERT INTO action_taken_reason (action_type, action_desc, user_type, status, is_new)
+SELECT 8, 'Material Approved — Visit Chosen', 1, 0, 0
  WHERE NOT EXISTS (SELECT 1 FROM action_taken_reason WHERE action_type = 8 AND action_desc = 'Material Approved — Visit Chosen');
 
 -- ─── 3. Verify (read-only) ───────────────────────────────────────────────────
