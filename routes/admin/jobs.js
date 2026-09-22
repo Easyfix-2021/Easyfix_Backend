@@ -3771,6 +3771,220 @@ router.post(
   },
 );
 
+// ─── NEW — Admin "approve on client's behalf" (Material Request Flow v2)
+// ─────────────────────────────────────────────────────────────────────────
+// POST /:id/client-approval-on-behalf (multipart/form-data)
+//   comment          : string, trimmed, 10..1000 chars, required
+//   files            : 1..5 files, each <=10MB — audio (mp3/m4a/wav/aac/ogg),
+//                       image (jpeg/png/webp/heic) or application/pdf,
+//                       validated by BOTH mimetype AND extension.
+//                       Deliberately NOT job-image.service's byte-sniff gate
+//                       (assertUploadableFile) — that allowlist is image/PDF
+//                       only (see its own header) and every one of its four
+//                       callers is a photo or a document upload; this is the
+//                       first caller that can legitimately carry a
+//                       phone-call recording, so widening the shared
+//                       sniffer for everyone was rejected in favour of this
+//                       route validating its own (wider) allowlist and
+//                       handing job-image.service an already-resolved
+//                       contentType.
+//   visit_date_time  : 'YYYY-MM-DD HH:00:00' (IST) — validated by
+//                       services/visit-slots.service.js#assertSlotBookable.
+//   permission       : 'now' | 'later' | 'not_required'.
+//   permission_file  : one file, required iff permission='now' — pdf / jpeg
+//                       / png / webp / heic, <=10MB — validated by
+//                       services/job-estimate-approval.js's OWN table (see
+//                       its header for why that's separate from the one
+//                       above: heic isn't in job-image.service's byte-sniff
+//                       allowlist either).
+//
+// Ops sometimes gets a client's approval over a phone call or a WhatsApp
+// voice note rather than through the portal/magic-link — this endpoint lets
+// an authorised PM (isJobMaterialReview) record that proof and apply the
+// SAME approval the client would have applied themselves, including the
+// visit date/time and site-access permission choice the client gave over
+// that same call. Guarded to status 15 (ESTIMATE_PENDING_APPROVAL) exactly
+// like every other estimate-approval surface
+// (services/job-estimate-approval.js's isEstimateApprovable), with its own
+// 409 message per the API contract.
+//
+// Storage: routes/admin/job-documents.js's own storage path —
+// job-image.service's storeJobImageFile (the shared S3-or-local helper) +
+// tbl_job_image (the SAME table Job Sheet / Purchase Order documents use)
+// under a NEW category, 'ClientApprovalProof'.
+// utils/job-image-buckets.js#DOCUMENT_CATEGORIES classifies it as a
+// document, not a before/after work photo — same treatment as 'jobsheet' /
+// 'po'. Categories are a plain in-code allowlist (job-charges.service.js's
+// DOC_CATEGORIES is the Billing-tab example), not a DB table, so adding one
+// is a code change, not a migration.
+//
+// Then: a job comment (services/job-comment.service.js#addComment,
+// comment_on=1) prefixed "Approved on client's behalf: <comment>", and the
+// SAME shared writer every approve surface uses
+// (services/job-estimate-approval.js#approveWithVisitSchedule) — never a
+// second approval writer.
+const clientApprovalMulter = require('multer');
+const clientApprovalUpload = clientApprovalMulter({
+  storage: clientApprovalMulter.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 6 },
+});
+
+// mimetype -> allowed extension(s). Both must agree — a mismatched pair (a
+// .wav renamed .mp3, or vice versa) is refused rather than guessed at.
+const CLIENT_APPROVAL_PROOF_TYPES = {
+  'audio/mpeg': ['.mp3'],
+  'audio/mp3': ['.mp3'],
+  'audio/x-m4a': ['.m4a'],
+  'audio/m4a': ['.m4a'],
+  'audio/mp4': ['.m4a'],
+  'audio/wav': ['.wav'],
+  'audio/x-wav': ['.wav'],
+  'audio/wave': ['.wav'],
+  'audio/aac': ['.aac'],
+  'audio/x-aac': ['.aac'],
+  'audio/ogg': ['.ogg'],
+  'application/ogg': ['.ogg'],
+  'image/jpeg': ['.jpg', '.jpeg'],
+  'image/png': ['.png'],
+  'image/webp': ['.webp'],
+  'image/heic': ['.heic'],
+  'image/heif': ['.heic', '.heif'],
+  'application/pdf': ['.pdf'],
+};
+
+function clientApprovalProofError(file) {
+  const mime = String(file.mimetype || '').trim().toLowerCase();
+  const exts = CLIENT_APPROVAL_PROOF_TYPES[mime];
+  if (!exts) return `"${file.originalname}": unsupported file type (${file.mimetype})`;
+  const ext = require('node:path').extname(file.originalname || '').toLowerCase();
+  if (!exts.includes(ext)) return `"${file.originalname}": file extension does not match its declared type (${file.mimetype})`;
+  return null;
+}
+
+// Two named fields now: the existing proof recording(s) ('files', 1..5) and
+// the NEW site-access permission document ('permission_file', 0..1 — its
+// OWN requiredness rule, checked in the handler once `permission` is known).
+// Same MulterError-mapping reason as imageUploadOr400 below: a size/count
+// rejection throws from INSIDE multer's own middleware, before the handler's
+// try/catch can see it, and MulterError has no .status.
+function clientApprovalUploadOr400(req, res, next) {
+  clientApprovalUpload.fields([
+    { name: 'files', maxCount: 5 },
+    { name: 'permission_file', maxCount: 1 },
+  ])(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return modernError(res, 400, 'each file must be 10MB or smaller');
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return modernError(res, 400, 'attach between 1 and 5 files');
+    }
+    return next(err);
+  });
+}
+
+const clientApprovalOnBehalfBody = Joi.object({
+  comment: Joi.string().trim().min(10).max(1000).required(),
+  // Format/range validated by assertSlotBookable inside approveWithVisitSchedule
+  // (its own 400 messages) — Joi only guards "present at all" here.
+  visit_date_time: Joi.string().trim().required(),
+  permission: Joi.string().valid('now', 'later', 'not_required').required(),
+});
+
+router.post(
+  '/:id/client-approval-on-behalf',
+  validate(idParam, 'params'),
+  scopedJob,
+  requireAction('isJobMaterialReview'),
+  clientApprovalUploadOr400,
+  validate(clientApprovalOnBehalfBody),
+  async (req, res, next) => {
+    const jobId = Number(req.params.id);
+    try {
+      if (Number(req.scopedJob.job_status) !== job.STATUS.ESTIMATE_PENDING_APPROVAL) {
+        logger.warn('Client-approval-on-behalf refused · jobId=' + jobId + ' · job_status=' + req.scopedJob.job_status);
+        return modernError(res, 409, 'This job is not waiting for client approval');
+      }
+
+      const files = req.files?.files || [];
+      const permissionFile = req.files?.permission_file?.[0] || null;
+      if (files.length < 1) return modernError(res, 400, 'attach at least 1 file (up to 5)');
+      for (const file of files) {
+        const fileErr = clientApprovalProofError(file);
+        if (fileErr) return modernError(res, 400, fileErr);
+      }
+
+      // Validate visit_date_time/permission/permission_file AND re-check slot
+      // availability BEFORE writing ANYTHING — including this route's OWN
+      // proof-file storage and comment below, which otherwise land before
+      // approveWithVisitSchedule gets a chance to validate them itself.
+      const jobEstimateApproval = require('../../services/job-estimate-approval');
+      const visitSlots = require('../../services/visit-slots.service');
+      jobEstimateApproval.validatePermissionChoice(req.body.permission, permissionFile);
+      await visitSlots.assertSlotBookable(jobId, req.body.visit_date_time, new Date());
+
+      logger.info('Client-approval-on-behalf · jobId=' + jobId + ' · files=' + files.length
+        + ' by userId=' + (req.user?.user_id ?? '-'));
+
+      const { storeJobImageFile } = require('../../services/job-image.service');
+      for (const file of files) {
+        const mime = String(file.mimetype || '').trim().toLowerCase();
+        await storeJobImageFile({ jobId, file, category: 'ClientApprovalProof', contentType: mime });
+      }
+
+      // Required, not best-effort: the comment IS the recorded proof text —
+      // a failure here must surface (500), unlike the material-review reject
+      // reason comment above, which is a nicety on an already-committed move.
+      await jobComments.addComment(jobId, {
+        comments: `Approved on client's behalf: ${req.body.comment}`,
+        comment_on: 1,
+        commented_by: req.user?.user_id ?? null,
+      });
+
+      // Re-validates (cheap — no write) then does the real work; see its
+      // header for the transaction boundary and post-commit surfacing rules.
+      const result = await jobEstimateApproval.approveWithVisitSchedule(jobId, req.user, {
+        visitDateTime: req.body.visit_date_time,
+        permissionChoice: req.body.permission,
+        permissionFile,
+        technicianId: req.scopedJob.fk_easyfixter_id,
+        rescheduleActor: req.user, // the CRM user — never a client-contact id
+        permissionSpocId: null,    // no client contact on this path
+      });
+
+      const updated = await job.getById(jobId);
+      logger.info('Client-approval-on-behalf done · jobId=' + jobId + ' · status->' + updated.job_status
+        + ' · rescheduled=' + result.rescheduled + ' · permission=' + result.permission.choice);
+      return modernOk(res, {
+        job_status: updated.job_status,
+        visit_date_time: result.visitDateTime,
+        permission: { choice: result.permission.choice, request_id: result.permission.requestId },
+        schedule_error: result.scheduleError,
+        permission_error: result.permissionError,
+      }, "approved on client's behalf");
+    } catch (e) {
+      logger.warn('Client-approval-on-behalf failed · jobId=' + req.params.id + ' · ' + e.message);
+      return next(e);
+    }
+  },
+);
+
+// ─── GET /:id/visit-slots — the technician's free hours for the next 30
+// days (Material Request Flow v2, 2026-09-22 correction). Same payload shape
+// on all three surfaces (admin/client/public) — see
+// services/visit-slots.service.js#listVisitSlots.
+router.get(
+  '/:id/visit-slots',
+  validate(idParam, 'params'),
+  scopedJob,
+  requireAction('isJobMaterialReview'),
+  async (req, res, next) => {
+    try {
+      const visitSlots = require('../../services/visit-slots.service');
+      const slots = await visitSlots.listVisitSlots(Number(req.params.id));
+      return modernOk(res, slots);
+    } catch (e) { return next(e); }
+  },
+);
+
 // ─── Job Feedback sub-resource (legacy tbl_customer_feedback) ─────────
 const jobFeedback = require('../../services/job-feedback.service');
 // VERIFIED against tbl_customer_feedback (see services/job-feedback.service.js).

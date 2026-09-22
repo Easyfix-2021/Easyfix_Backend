@@ -357,10 +357,20 @@ function handlerFor(router, routePath, method) {
 function mockRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
 }
+// Material Request Flow v2, 2026-09-22 correction: the estimate/approve
+// routes now REQUIRE visit_date_time + permission (see
+// services/job-estimate-approval.js#approveWithVisitSchedule). Defaulted
+// here so every existing call below keeps exercising what it always tested
+// (the 15->1/2 move, the 16 guard) without each needing its own edit.
+const APPROVE_BODY_DEFAULTS = { visit_date_time: '2026-09-23 10:00:00', permission: 'not_required' };
+
 async function callClient(routePath, method, body = {}) {
   const r = mockRes();
   await handlerFor(clientRouter, routePath, method)(
-    { spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(jobFixture.job_id) }, body },
+    {
+      spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(jobFixture.job_id) },
+      body: routePath.includes('/estimate/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;
@@ -426,7 +436,10 @@ function mintEstimateToken(jobId, clientContactId = null) {
 async function callPublic(routePath, method, { token, body = {} } = {}) {
   const r = mockRes();
   await handlerFor(publicEstimateRouter, routePath, method)(
-    { params: { token: token || mintEstimateToken(jobFixture.job_id, 42) }, body },
+    {
+      params: { token: token || mintEstimateToken(jobFixture.job_id, 42) },
+      body: routePath.includes('/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;

@@ -254,3 +254,123 @@ ALTER TABLE tbl_job_material_review ADD COLUMN pre_material_status TINYINT NULL;
 - client approve stamps only approval_pending lines.
 - mobile list `material_state` / `material_count` for draft / 16 / 15 / none.
 - CRM: build + tests; app: `tsc` + tests; QA APK + TestFlight build; deck.
+
+## Amendment, 2026-09-22 (owner correction) — visit-slot picker replaces auto-reschedule
+
+**Owner decision: "never pre-assume the next visit date."** A prior session
+on this branch (unpushed commit `54fd9dc`) built a SAME-DAY
+auto-reschedule — after any client material approval, find the technician's
+next open 7-day slot (a `baseDate`/`findSlot`/3 PM rule) and book it
+automatically, with a `tbl_job_auto_schedule.needs_scheduling` flag when
+nothing was free. The owner rejected that design outright. This amendment
+REPLACES it — the auto-computation, its table/column, and the flag-clearing
+hook in `job.service.js#reschedule()` are all removed, not kept alongside
+the new flow.
+
+**The new flow**: the client/CRM PICKS the visit date/time themselves, from a
+list of the technician's actually-free hours, at the moment they approve the
+estimate.
+
+### `services/visit-slots.service.js` (new, shared)
+
+- `listVisitSlots(jobId, { days = 30, now })` → `{ technician_id, days: [
+  { date: 'YYYY-MM-DD', hours: [ { hour, free } ] } ] }`. Hours are
+  `time-slot.js#SLOT_START_HOURS` (9..18); dates run today..today+29 in IST
+  (`Asia/Kolkata` explicitly — never the container TZ, which is UTC on every
+  deployed env). Today's hours at or before the current IST hour are
+  OMITTED (already past). Busy = the job's assigned technician's OTHER open
+  jobs (status 0/1/2) in the same `(date, hour)` frame, reusing
+  `time-slot.js#conflictFrame` — the SAME booking-conflict definition
+  `candidate-ranking.service.js`'s hard filter uses (midnight-sentinel
+  excluded, this job excluded), one query over the whole window. No
+  technician assigned yet → every hour in the window is free.
+- `assertSlotBookable(jobId, visitDateTime, now)` — the gate every approve
+  path runs BEFORE writing anything:
+  - not `'YYYY-MM-DD HH:00:00'` with hour in 9..18 → 400 "Pick a visit time
+    between 9 AM and 6 PM"
+  - in the past / the current hour / beyond the 30-day window → 400 "Pick a
+    future visit time within 30 days"
+  - the technician's frame is already booked → 409 "That slot was just
+    booked — pick another"
+
+### Endpoints (same response shape on all three)
+
+- `GET /api/admin/jobs/:id/visit-slots` — `scopedJob` + `requireAction('isJobMaterialReview')`
+- `GET /api/client/jobs/:id/visit-slots` — the same hierarchy scope as every
+  other `/jobs/:id` route (`loadJobInScope`)
+- `GET /api/public/estimate/:token/visit-slots` — the same token auth + rate
+  limit as `GET /api/public/estimate/:token`
+
+### The three approve paths — all now REQUIRE, as multipart/form-data
+
+- `visit_date_time` — `'YYYY-MM-DD HH:00:00'` (IST wall clock)
+- `permission` — `'now' | 'later' | 'not_required'` (400 otherwise)
+- `permission_file` — one file, required iff `permission='now'` (pdf / jpeg /
+  png / webp / heic, ≤10MB, mimetype AND extension checked — its OWN table in
+  `services/job-estimate-approval.js`, distinct from
+  `routes/admin/jobs.js`'s `ClientApprovalProof` table, because heic isn't in
+  `job-image.service.js`'s byte-sniff allowlist either)
+
+Routes: `routes/client/index.js` `PATCH /jobs/:id/estimate/approve`,
+`routes/public/estimate.js` `PATCH /:token/approve`, `routes/admin/jobs.js`
+`POST /:id/client-approval-on-behalf` (keeps its existing `comment` + proof
+`files` fields alongside the new ones).
+
+**`services/job-estimate-approval.js#approveWithVisitSchedule`** is the ONE
+writer all three call. Validation (permission/file shape, then
+`assertSlotBookable`) runs before any write. Then:
+  (a) `approveEstimateLinesAndStatus` — its own transaction, unchanged;
+  (b) `job.service#reschedule()` to the chosen `visit_date_time`, reason
+      "Material Approved — Visit Chosen" (same `action_type = 8` bucket the
+      rejected amendment seeded, renamed — see the shrunk migration below).
+      Actor is `null` ("system") on the client/public paths — never a
+      client-contact id in a tbl_user FK — and the CRM user on the admin
+      path.
+  (c) the permission choice: `'now'` → create a
+      `tbl_job_permission_request` of kind "Entry Permission"
+      (`services/job-permission-request.service.js#raiseForApproval`,
+      attributed to the job's own assigned technician — the table's
+      `requested_by_efr_id` is NOT NULL and this change ships no migration
+      to add a "raised by CRM/client" column) and fulfil it with the file;
+      `'later'` → create it OPEN, never fulfilled; `'not_required'` →
+      nothing. Never sends the "technician requested a document"
+      notification (that's `create()`'s caller's opt-in, and this caller
+      never opts in) — the technician still sees the row via the existing
+      job-scoped listing.
+
+(b) and (c) run AFTER the approval commits, not inside it — `reschedule()`
+manages its own transaction and folding a foreign connection into it is a
+bigger change than this fix calls for. Because `assertSlotBookable` already
+re-validated the slot immediately before the transaction, a failure here can
+only be a genuine race or a real DB error. UNLIKE the rejected
+auto-reschedule amendment (which could never fail the approval and hid a
+miss behind `needs_scheduling`), a chosen slot is an explicit user decision:
+a failure is logged AND surfaced on the response as `schedule_error` /
+`permission_error` — never swallowed.
+
+Response (all three, additive): `{ visit_date_time, permission: { choice,
+request_id }, schedule_error, permission_error }`.
+
+### Migration
+
+`migrations/executed/2026-09-22-material-approval-auto-schedule.sql` is SHRUNK to
+just the reschedule-reason seed (renamed "Material Approved — Visit
+Chosen"), same `action_type = 8` bucket, idempotent insert. The
+`tbl_job_auto_schedule` table and the `needs_scheduling` column exposure are
+removed from the code entirely; the migration never ran against any
+database, so there is nothing to roll back.
+
+### Testing (each check made to fail once)
+
+- `listVisitSlots`: omits past hours in IST (including a UTC-date-boundary
+  case); marks busy frames from the technician's other open jobs; no
+  technician → every hour free.
+- `assertSlotBookable`: bad format/hour → 400; past/beyond-window → 400;
+  busy → 409.
+- Each approve path: missing `visit_date_time` / bad `permission` / `'now'`
+  without a file → 400 before any write; busy slot → 409; happy path
+  reschedules to exactly the chosen slot; each permission choice produces
+  the right permission-request row (fulfilled / open / none).
+- `GET /api/client/jobs/:id/visit-slots` is hierarchy-scoped
+  (`tests/client-scope-single-definition.test.js` stays green, no EXEMPT
+  entry needed — it routes through `loadJobInScope`).
