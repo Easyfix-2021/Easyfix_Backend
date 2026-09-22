@@ -232,6 +232,9 @@ app.use('/api', routes);
 // can't accidentally shadow them; the inner router only registers
 // /book/:code so non-matching paths fall through to the 404 handler.
 app.use('/', require('./routes/public/url-shortener'));
+// Referral install link — `GET /get-app/:code` → 302 to the opener's store.
+// Root-mounted for the same shortness reason; see routes/public/get-app.js.
+app.use('/', require('./routes/public/get-app'));
 
 // Tell the swagger module which Express app to introspect. Called
 // AFTER `app.use('/api', routes)` so the entire router stack is

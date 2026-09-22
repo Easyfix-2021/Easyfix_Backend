@@ -49,12 +49,16 @@ function toVersionCode(raw) {
   return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
+/** The live store listing for a platform — property override, else the default. */
+function storeUrlFor(platform) {
+  return String(getProperty(`app.${platform}.store.url`) || '').trim() || DEFAULT_STORE_URL[platform];
+}
+
 router.get('/', async (req, res, next) => {
   try {
     const platform = String(req.query.platform || 'android').toLowerCase() === 'ios' ? 'ios' : 'android';
     const minVersionCode = toVersionCode(getProperty(`app.${platform}.min.version.code`));
-    const storeUrl =
-      String(getProperty(`app.${platform}.store.url`) || '').trim() || DEFAULT_STORE_URL[platform];
+    const storeUrl = storeUrlFor(platform);
 
     logger.info('App version policy · platform=' + platform + ' · minVersionCode=' + minVersionCode);
     modernOk(res, { platform, minVersionCode, storeUrl });
@@ -64,3 +68,6 @@ router.get('/', async (req, res, next) => {
 });
 
 module.exports = router;
+// Shared with /get-app so the referral link and the force-update screen can
+// never point at different listings.
+module.exports.storeUrlFor = storeUrlFor;
