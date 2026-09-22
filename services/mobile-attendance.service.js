@@ -1,5 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const { todayIst } = require('../utils/ist-calendar');
+const { getProperty } = require('./properties.service');
 
 /*
  * Mobile Attendance service — backs `GET/POST /api/mobile/attendance`,
@@ -44,6 +46,20 @@ const logger = require('../logger');
  */
 
 const SLOT_CUTOFF = '14:00:00';
+// Ops rule (2026-09-22): today can be marked PRESENT only before the cutoff
+// hour (IST); after that, only tomorrow. Un-marking / leave stays allowed all
+// day. Property `attendance.today.cutoff_hour` (0-24; 24 = no cutoff), read
+// through the 1h properties cache; anything unparseable falls back to 12.
+const DEFAULT_TODAY_CUTOFF_HOUR = 12;
+function todayCutoffHour() {
+  const n = Number(getProperty('attendance.today.cutoff_hour'));
+  return Number.isInteger(n) && n >= 0 && n <= 24 ? n : DEFAULT_TODAY_CUTOFF_HOUR;
+}
+// 12 → "12:00 PM", 9 → "9:00 AM", 0/24 → "12:00 AM".
+function formatHour(h) {
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:00 ${h % 24 < 12 ? 'AM' : 'PM'}`;
+}
 // Statuses the legacy slot-count query considered "active" jobs.
 const ACTIVE_JOB_STATUSES = [0, 1, 2, 20];
 
@@ -171,14 +187,24 @@ async function getAttendance(efrId, { from, to } = {}) {
  *
  *   { marked: true }
  */
-async function markDay(efrId, { date, morningSlot, eveningSlot }) {
+async function markDay(efrId, { date, morningSlot, eveningSlot }, now = new Date()) {
   if (!efrId) throw mkErr(400, 'efrId is required');
   const dayKey = toDayKey(date);
   const morning = morningSlot ? 1 : 0;
   const evening = eveningSlot ? 1 : 0;
+  // Only the PRESENT signal is time-gated — a 0/0 un-mark is always allowed.
+  // The server is the gate: the legacy Flutter app hits this same endpoint.
+  if (morning || evening) {
+    const today = todayIst(now);
+    if (dayKey < today) throw mkErr(400, 'Attendance cannot be marked for a past date');
+    const istHour = new Date(now.getTime() + 330 * 60 * 1000).getUTCHours();
+    const cutoff = todayCutoffHour();
+    if (dayKey === today && istHour >= cutoff) {
+      throw mkErr(400, `Today's attendance can only be marked before ${formatHour(cutoff)}. You can mark attendance for tomorrow.`);
+    }
+  }
   logger.info('Mark attendance day · date=' + dayKey + ' · morning=' + morning + ' · evening=' + evening);
 
-  const now = new Date();
   const [upd] = await pool.query(
     `UPDATE tbl_easyfixer_attendance
         SET morning_slot = ?, evening_slot = ?, is_leave_marked = 0,
@@ -308,6 +334,7 @@ async function unmarkLeave(efrId, { startDate, endDate }) {
 }
 
 module.exports = {
+  todayCutoffHour,
   getAttendance,
   markDay,
   markLeave,

@@ -5,6 +5,7 @@ const noticeService = require('./notice.service');
 const performanceService = require('./performance.service');
 const alertFlags = require('./job-offer-alert-flags');
 const { OPEN_JOB_STATUSES } = require('./easyfixer-lifecycle.service');
+const { todayCutoffHour } = require('./mobile-attendance.service');
 
 /*
  * Mobile dashboard orchestrator — composes shared services into the
@@ -255,6 +256,9 @@ async function getDashboard(efrId, opts = {}) {
     attendance: {
       status:   attendanceStatus(attendance.today),
       tomorrow: attendanceStatus(attendance.tomorrow),
+      // IST hour from which TODAY can no longer be marked present (24 = never
+      // locks). The app greys out Today with it; markDay() is the real gate.
+      todayCutoffHour: todayCutoffHour(),
     },
     counts: {
       // Under the offer-pool model the "New Requests" tile counts the
