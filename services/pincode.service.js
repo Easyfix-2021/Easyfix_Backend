@@ -517,10 +517,15 @@ async function findOrCreateStateByName(stateName, { userId = null } = {}) {
   void userId;
   const name = String(stateName || '').trim();
   if (!name) throw badReq('State name is required to create a new state');
-  const [[existing]] = await pool.query(
-    'SELECT state_id FROM tbl_state WHERE LOWER(TRIM(state_name)) = LOWER(?) LIMIT 1', [name]
-  );
-  if (existing) return { state_id: Number(existing.state_id), created: false };
+  /*
+   * Official spelling and old spellings ("Orissa", "Pondicherry", "New Delhi")
+   * all resolve to the ACTIVE state, ahead of any inactive row — see
+   * services/state.service.js resolveStateByName. An exact-name match used to
+   * bind new cities to whichever duplicate row happened to carry the string.
+   * Lazy require: state.service lazily requires this module.
+   */
+  const existing = await require('./state.service').resolveStateByName(name);
+  if (existing) return { state_id: existing.state_id, created: false };
   const countryId = await indiaCountryId();
   if (countryId == null) throw badReq('Cannot create a new state — no country configured in tbl_country');
   const [r] = await pool.query(
@@ -858,6 +863,7 @@ async function createPincode(
     if (stateId) {
       const [[srow]] = await pool.query('SELECT state_id FROM tbl_state WHERE state_id = ? LIMIT 1', [stateId]);
       if (!srow) throw badReq(`Unknown state_id ${stateId}`);
+      await require('./state.service').assertActiveStates([stateId]);
     } else {
       stateId = (await findOrCreateStateByName(newCity.state_name, { userId })).state_id;
     }
@@ -1320,11 +1326,9 @@ async function geocodeAndMatch(pincodeRaw) {
 
   let matchedState = null;
   if (detail?.state) {
-    const [[srow]] = await pool.query(
-      'SELECT state_id, state_name FROM tbl_state WHERE LOWER(TRIM(state_name)) = LOWER(?) LIMIT 1',
-      [detail.state.trim()]
-    );
-    if (srow) matchedState = { state_id: Number(srow.state_id), state_name: srow.state_name };
+    // Same resolver as findOrCreateStateByName — old spellings land on the
+    // active state, ahead of any inactive row (services/state.service.js).
+    matchedState = await require('./state.service').resolveStateByName(detail.state);
   }
 
   // Only match the city WITHIN the matched state — never name-only across all

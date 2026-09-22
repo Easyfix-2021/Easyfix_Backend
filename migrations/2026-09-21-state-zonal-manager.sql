@@ -10,43 +10,52 @@
 --   automatically. Manage Cities' own Add City set nothing at all.
 --
 --   The business rule is one zonal manager per state. This moves the control
---   to tbl_state and keeps tbl_city.state_user as the value everything reads:
---   saving a state's manager rewrites it on every city in that state, and every
---   city creation / state change / approval copies it from the state. None of
---   the ~20 readers of tbl_city.state_user change.
+--   to tbl_state while tbl_city.state_user stays the value everything reads:
+--   assigning a state's manager on the States tab rewrites it on every city of
+--   that state, and every city creation / state change / approval copies it
+--   from the state. None of the ~20 readers of tbl_city.state_user change.
+--
+-- DECIDED 2026-09-22 (Priyanka)
+--   * Every state starts with zonal manager 121. Operators then pick states on
+--     the States tab and assign the real manager; only then do that state's
+--     cities change. Nothing is copied onto cities by this file.
+--   * State rows were cleaned up by hand beforehand. This file does NOT move,
+--     merge or rename anything.
+--   * Active / inactive is set directly on tbl_state.state_status (1 / 0). The
+--     app works with ACTIVE states only: the States tab, every state picker and
+--     manager assignment.
 --
 -- WHAT IT ADDS
 --   tbl_state.state_user    the state's zonal manager (tbl_user.user_id).
---                           NULL only until someone assigns one — the States
---                           tab shows those rows as "Needs a manager".
---   tbl_state.state_status  1 active / 0 inactive. No UI toggle by decision
---                           (2026-09-21: EasyFix serves PAN India, every state
---                           stays active); kept for the future.
+--                           DEFAULT 121 — existing rows are filled with 121 by
+--                           the ALTER itself, and so is any state a legacy
+--                           service or automatic path inserts later.
+--   tbl_state.state_status  1 active / 0 inactive, DEFAULT 1.
 --   tbl_state.updated_by    tbl_user.user_id of the last person to change the
---                           row. NULL with a non-NULL updated_on = the backfill.
+--                           row. NULL = never changed by a person.
 --   tbl_state.updated_on    when.
+--   tbl_state.state_type    'State' or 'UT', shown under the name on the States
+--                           tab. Filled for the 36 official names; any other
+--                           row stays NULL until someone sets it.
 --   menu_action isStateEdit add / edit a state, assign or re-sync its manager.
 --
 -- LEGACY SAFETY
 --   The five legacy services select tbl_state by named columns (state_id,
---   state_name, state_code, country_id). Four nullable / defaulted columns are
+--   state_name, state_code, country_id). New nullable / defaulted columns are
 --   invisible to them. Same precedent as the tbl_city audit columns in
 --   migrations/executed/2026-09-09-city-approval-flow.sql.
 --
 -- HOW TO APPLY
---   Run each statement in order. Plain ALTER / UPDATE / INSERT — no prepared
---   statements, no @-variables. Section 1 is NOT idempotent (MySQL has no ADD
+--   Run each statement in order. Section 1 is NOT idempotent (MySQL has no ADD
 --   COLUMN IF NOT EXISTS); re-running it errors with ER_DUP_FIELDNAME, which is
 --   safe — skip it. Sections 2–4 are idempotent.
 --
 -- POST-APPLY
---   1. RESTART THE BACKEND. services/state.service.js memoises a SHOW COLUMNS
---      probe for tbl_state.state_user. A process started before this migration
---      has cached "absent": the States tab shows no managers and city creation
---      keeps the old majority guess, silently, until restart.
+--   1. RESTART THE BACKEND. services/state.service.js memoises SHOW COLUMNS
+--      probes for these columns. A process started before this migration has
+--      cached "absent" and keeps the States tab read-only until restart.
 --   2. Users in roles 2 / 13 / 15 log out and back in so isStateEdit is read.
---   3. Open Manage Cities → States. Rows whose "Cities in sync" is not green
---      had cities split between managers before today; review and Re-sync.
+--   3. Set state_status = 0 on any state that should be hidden.
 --
 -- APPLIED
 --   QA: —
@@ -54,23 +63,39 @@
 -- ─────────────────────────────────────────────────────────────────────
 
 
+-- ─── 0. Check first (read-only) ──────────────────────────────────────
+-- User 121 becomes every state's zonal manager. Expect ONE row with
+-- user_status = 1 and an internal role (2, 3, 5, 7, 11, 12, 13, 15, 17, 18).
+-- If not, the States tab flags every state "Left organisation" until reassigned.
+
+SELECT u.user_id, u.user_name, u.user_status, u.user_role, r.role_name
+  FROM tbl_user u LEFT JOIN tbl_role r ON r.role_id = u.user_role
+ WHERE u.user_id = 121;
+
+
 -- ─── 1. Columns ──────────────────────────────────────────────────────
 
-ALTER TABLE tbl_state ADD COLUMN state_user INT NULL;
+ALTER TABLE tbl_state ADD COLUMN state_user INT NULL DEFAULT 121;
 ALTER TABLE tbl_state ADD COLUMN state_status TINYINT NOT NULL DEFAULT 1;
 ALTER TABLE tbl_state ADD COLUMN updated_by INT NULL;
 ALTER TABLE tbl_state ADD COLUMN updated_on DATETIME NULL;
+ALTER TABLE tbl_state ADD COLUMN state_type VARCHAR(5) NULL;
 
 
--- ─── 2. Backfill the state's manager from its cities ─────────────────
--- For each state, the manager most of its cities already carry (ties broken by
--- the lower user_id, so a re-run picks the same one). Inactive cities do not
--- vote; active and pending do. This writes tbl_state ONLY — no city changes
--- here. Cities that disagree with their state keep their current manager until
--- someone saves or re-syncs that state, so nothing moves on release day.
--- Idempotent: only fills states that have no manager yet.
+-- ─── 2. State or UT — by official name ───────────────────────────────
+-- 28 States and 8 Union Territories. Only rows spelled exactly like the
+-- official name are typed; anything else stays NULL (set it on the States tab).
 
-UPDATE tbl_state s SET s.state_user = (SELECT c.state_user FROM tbl_city c WHERE c.state_id = s.state_id AND c.state_user IS NOT NULL AND (c.city_status IS NULL OR c.city_status IN (1, 2)) GROUP BY c.state_user ORDER BY COUNT(*) DESC, c.state_user ASC LIMIT 1), s.updated_on = NOW() WHERE s.state_user IS NULL AND EXISTS (SELECT 1 FROM tbl_city c2 WHERE c2.state_id = s.state_id AND c2.state_user IS NOT NULL AND (c2.city_status IS NULL OR c2.city_status IN (1, 2)));
+UPDATE tbl_state SET state_type = 'UT'
+ WHERE TRIM(state_name) IN ('Andaman and Nicobar Islands', 'Chandigarh', 'Dadra and Nagar Haveli and Daman and Diu',
+                            'Delhi', 'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry');
+
+UPDATE tbl_state SET state_type = 'State'
+ WHERE TRIM(state_name) IN ('Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat',
+                            'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
+                            'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab',
+                            'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh',
+                            'Uttarakhand', 'West Bengal');
 
 
 -- ─── 3. The permission ───────────────────────────────────────────────
@@ -90,15 +115,14 @@ INSERT INTO role_menu_action (role_id, menu_action_id, isDeleted) SELECT r.role_
 
 
 -- ─── 5. Verify (read-only) ───────────────────────────────────────────
--- Expected: state_cols_present = 4; granted_roles = 3.
--- The third query is the review list: every state with how many of its cities
--- already match the backfilled manager. states_without_manager should be the
--- handful with no assigned city at all.
+-- Expected: state_cols_present = 5; granted_roles = 3; every state shows
+-- zonal_manager_id 121 and a type (or NULL for a non-official spelling).
 
-SELECT COUNT(*) AS state_cols_present FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_state' AND COLUMN_NAME IN ('state_user', 'state_status', 'updated_by', 'updated_on');
+SELECT COUNT(*) AS state_cols_present FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_state' AND COLUMN_NAME IN ('state_user', 'state_status', 'updated_by', 'updated_on', 'state_type');
 
 SELECT ma.id, ma.action_name, ma.menu_id, (SELECT COUNT(*) FROM role_menu_action rma WHERE rma.menu_action_id = ma.id AND rma.role_id IN (2, 13, 15) AND rma.isDeleted = 0) AS granted_roles FROM menu_action ma WHERE ma.action_name = 'isStateEdit';
 
-SELECT s.state_id, s.state_name, u.user_name AS zonal_manager, (SELECT COUNT(*) FROM tbl_city c WHERE c.state_id = s.state_id) AS cities, (SELECT COUNT(*) FROM tbl_city c WHERE c.state_id = s.state_id AND c.state_user <=> s.state_user) AS cities_in_sync FROM tbl_state s LEFT JOIN tbl_user u ON u.user_id = s.state_user ORDER BY (s.state_user IS NULL) DESC, s.state_name;
-
-SELECT COUNT(*) AS states_without_manager FROM tbl_state WHERE state_user IS NULL;
+SELECT s.state_id, s.state_name, s.state_type, s.state_status, s.state_user AS zonal_manager_id, u.user_name AS zonal_manager,
+       (SELECT COUNT(*) FROM tbl_city c WHERE c.state_id = s.state_id) AS cities
+  FROM tbl_state s LEFT JOIN tbl_user u ON u.user_id = s.state_user
+ ORDER BY s.state_status DESC, s.state_type, s.state_name;
