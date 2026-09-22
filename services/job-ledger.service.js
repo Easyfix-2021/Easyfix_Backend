@@ -135,6 +135,57 @@ async function loadLedgerConfig(conn) {
   return { serviceTaxRate: num(tax && tax.rate), minEasyfixerFee: num(fee && fee.param_weightage) };
 }
 
+// job_material.type → how its charge moves the technician share.
+function materialSign(type) {
+  const t = String(type || '').toLowerCase();
+  if (t === 'penalty') return -1;
+  return ['material', 'travel', 'incentive'].includes(t) ? 1 : 0;
+}
+
+// One service line through the rate card, exactly as a completion prices it.
+function rateCardLineShares(l, serviceTaxRate, minEasyfixerFee) {
+  const price = num(l.total_charge);
+  const lineTax = price * serviceTaxRate / 100;
+  return { price, lineTax, s: legacyRateCardShares(price - lineTax, l, minEasyfixerFee) };
+}
+
+/**
+ * The technician share a completion WOULD post for each job — for jobs that
+ * never completed (missed offers, cancellations). Service lines through the
+ * rate card plus job_material rows, signed exactly as computeCompletionAmounts
+ * signs them. Batched: 4 queries for any number of jobs. A job with neither a
+ * priced line nor a material row is absent from the map (unknown, not zero).
+ */
+async function estimateTechnicianShares(conn, jobIds) {
+  const out = new Map();
+  if (!jobIds.length) return out;
+  const { serviceTaxRate, minEasyfixerFee } = await loadLedgerConfig(conn);
+  const [lines] = await conn.query(
+    `SELECT js.job_id, js.total_charge, js.quantity,
+            cs.client_fixed, cs.client_variable,
+            cs.easyfix_direct_fixed, cs.easyfix_direct_variable,
+            cs.overhead_fixed, cs.overhead_variable
+       FROM tbl_job_services js
+       JOIN tbl_client_service cs ON cs.client_service_id = js.service_id
+      WHERE js.job_id IN (?) AND ${ACTIVE_SERVICES_SQL('js')}`,
+    [jobIds],
+  );
+  const [materials] = await conn.query(
+    'SELECT job_id, type, tx_charge FROM job_material WHERE job_id IN (?)',
+    [jobIds],
+  );
+  const add = (jobId, amount) => {
+    const id = Number(jobId);
+    out.set(id, round2((out.get(id) || 0) + amount));
+  };
+  for (const l of lines) {
+    const { s } = rateCardLineShares(l, serviceTaxRate, minEasyfixerFee);
+    add(l.job_id, s.easyfixer * num(l.quantity));
+  }
+  for (const m of materials) add(m.job_id, materialSign(m.type) * num(m.tx_charge));
+  return out;
+}
+
 /**
  * What a completion of this job posts, before any sign is applied.
  * Read-only; `conn` may be the pool or a transaction's connection.
@@ -158,9 +209,7 @@ async function computeCompletionAmounts(conn, jobId) {
     // No rate card: legacy's lookup throws, the catch swallows it, and the line
     // adds nothing — not even its tax. Same here, and it is reported.
     if (l.client_service_id == null) { unpriced.push(l.job_service_id); continue; }
-    const price = num(l.total_charge);
-    const lineTax = price * serviceTaxRate / 100;
-    const s = legacyRateCardShares(price - lineTax, l, minEasyfixerFee);
+    const { price, lineTax, s } = rateCardLineShares(l, serviceTaxRate, minEasyfixerFee);
     const qty = num(l.quantity);
     efr += s.easyfixer * qty; ef += s.easyfix * qty; client += s.client * qty; tax += lineTax;
     priced.push({ job_service_id: l.job_service_id, price, quantity: qty,
@@ -169,8 +218,7 @@ async function computeCompletionAmounts(conn, jobId) {
   const [materials] = await conn.query('SELECT type, tx_charge, client_charge FROM job_material WHERE job_id = ?', [jobId]);
   let tx = 0; let cx = 0;
   for (const m of materials) {
-    const t = String(m.type || '').toLowerCase();
-    const sign = t === 'penalty' ? -1 : (['material', 'travel', 'incentive'].includes(t) ? 1 : 0);
+    const sign = materialSign(m.type);
     tx += sign * num(m.tx_charge); cx += sign * num(m.client_charge);
   }
   return {
@@ -497,6 +545,7 @@ module.exports = {
   legacyRateCardShares,
   ledgerMoves,
   computeCompletionAmounts,
+  estimateTechnicianShares,
   postCompletionLedger,
   releaseLedgerLock,
   inLedgerTransaction,
