@@ -167,7 +167,7 @@ function validatePermissionChoice(rawChoice, file) {
 
 // Same action_taken_reason bucket (action_type = 8, "Reschedule") the old
 // auto-reschedule amendment seeded — see the shrunk migration
-// migrations/2026-09-22-material-approval-auto-schedule.sql.
+// migrations/executed/2026-09-22-material-approval-auto-schedule.sql.
 const VISIT_CHOSEN_REASON = 'Material Approved — Visit Chosen';
 
 async function visitChosenReasonId() {

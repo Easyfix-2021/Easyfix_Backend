@@ -353,7 +353,7 @@ request_id }, schedule_error, permission_error }`.
 
 ### Migration
 
-`migrations/2026-09-22-material-approval-auto-schedule.sql` is SHRUNK to
+`migrations/executed/2026-09-22-material-approval-auto-schedule.sql` is SHRUNK to
 just the reschedule-reason seed (renamed "Material Approved — Visit
 Chosen"), same `action_type = 8` bucket, idempotent insert. The
 `tbl_job_auto_schedule` table and the `needs_scheduling` column exposure are
