@@ -405,7 +405,18 @@ test('the retired view-only share page stays gone; /shared-job is now only the O
     try { return await fn(calls); } finally { gallabox.sendTemplate = original; }
   };
 
+  test('with no template configured the server sends nothing — the app sends the link itself', async () => {
+    delete process.env.JOB_SHARE_WA_TEMPLATE;
+    assert.equal(delegation.shareTemplateName(), null);
+    await withSend(() => ({ delivered: true }), async (calls) => {
+      const out = await delegation.notifyShareRecipient(share, 'https://crm.easyfix.in/public/share/x');
+      assert.equal(out.sent, false);
+      assert.equal(calls.length, 0, 'Gallabox must not be called without an approved template');
+    });
+  });
+
   test('share WhatsApp goes to the delegate number with job-level facts only', async () => {
+    process.env.JOB_SHARE_WA_TEMPLATE = 'job_shared_contact';
     jobRow = {
       job_id: 5001, slot: new Date('2026-09-22T05:00:00Z'),
       service_catg_name: 'AC Repair', locality: 'Sector 18', city_name: 'Noida',
@@ -431,6 +442,7 @@ test('the retired view-only share page stays gone; /shared-job is now only the O
   });
 
   test('share WhatsApp is skipped without a number and never throws on failure', async () => {
+    process.env.JOB_SHARE_WA_TEMPLATE = 'job_shared_contact';
     await withSend(() => ({ delivered: true }), async (calls) => {
       const out = await delegation.notifyShareRecipient({ ...share, delegateNumber: null });
       assert.equal(out.sent, false);
@@ -443,3 +455,20 @@ test('the retired view-only share page stays gone; /shared-job is now only the O
     });
   });
 }
+
+test('only the sharer of a LIVE share can have its link re-issued', async () => {
+  shareRow = { share_id: 77, job_id: 5001, fk_easyfixer_id: 901, delegate_efr_id: null, contact_number: '9876543210', status: 'started' };
+  const share = await delegation.requireSharerLiveShare(5001, 901);
+  assert.equal(share.share_id, 77);
+  await assert.rejects(delegation.requireSharerLiveShare(5001, 902), { status: 404 });
+  shareRow = null;
+  await assert.rejects(delegation.requireSharerLiveShare(5001, 901), { status: 404 });
+  delete process.env.JOB_SHARE_WA_TEMPLATE;
+});
+
+test('the share route returns the link, sends server WhatsApp only when configured, and re-issues for the sharer', () => {
+  const route = readSrc('routes/mobile/job-share.js');
+  assert.match(route, /const data = \{ share, link \};/);
+  assert.match(route, /if \(delegation\.shareTemplateName\(\)\) data\.whatsapp = /);
+  assert.match(route, /router\.post\('\/:id\/share\/link'[\s\S]*requireSharerLiveShare\(jobId, req\.tech\.efr_id\)/);
+});
