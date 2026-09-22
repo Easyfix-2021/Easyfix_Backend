@@ -80,8 +80,9 @@ test('overview separates claimable, pending, withdrawn and lifetime paid-job mon
   assert.equal(result.months.nextCursor, '2026-07');
   assert.deepEqual(result.features, { qc: false, inQa: true, workInProgress: true });
   assert.equal(Object.hasOwn(result.wallet, 'inQc'), false);
-  const offerCall = calls.find((call) => /COUNT\(DISTINCT jo\.job_id\)/.test(call.sql));
-  assert.match(offerCall.sql, /COUNT\(DISTINCT jo\.job_id\)/, 're-offers must not inflate jobs given');
+  const offerCall = calls.find((call) => /AS given_count/.test(call.sql));
+  assert.match(offerCall.sql, /COUNT\(DISTINCT g\.job_id\) AS given_count/, "re-offers must not inflate jobs given");
+  assert.match(offerCall.sql, /j\.job_status IN \(3, 5\)/, "directly assigned completed jobs count as given");
   const paidCall = calls.find((call) => /SUM\(p\.technician_earning\)/.test(call.sql));
   assert.match(paidCall.sql, /LEFT JOIN tbl_job_transaction tjt ON tjt\.fk_job_id = j\.job_id/,
     'technician earnings must use the authoritative job transaction share');
@@ -150,29 +151,41 @@ test('overview withholds claimable-now while finance has a requested payout', as
   assert.equal(result.wallet.pendingWithdrawalAmount, 4250);
 });
 
-test('month jobs include zero-rupee completed work, stay owner scoped and page bounded', async () => {
+test('missed opportunities attribute no expiry when closed_reason is absent', async (t) => {
+  const closedReason = require('../services/offer-closed-reason');
+  t.mock.method(closedReason, 'hasOfferClosedReasonCol', async () => false);
+  const sqls = [];
+  const db = {
+    async query(sql) {
+      sqls.push(sql);
+      return [[]];
+    },
+  };
+  await phe.getMissed(7, { days: 30 }, db);
+  const offerSql = sqls.filter((sql) => /FROM tbl_job_offer jo/.test(sql));
+  assert.equal(offerSql.length, 2);
+  assert.ok(offerSql.every((sql) => /offer_status = 2 OR FALSE/.test(sql) && !/closed_reason/.test(sql)));
+});
+
+test('month jobs list the Given cohort (offered or completed), owner-only facts, page bounded', async () => {
   const calls = [];
+  const base = {
+    title: 'AC service', client_name: 'Hafele', ticket_created_date_time: '2026-08-09 08:00:00',
+    created_date_time: '2026-08-10 09:00:00', paid_at: null, technician_earning: 0,
+    job_rating: null, on_time: 1, same_day: 1, visit_number: 1, is_escalated: 0,
+    age_days: 3, age_secs: 277200, checkin_date_time: '2026-08-12 10:00:00', my_offer_status: null,
+  };
   const db = {
     async query(sql, params) {
       calls.push({ sql, params });
-      if (/ORDER BY j\.checkout_date_time/.test(sql)) return [[{
-        job_id: 88213,
-        title: 'AC service',
-        client_name: 'Hafele',
-        ticket_created_date_time: '2026-08-09 08:00:00',
-        created_date_time: '2026-08-10 09:00:00',
-        checkout_date_time: '2026-08-12 13:00:00',
-        paid_at: '2026-08-13 09:00:00',
-        technician_earning: 450,
-        job_rating: 4.5,
-        on_time: 1,
-        same_day: 1,
-        visit_number: 1,
-        is_escalated: 0,
-        age_days: 3,
-        age_secs: 277200,
-      }]];
-      if (/SELECT COUNT\(\*\) AS total/.test(sql)) return [[{ total: 1 }]];
+      if (/ORDER BY g\.given_at/.test(sql)) return [[
+        { ...base, job_id: 1, fk_easyfixter_id: 7, job_status: 3, checkout_date_time: '2026-08-12 13:00:00',
+          paid_at: '2026-08-13 09:00:00', technician_earning: 450, job_rating: 4.5 },
+        { ...base, job_id: 2, fk_easyfixter_id: 7, job_status: 1, checkin_date_time: null, my_offer_status: 1 },
+        { ...base, job_id: 3, fk_easyfixter_id: 99, job_status: 3, technician_earning: 800, my_offer_status: 3 },
+        { ...base, job_id: 4, fk_easyfixter_id: null, job_status: 0, checkin_date_time: null, my_offer_status: 2 },
+      ]];
+      if (/SELECT COUNT\(\*\) AS total/.test(sql)) return [[{ total: 4 }]];
       throw new Error(`unexpected SQL: ${sql}`);
     },
   };
@@ -180,20 +193,28 @@ test('month jobs include zero-rupee completed work, stay owner scoped and page b
   const result = await phe.getMonthJobs(7, '2026-08', { page: 2, limit: 99 }, db);
   assert.equal(result.limit, 50);
   assert.equal(result.page, 2);
-  assert.equal(result.items[0].amount, 450);
-  assert.equal(result.items[0].bookedAt, '2026-08-09 08:00:00');
-  assert.equal(result.items[0].recordCreatedAt, '2026-08-10 09:00:00');
-  assert.equal(result.items[0].ageDays, 3);
-  assert.equal(result.items[0].onTime, true);
-  assert.equal(result.items[0].visitNumber, 1);
-  assert.equal(result.items[0].isEscalated, false);
-  assert.ok(calls.every((call) => /j\.fk_easyfixter_id = \?/.test(call.sql)));
-  const dataCall = calls.find((call) => /ORDER BY j\.checkout_date_time/.test(call.sql));
-  assert.match(dataCall.sql, /COALESCE\(SUM\(tjt\.efr_charge\), 0\)/,
-    'completed warranty work remains visible even without a job transaction');
-  assert.match(dataCall.sql, /MIN\(et\.transaction_date\)/,
-    'wallet credit remains an optional settlement timestamp only');
-  assert.match(dataCall.sql, /j\.checkout_date_time >= \?/);
+  assert.equal(result.total, 4);
+  const [done, accepted, sibling, declined] = result.items;
+  assert.deepEqual(result.items.map((i) => i.outcome), ['completed', 'accepted', 'missed', 'declined']);
+  assert.equal(done.amount, 450);
+  assert.equal(done.onTime, true);
+  assert.equal(done.visitNumber, 1);
+  assert.equal(done.bookedAt, '2026-08-09 08:00:00');
+  assert.equal(accepted.amount, null, 'an unfinished job must not read as ₹0 earned');
+  assert.equal(accepted.onTime, null, 'no check-in yet is not "late"');
+  assert.equal(sibling.amount, null, "a sibling's earning is not this technician's");
+  assert.equal(sibling.onTime, null, "a sibling's check-in is not reported");
+  assert.equal(sibling.visitNumber, null);
+  assert.equal(declined.amount, null);
+  const dataCall = calls.find((call) => /ORDER BY g\.given_at/.test(call.sql));
+  const countCall = calls.find((call) => /COUNT\(\*\) AS total/.test(call.sql));
+  for (const call of [dataCall, countCall]) {
+    assert.match(call.sql, /jo\.fk_easyfixter_id = \? AND jo\.offered_at >= \?/, 'cohort includes offered jobs');
+    assert.match(call.sql, /j\.job_status IN \(3, 5\)\s+AND j\.checkout_date_time >= \?/, 'cohort includes completed jobs');
+  }
+  assert.deepEqual(countCall.params, [7, '2026-08-01', '2026-09-01', 7, '2026-08-01', '2026-09-01'].map((v, i) => (
+    typeof v === 'string' ? countCall.params[i] : v)));
+  assert.equal(dataCall.params.filter((p) => p === 7).length, 5, 'every branch is technician scoped');
   assert.deepEqual(dataCall.params.slice(-2), [50, 50]);
 });
 
@@ -470,54 +491,89 @@ test('withdrawal history is bounded and exposes only masked destination', async 
   assert.equal(Object.hasOwn(result.items[0], 'bankAccountNumber'), false);
 });
 
-test('missed opportunities use two fixed 30-day windows and label partial amount coverage honestly', async () => {
+test('missed opportunities price unposted jobs from the rate card and label unknowns honestly', async (t) => {
+  const closedReason = require('../services/offer-closed-reason');
+  t.mock.method(closedReason, 'hasOfferClosedReasonCol', async () => true);
   const calls = [];
   const db = {
     async query(sql, params) {
       calls.push({ sql, params });
-      const currentWindow = calls.length <= 2;
       if (/FROM tbl_job_offer jo/.test(sql)) {
-        return [[currentWindow
-          ? {
-            expired_jobs: 6,
-            rejected_jobs: 2,
-            expired_amount: 2400,
-            rejected_amount: 700,
-            expired_known: 5,
-            rejected_known: 2,
-          }
-          : {
-            expired_jobs: 8,
-            rejected_jobs: 1,
-            expired_amount: 5800,
-            rejected_amount: 1000,
-            expired_known: 8,
-            rejected_known: 1,
-          }]];
+        const isCurrent = calls.filter((c) => /FROM tbl_job_offer jo/.test(c.sql)).length === 1;
+        return [isCurrent
+          ? [
+            { job_id: 101, offer_status: 3, posted_amount: 400, posted: 1 },   // done by someone else
+            { job_id: 102, offer_status: 3, posted_amount: null, posted: 0 },  // estimate 450
+            { job_id: 103, offer_status: 3, posted_amount: null, posted: 0 },  // no service lines → unknown
+            { job_id: 106, offer_status: 3, posted_amount: null, posted: 0 },  // materials only: +200 −50
+            { job_id: 104, offer_status: 2, posted_amount: null, posted: 0 },  // estimate 300
+          ]
+          : [{ job_id: 201, offer_status: 2, posted_amount: 1000, posted: 1 }]];
       }
       if (/j\.job_status = 6/.test(sql)) {
-        return [[currentWindow
-          ? { cancelled_jobs: 3, cancelled_amount: 1100, cancelled_known: 3 }
-          : { cancelled_jobs: 2, cancelled_amount: 900, cancelled_known: 2 }]];
+        const isCurrent = calls.filter((c) => /j\.job_status = 6/.test(c.sql)).length === 1;
+        return [isCurrent ? [{ job_id: 105, posted_amount: null, posted: 0 }] : []];
+      }
+      if (/tbl_tax_rate/.test(sql)) return [[{ rate: 0 }]];
+      if (/rating_parameters_weightage/.test(sql)) return [[{ param_weightage: 0 }]];
+      if (/FROM tbl_job_services js/.test(sql)) {
+        const all = [
+          { job_id: 102, total_charge: 450, quantity: 1 },
+          { job_id: 104, total_charge: 150, quantity: 2 },
+          { job_id: 105, total_charge: 250, quantity: 1 },
+        ];
+        return [all.filter((l) => params[0].includes(l.job_id))];
+      }
+      if (/FROM job_material/.test(sql)) {
+        const all = [
+          { job_id: 102, type: 'Material', tx_charge: 100 },
+          { job_id: 106, type: 'travel', tx_charge: 200 },
+          { job_id: 106, type: 'Penalty', tx_charge: 50 },
+          { job_id: 104, type: 'unknown', tx_charge: 999 },
+        ];
+        return [all.filter((m) => params[0].includes(m.job_id))];
       }
       throw new Error(`unexpected SQL: ${sql}`);
     },
   };
 
   const result = await phe.getMissed(7, { days: 30 }, db);
-  assert.equal(calls.length, 4, 'current and comparison windows stay a fixed four queries');
-  assert.ok(calls.every((call) => call.params[0] === 7));
-  assert.ok(calls.every((call) => call.params.length === 3));
-  assert.equal(result.period.days, 30);
-  assert.equal(result.summary.knownPotentialAmount, 4200);
+  const byKey = Object.fromEntries(result.categories.map((c) => [c.key, c]));
+  assert.deepEqual(result.categories.map((item) => item.key), ['expired', 'rejected', 'cancelledAfterAssignment']);
+  assert.equal(byKey.expired.jobs, 4);
+  assert.equal(byKey.expired.knownAmount, 1100,
+    'posted 400 + (450 service + 100 material) + (200 travel − 50 penalty); the unpriced job adds nothing');
+  assert.equal(byKey.expired.amountCoverageComplete, false);
+  assert.equal(byKey.rejected.knownAmount, 300, 'estimate multiplies by quantity');
+  assert.equal(byKey.rejected.amountCoverageComplete, true);
+  assert.equal(byKey.cancelledAfterAssignment.knownAmount, 250);
+  assert.equal(result.summary.knownPotentialAmount, 1650, 'an unknown material type moves nothing');
   assert.equal(result.summary.amountCoverageComplete, false);
-  assert.equal(result.previousPeriod.knownPotentialAmount, 7700);
+  assert.equal(result.previousPeriod.knownPotentialAmount, 1000);
   assert.equal(result.previousPeriod.amountCoverageComplete, true);
-  const missedOfferCalls = calls.filter((call) => /FROM tbl_job_offer jo/.test(call.sql));
-  assert.ok(missedOfferCalls.every((call) => /MAX\(job_offer_id\)/.test(call.sql)),
-    're-offers in a window must collapse to the latest outcome per job');
-  assert.deepEqual(result.categories.map((item) => item.key), [
-    'expired', 'rejected', 'cancelledAfterAssignment',
-  ]);
+  const offerCalls = calls.filter((call) => /FROM tbl_job_offer jo/.test(call.sql));
+  assert.ok(offerCalls.every((call) => call.params[0] === 7 && call.params.length === 3));
+  assert.ok(offerCalls.every((call) => /offer_status = 3 AND jo\.closed_reason = 'ttl_elapsed'/.test(call.sql)),
+    'only a real timeout counts as expired — sibling-accepted, re-offered etc. are not the technician\'s miss');
+  assert.ok(offerCalls.every((call) => /MAX\(job_offer_id\)[\s\S]*\)\s*latest[\s\S]*WHERE \(jo\.offer_status = 2 OR/.test(call.sql)),
+    'status filter must apply AFTER picking the latest offer, so an accepted re-offer is not a miss');
   assert.equal(Object.hasOwn(result.summary, 'acceptedThenGivenAway'), false);
+  const cancelCalls = calls.filter((call) => /j\.job_status = 6/.test(call.sql));
+  assert.ok(cancelCalls.every((call) => /JOIN action_taken_reason atr\s+ON atr\.id = j\.cancel_reason_id\s+AND atr\.action_type = 1\s+AND atr\.user_type = 4/.test(call.sql)),
+    'only cancellations ops attributed to the technician count');
+});
+
+test('missed comparison stays hidden until the previous window postdates closed_reason', async (t) => {
+  const closedReason = require('../services/offer-closed-reason');
+  t.mock.method(closedReason, 'hasOfferClosedReasonCol', async () => true);
+  const db = { async query() { return [[]]; } };
+  // 2026-09-22 IST: previous window starts 2026-07-24 — before the column.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-09-22T06:00:00Z') });
+  assert.equal((await phe.getMissed(7, { days: 30 }, db)).previousPeriod.comparable, false);
+  // The window includes today, so on 2026-11-08 IST the previous window starts
+  // exactly 2026-09-10 — the first fully attributed day (boundary inclusive).
+  t.mock.timers.setTime(new Date('2026-11-08T06:00:00Z').getTime());
+  assert.equal((await phe.getMissed(7, { days: 30 }, db)).previousPeriod.comparable, true);
+  t.mock.timers.setTime(new Date('2026-11-07T06:00:00Z').getTime());
+  assert.equal((await phe.getMissed(7, { days: 30 }, db)).previousPeriod.comparable, false);
 });
