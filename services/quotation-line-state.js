@@ -26,6 +26,14 @@
  * silently disagree about what "review_pending" means. tests/quotation-line-
  * state.test.js's guard test fails the build if a second copy of the state
  * labels turns up anywhere else in services/ or routes/.
+ *
+ * AMENDMENT (owner decision, 2026-09-22): a QUOTATION is the set of lines
+ * stamped by one send-for-approval — they share an exact `sent_on`; drafts
+ * (`sent_on IS NULL`) are the NEXT quotation being built. Once sent, a line
+ * is immutable to the technician — TECH_EDITABLE_STATES below now covers
+ * only `draft` (previously draft + review_pending). See `nextSentOn` (the
+ * strictly-later stamp that keeps two sends from merging into one
+ * quotation) and `quotationNumbers` (1..n display numbering) below.
  */
 
 const STATE = {
@@ -45,9 +53,15 @@ const OPEN_STATES = [STATE.DRAFT, STATE.REVIEW_PENDING, STATE.APPROVAL_PENDING];
 
 // The states a technician may still write to (add a line as a sibling of, or
 // delete). Deliberately NOT the same list as OPEN_STATES: approval_pending
-// (client already has it) is open for COUNTING purposes but locked for tech
+// AND review_pending are open for COUNTING purposes but locked for tech
 // WRITES — see assertTechLineEditable below.
-const TECH_EDITABLE_STATES = [STATE.DRAFT, STATE.REVIEW_PENDING];
+//
+// OWNER DECISION (2026-09-22): "once Tx clicks Send for Approval he won't be
+// able to edit the quotation — Save is for drafts. Additional material after
+// sending = a NEW quotation." Before this, review_pending (sent, not yet
+// reviewed) was still tech-editable; it no longer is — draft is the only
+// state a technician may touch.
+const TECH_EDITABLE_STATES = [STATE.DRAFT];
 
 /*
  * The raw SQL boolean for one state, over the given table alias. Every other
@@ -126,6 +140,44 @@ function isTechEditable(state) {
   return TECH_EDITABLE_STATES.includes(state);
 }
 
+/*
+ * The single timestamp stamped onto every draft by ONE send-for-approval
+ * (owner decision, 2026-09-22 amendment): "A QUOTATION = the lines stamped
+ * by one send — they share an exact sent_on." Must be STRICTLY later than
+ * any sent_on already on the job, so two sends can never land in the same
+ * second and merge into one quotation. quotation_details.sent_on is a
+ * DATETIME — second precision, no fractional seconds — so the comparison is
+ * done at whole-second granularity: max(now, lastSentOn + 1s).
+ */
+function truncToSecond(date) {
+  return Math.floor(new Date(date).getTime() / 1000) * 1000;
+}
+
+function nextSentOn(now, lastSentOn) {
+  if (!lastSentOn) return now;
+  const bumpedMs = truncToSecond(lastSentOn) + 1000;
+  return new Date(Math.max(now.getTime(), bumpedMs));
+}
+
+/*
+ * Quotation numbering (owner decision, 2026-09-22 amendment): 1..n by
+ * ascending distinct sent_on within the job; null for a draft (sent_on
+ * NULL — not part of a quotation yet). Takes the raw sent_on values in
+ * whatever row order the caller has, returns the numbers in the SAME order,
+ * so a caller just zips them back onto its rows/items.
+ *
+ * ponytail: legacy pre-v2 rows each carry their OWN insert-time sent_on
+ * (the old single-add path always stamped sent_on immediately), so each
+ * shows as its own quotation — acceptable, display-only, no migration.
+ */
+function quotationNumbers(sentOnValues) {
+  const distinctTimes = [...new Set(
+    sentOnValues.filter((v) => v != null).map((v) => new Date(v).getTime()),
+  )].sort((a, b) => a - b);
+  const numberByTime = new Map(distinctTimes.map((t, i) => [t, i + 1]));
+  return sentOnValues.map((v) => (v == null ? null : numberByTime.get(new Date(v).getTime())));
+}
+
 module.exports = {
   STATE,
   OPEN_STATES,
@@ -136,4 +188,6 @@ module.exports = {
   openLineSql,
   quotationLineState,
   isTechEditable,
+  nextSentOn,
+  quotationNumbers,
 };

@@ -61,7 +61,7 @@ const { resolveMaterialPrice } = require('./material-price-resolver');
 // job.service.js, so requiring them here carries none of the circular-import
 // risk the STATUS constants below were duplicated to avoid.
 const quotationLineState = require('./quotation-line-state');
-const { getPreMaterialStatus, storePreMaterialStatus } = require('./material-review-store');
+const { storePreMaterialStatus } = require('./material-review-store');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
@@ -80,65 +80,60 @@ const MATERIAL_SUB_STATUS_QUOTATION_PENDING = 1;
 const MATERIAL_SUB_STATUS_REVIEW_PENDING = 2;
 
 /*
- * Material Request Flow v2 (2026-09-21) — job-status LOCK for every
- * technician quotation WRITE (add / bulk-add / delete / bulk-delete /
- * send-for-approval). See the design's "Locks":
- *   - at 15 (client approval pending), every technician write is refused —
- *     the client has the quote now.
- *   - anywhere else outside {1 SCHEDULED, 2/20 IN_PROGRESS, 16 PENDING_FOR_
- *     MATERIAL}, there is no defined transition for a technician to write
- *     into, so it is refused too (closed allowlist, not an open denylist —
- *     the safe direction when a status this backend gains later should be
- *     refused until someone decides it belongs here).
+ * Job-status LOCK for a technician quotation WRITE (add / bulk-add / delete /
+ * bulk-delete). See the design's "Locks", amended 2026-09-22 (owner
+ * decision): drafting the NEXT quotation is now allowed at 15 too — only
+ * SEND is blocked there (assertTechCanSendForApproval below). Anywhere
+ * outside {1 SCHEDULED, 2/20 IN_PROGRESS, 16 PENDING_FOR_MATERIAL, 15
+ * ESTIMATE_PENDING_APPROVAL}, there is no defined transition for a
+ * technician to write into, so it is refused (closed allowlist, not an open
+ * denylist — the safe direction when a status this backend gains later
+ * should be refused until someone decides it belongs here).
  */
 const TECH_QUOTATION_WRITE_STATUSES = new Set([
   STATUS_SCHEDULED, STATUS_IN_PROGRESS, STATUS_IN_PROGRESS_ALT, STATUS_PENDING_FOR_MATERIAL,
+  STATUS_ESTIMATE_PENDING_APPROVAL,
 ]);
 
 function assertTechCanWriteQuotation(jobStatus) {
   const s = Number(jobStatus);
-  if (s === STATUS_ESTIMATE_PENDING_APPROVAL) {
-    const e = new Error('Waiting for client approval'); e.status = 409; throw e;
-  }
   if (!TECH_QUOTATION_WRITE_STATUSES.has(s)) {
     const e = new Error('This material is locked'); e.status = 409; throw e;
   }
 }
 
+// The one write send-for-approval alone forbids at 15: the client already
+// has a quotation out; the technician may keep drafting the next one (Save)
+// but may not send it until the client decides on the one they're looking
+// at. Exact contract message (owner decision, 2026-09-22).
+const SEND_BLOCKED_AT_ESTIMATE_PENDING_MESSAGE =
+  'Your previous quotation is with the client — send this one after they decide';
+
+function assertTechCanSendForApproval(jobStatus) {
+  const s = Number(jobStatus);
+  if (s === STATUS_ESTIMATE_PENDING_APPROVAL) {
+    const e = new Error(SEND_BLOCKED_AT_ESTIMATE_PENDING_MESSAGE); e.status = 409; throw e;
+  }
+  assertTechCanWriteQuotation(s);
+}
+
 /*
- * Per-LINE lock — a technician may only touch a line in `draft` or
- * `review_pending` (quotationLineState.TECH_EDITABLE_STATES); every other
- * state (approval_pending, rejected, client_approved, client_rejected) is
- * locked to the technician even when the JOB-level check above passes (e.g.
- * an old rejected line sitting on a job back at 2/20).
+ * Per-LINE lock — a technician may only touch a `draft` line
+ * (quotationLineState.TECH_EDITABLE_STATES); every other state
+ * (review_pending, approval_pending, rejected, client_approved,
+ * client_rejected) is locked to the technician even when the JOB-level check
+ * above passes. OWNER DECISION (2026-09-22): once a line has been sent
+ * (review_pending) it is as locked as an already-decided one — "Save" is for
+ * drafts; anything more once sent is a NEW quotation, not an edit of this
+ * one. This also means the technician can no longer delete the job's last
+ * non-draft line, so the old "revert job to pre-status" transition that used
+ * to fire on that delete is unreachable and has been removed (CRM Reject
+ * Request still reverts to pre-status, unchanged).
  */
 function assertTechLineEditable(state) {
   if (!quotationLineState.isTechEditable(state)) {
     const e = new Error('This material is locked'); e.status = 409; throw e;
   }
-}
-
-/*
- * "Tech deletes the last non-draft (review_pending) line at 16 → job returns
- * to its pre-status; material_sub_status cleared." Re-checks the LIVE count
- * after the delete (rather than trusting what the caller just removed), so a
- * single-line delete and a bulk delete-all share one, always-correct rule:
- * only revert when NO review_pending line remains for the job.
- */
-async function maybeRevertFromPendingMaterial(jobId, efrId) {
-  const [[cnt]] = await pool.query(
-    `SELECT COUNT(*) AS n FROM quotation_details
-      WHERE job_id = ? AND (${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.REVIEW_PENDING)})`,
-    [jobId],
-  );
-  if (Number(cnt.n) > 0) return false;
-  const preStatus = await getPreMaterialStatus(jobId);
-  await pool.query(
-    `UPDATE tbl_job SET job_status = ?, material_sub_status = NULL, last_update_time = ?
-      WHERE job_id = ? AND fk_easyfixter_id = ?`,
-    [preStatus, new Date(), jobId, efrId],
-  );
-  return true;
 }
 
 // S3 key convention for job-supporting images:
@@ -521,11 +516,14 @@ async function addQuotationLines(jobId, efrId, lines) {
  * line by guessing an id. Returns { deleted: true }; throws 404 if the
  * line doesn't exist or isn't this tech's.
  *
- * Material Request Flow v2 (2026-09-21) adds two lock checks — the job-level
- * one (15 -> "Waiting for client approval"; anything else outside
- * {1,2,20,16} -> "This material is locked") and a per-LINE one (only
- * draft/review_pending are technician-editable) — plus the "deletes the last
- * review_pending line at 16" revert-to-pre-status transition.
+ * Two lock checks: the job-level one (anything outside
+ * {1,2,20,16,15} -> "This material is locked") and a per-LINE one — only
+ * `draft` is technician-editable (owner decision, 2026-09-22 — see
+ * assertTechLineEditable above). Because a technician can therefore never
+ * delete a sent (review_pending) line any more, the old "deletes the last
+ * review_pending line at 16 -> revert to pre-status" transition is
+ * unreachable from here and has been removed; CRM Reject Request still
+ * reverts to pre-status exactly as before.
  */
 async function deleteQuotationLine(jobId, efrId, lineId) {
   logger.info('Delete quotation line · jobId=' + jobId + ' · lineId=' + lineId);
@@ -550,22 +548,15 @@ async function deleteQuotationLine(jobId, efrId, lineId) {
 
   await pool.query('DELETE FROM quotation_details WHERE id = ? AND job_id = ?', [lineId, jobId]);
   logger.info('Quotation line deleted · id=' + lineId + ' · jobId=' + jobId);
-
-  let reverted = false;
-  if (Number(job.job_status) === STATUS_PENDING_FOR_MATERIAL) {
-    reverted = await maybeRevertFromPendingMaterial(jobId, efrId);
-    if (reverted) logger.info('Job reverted to pre-material status after last review_pending line deleted · jobId=' + jobId);
-  }
   return { deleted: true };
 }
 
 /*
- * NEW — DELETE /:id/quotation. Deletes every technician-editable line
- * (draft + review_pending) in one statement — the app's "Delete All". Locked
- * / client-approved / rejected lines are left untouched (not in the SQL's
- * state predicate at all), same as a single delete would refuse them one by
- * one. Applies the same "last review_pending line" revert as the single
- * delete. Returns { deleted: n }.
+ * NEW — DELETE /:id/quotation. Deletes every technician-editable line — now
+ * `draft` only (owner decision, 2026-09-22) — in one statement — the app's
+ * "Delete All". Sent (review_pending) / locked / client-approved / rejected
+ * lines are left untouched (not in the SQL's state predicate at all), same
+ * as a single delete would refuse them one by one. Returns { deleted: n }.
  */
 async function deleteAllQuotationLines(jobId, efrId) {
   logger.info('Delete all technician-editable quotation lines · jobId=' + jobId);
@@ -580,10 +571,6 @@ async function deleteAllQuotationLines(jobId, efrId) {
     [jobId],
   );
   logger.info('Deleted ' + result.affectedRows + ' technician-editable quotation lines · jobId=' + jobId);
-
-  if (Number(job.job_status) === STATUS_PENDING_FOR_MATERIAL) {
-    await maybeRevertFromPendingMaterial(jobId, efrId);
-  }
   return { deleted: result.affectedRows };
 }
 
@@ -610,8 +597,12 @@ async function listQuotationLines(jobId, efrId) {
       ORDER BY id DESC`,
     [jobId],
   );
+  // quotationNo (owner decision, 2026-09-22): 1..n by ascending distinct
+  // sent_on within the job; null for a draft. One shared JS helper — see
+  // quotation-line-state.js's quotationNumbers.
+  const quotationNos = quotationLineState.quotationNumbers(rows.map((r) => r.sent_on));
   return {
-    items: rows.map((r) => ({
+    items: rows.map((r, i) => ({
       lineId: r.id,
       type: r.type,
       name: r.name,
@@ -624,6 +615,7 @@ async function listQuotationLines(jobId, efrId) {
       sentOn: r.sent_on,
       actionOn: r.action_on,
       state: r.state,
+      quotationNo: quotationNos[i],
     })),
   };
 }
@@ -652,9 +644,18 @@ async function listQuotationLines(jobId, efrId) {
  *     materials before sending for approval". Nothing is written.
  *   - allowed from 1/2/20/16 (job-level lock — see assertTechCanWriteQuotation);
  *     16 stays 16; 1/2/20 move to 16 and the job's PRE-status is stored
- *     (services/material-review-store.js) so a later delete-last-line or a
- *     CRM Reject Request can put it back. 15 -> 409 "Waiting for client
- *     approval" (via the same job-level lock).
+ *     (services/material-review-store.js) so a later CRM Reject Request can
+ *     put it back.
+ *
+ * AMENDMENT (owner decision, 2026-09-22): send is now ALSO allowed to be
+ * ATTEMPTED at 15 job-status-wise (drafting the next quotation is allowed
+ * there), but is refused with its own message —
+ * assertTechCanSendForApproval, not assertTechCanWriteQuotation — because a
+ * quotation is already with the client. The stamp itself is now the
+ * strictly-later timestamp quotationLineState.nextSentOn computes against
+ * the job's MAX(sent_on): "a QUOTATION = the lines stamped by one send, with
+ * one exact sent_on" only holds if two sends can never land in the same
+ * second.
  *
  * `checkInImageRefs` (optional) — if the app passes check-in image S3 keys
  * alongside the send, we record them as Booking-stage refs so the estimate
@@ -667,7 +668,7 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs, lines } = {}) {
   const job = await jobForTech(jobId, efrId);
   if (!job) logger.warn('Send for approval failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
-  assertTechCanWriteQuotation(job.job_status);
+  assertTechCanSendForApproval(job.job_status);
 
   const conn = await pool.getConnection();
   try {
@@ -694,10 +695,20 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs, lines } = {}) {
       const e = new Error('Add materials before sending for approval'); e.status = 422; throw e;
     }
 
+    // One-timestamp-per-send, strictly later than any sent_on already on the
+    // job (owner decision, 2026-09-22 — see quotation-line-state.js's
+    // nextSentOn header comment). The FOR UPDATE lock above already
+    // serializes concurrent sends on this job, so this plain read is safe.
+    const [[maxRow]] = await conn.query(
+      'SELECT MAX(sent_on) AS maxSentOn FROM quotation_details WHERE job_id = ?',
+      [jobId],
+    );
+    const sentOn = quotationLineState.nextSentOn(now, maxRow.maxSentOn);
+
     await conn.query(
       `UPDATE quotation_details SET sent_on = ?
         WHERE job_id = ? AND (${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.DRAFT)})`,
-      [now, jobId],
+      [sentOn, jobId],
     );
 
     // Store the pre-status only on the FIRST entry into the material flow —
@@ -750,7 +761,8 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs, lines } = {}) {
  * merged into ONE action (sendForApproval). This endpoint is kept only so
  * older app builds that still call it keep working: it is now a literal
  * alias, with sendForApproval's own rules (a job with no draft line -> 422;
- * only reachable from 1/2/20/16; 15 -> 409). Positive behaviour change
+ * reachable from 1/2/20/16; 15 -> 409 "Your previous quotation is with the
+ * client — send this one after they decide"). Positive behaviour change
  * older builds must tolerate: previously a bare 2/20 job with NO lines could
  * be marked material-required; now it 422s ("Add materials before sending
  * for approval") because there is nothing to send.
