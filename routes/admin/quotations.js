@@ -69,6 +69,11 @@ router.get('/', async (req, res, next) => {
         ORDER BY id DESC`,
       [jobId]
     );
+    // quotation_no (owner decision, 2026-09-22): 1..n by ascending distinct
+    // sent_on within the job; null for a draft. Same shared helper the
+    // mobile quotation list uses — see services/quotation-line-state.js.
+    const quotationNos = quotationLineState.quotationNumbers(rows.map((r) => r.sent_on));
+    rows.forEach((r, i) => { r.quotation_no = quotationNos[i]; });
     logger.info('Found ' + rows.length + ' quotations');
     modernOk(res, rows);
   } catch (e) { logger.error('List quotations failed · ' + e.message); next(e); }

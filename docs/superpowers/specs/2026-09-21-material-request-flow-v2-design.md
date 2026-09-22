@@ -6,6 +6,17 @@ Supersedes the sub-status-1 ("Quotation Pending") parts of
 `2026-09-18-pending-for-material-status-16-design.md`.
 Repos: `EasyFix_Backend`, `Easyfix_CRM_UI`, `Easyfix_Technician_Mobile_Application`
 
+**Amendment, 2026-09-22** (owner decision — "once Tx clicks Send for
+Approval he won't be able to edit the quotation — we provide Save for
+drafts. Additional material after sending = a NEW quotation."): once sent, a
+line is locked to the technician (`review_pending` is no longer
+tech-editable); drafting is now allowed at 15 too, but sending is not; a
+send stamps one strictly-later `sent_on` shared by the whole quotation; both
+quotation lists gain a display-only `quotationNo`/`quotation_no`. See
+"Locks", "Transitions" and "API contract" below (backend only — this
+repo's `EasyFix_Backend`; the CRM/app UI-facing parts of this amendment are
+tracked separately).
+
 ## Owner requirements (2026-09-21, verbatim intent)
 
 1. A job shows in Pending for Material as soon as the technician raises the
@@ -73,23 +84,48 @@ pre-status" below means that value, defaulting to 2.
 
 ## Locks
 
-- **Technician** may add / edit / delete lines in `draft` or `review_pending`,
-  on a job in 1, 2, 20 or 16. At 15 every technician write → 409
-  `"Waiting for client approval"`. Lines in any other state → 409
-  `"This material is locked"`.
+**AMENDED 2026-09-22** (owner decision — "once Tx clicks Send for Approval
+he won't be able to edit the quotation — we provide Save for drafts.
+Additional material after sending = a NEW quotation."):
+
+- A QUOTATION is the set of lines stamped by ONE send — they share an exact
+  `sent_on`. Drafts (`sent_on IS NULL`) are the NEXT quotation being built.
+  No migration: this is a re-reading of columns that already exist.
+- **Technician** may add / edit / delete lines ONLY in `draft` state — never
+  `review_pending` any more — on a job in 1, 2, 20, 16 **or 15**. 15 is new:
+  drafting the next quotation is allowed while the current one sits with the
+  client. Lines in any other state (`review_pending` included) → 409
+  `"This material is locked"`. Delete-all deletes only drafts.
+  Send-for-approval is the ONE write still refused at 15, with its own
+  message: 409 `"Your previous quotation is with the client — send this one
+  after they decide"`. Because a technician can never delete a sent line any
+  more, the old "deletes the last non-draft line at 16 → revert to
+  pre-status" transition is unreachable and has been removed (its dead code
+  and tests too) — CRM Reject Request still reverts to pre-status, unchanged.
+- `sendForApproval` stamps every current draft with ONE timestamp, strictly
+  later than any `sent_on` already on the job —
+  `max(now, lastSentOn + 1s)`, since `quotation_details.sent_on` is a
+  second-precision DATETIME — so two sends can never collide onto the same
+  stamp and merge into one quotation (`services/quotation-line-state.js`'s
+  `nextSentOn`).
 - **CRM** may add lines while the job is 1, 2, 20, 16 or 15 (not closed /
-  cancelled). A CRM-added line is born reviewed: `sent_on = action_on = now`,
-  `status = 1`, `approved_charge` = the entered amount.
+  cancelled) — UNCHANGED. A CRM-added line is born reviewed:
+  `sent_on = action_on = now`, `status = 1`, `approved_charge` = the entered
+  amount.
 - **Client-approved** lines are locked everywhere.
 
 ## Transitions
 
+**AMENDED 2026-09-22**: `tech send-for-approval` from 15 is now reachable
+(job-status-wise) — it 409s on its own dedicated check, not the generic
+job-level write lock, and with its own message. The `tech deletes last
+non-draft line` row below is REMOVED (unreachable — see "Locks").
+
 | trigger | from | effect |
 |---|---|---|
-| tech send-for-approval | 1/2/20 (≥1 draft) | drafts → sent; job → 16 / sub 2; store pre-status |
+| tech send-for-approval | 1/2/20 (≥1 draft) | drafts → sent (one shared, strictly-later timestamp); job → 16 / sub 2; store pre-status |
 | tech send-for-approval | 16 (≥1 draft) | drafts → sent; job stays 16 |
-| tech send-for-approval | 15 | 409 |
-| tech deletes last non-draft line | 16 | job → pre-status; `material_sub_status` NULL |
+| tech send-for-approval | 15 | 409 `"Your previous quotation is with the client — send this one after they decide"` |
 | CRM review "Send Request to Client" | 16 | unchanged (→ 15 + email), BUT every `review_pending` line must be in the payload, else **409** `"New materials were added — reload and review again"` |
 | CRM "Reject Request" | 16 | all `review_pending` lines → rejected; job → pre-status; reason stored (`material_reject_reason`) |
 | CRM add line | 16 | line born reviewed; job stays 16 |
@@ -107,30 +143,45 @@ pre-status" below means that value, defaulting to 2.
 ### Mobile (`routes/mobile/jobs-estimate.js`, technician-scoped)
 
 - `GET  /mobile/jobs/:id/quotation` (existing list, whatever its current path
-  is) — each line gains `state` (table above).
+  is) — each line gains `state` (table above) and, **AMENDED 2026-09-22**,
+  `quotationNo` — 1..n by ascending distinct `sent_on` within the job, `null`
+  for a draft (computed by `services/quotation-line-state.js`'s
+  `quotationNumbers`, in JS, not a SQL window function). `ponytail:` legacy
+  pre-v2 rows each carry their own insert-time `sent_on`, so each shows as
+  its own quotation — acceptable, display-only.
 - `POST /mobile/jobs/:id/quotation` (existing single add) — now inserts a
-  **draft** (`sent_on NULL`). Lock rules apply.
+  **draft** (`sent_on NULL`). Lock rules apply — **AMENDED 2026-09-22**:
+  allowed at 15 too (drafting the next quotation).
 - **NEW** `POST /mobile/jobs/:id/quotation/draft`
   `{ lines: [{ type, itemId?, materialId?, brandId?, name?, quantity, amount }] }`
   (1..50, same line shape and validation as the single add) → `{ lineIds }`,
-  one transaction.
+  one transaction. Also allowed at 15.
 - **NEW** `DELETE /mobile/jobs/:id/quotation` → deletes every technician-editable
-  line (`draft` + `review_pending`) → `{ deleted: n }`; applies the
-  "last non-draft line" transition.
-- `DELETE|POST /mobile/jobs/:id/quotation/:lineId` (existing) — lock rules +
-  the "last non-draft line" transition.
+  line — **AMENDED 2026-09-22**: `draft` ONLY, not `review_pending` — →
+  `{ deleted: n }`. The old "last non-draft line" revert transition no longer
+  applies (removed — see "Locks").
+- `DELETE|POST /mobile/jobs/:id/quotation/:lineId` (existing) — lock rules;
+  **AMENDED 2026-09-22**: only a `draft` line may be touched — a
+  `review_pending` line now 409s `"This material is locked"` exactly like any
+  other sent state, so the "last non-draft line" revert transition is
+  unreachable here too.
 - `POST /mobile/jobs/:id/send-for-approval` `{ checkInImageRefs?, lines? }` —
   `lines` (same shape as draft) are inserted as drafts in the SAME transaction
   first; then transitions above. No drafts at all → 422
-  `"Add materials before sending for approval"`.
+  `"Add materials before sending for approval"`. **AMENDED 2026-09-22**: at
+  15 → 409 `"Your previous quotation is with the client — send this one
+  after they decide"` (its own check, distinct from the generic job-level
+  write lock, which now allows 15 for every OTHER write).
 - `POST /mobile/jobs/:id/material-required` — kept for older builds as an alias
-  of send-for-approval.
+  of send-for-approval (inherits its 15 message unchanged).
 - Mobile job list + `GET /mobile/jobs/:id` gain `material_state` and
   `material_count` (one aggregated subquery, no N+1).
 
 ### Admin
 
-- `GET /admin/quotations?jobId=` — each row gains `state`.
+- `GET /admin/quotations?jobId=` — each row gains `state` and, **AMENDED
+  2026-09-22**, `quotation_no` (same `quotationNumbers` helper as the mobile
+  list above — one shared implementation, not a second copy).
 - `PATCH /admin/quotations/:id/approve|reject` — only on `review_pending`
   lines, else 409.
 - `POST /admin/jobs/:id/material-review` — "pending" now also requires
