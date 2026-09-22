@@ -448,6 +448,9 @@ router.get('/jobs', async (req, res, next) => {
       // filter is also the CRM export's technician filter, which must keep
       // meaning "assigned to".
       delegatedToEfrId: req.tech.efr_id,
+      // "Waiting for Me": the app sends actionRequired=true with status=2.
+      // It used to be ignored, so the chip listed EVERY status-2 job.
+      sendBackToTx: req.query.actionRequired === 'true',
       status: req.query.status != null ? Number(req.query.status) : undefined,
       // No status = his WORK IN HAND, not every job he ever had. NOT the
       // dashboard's (1, 2, 20): that is a counter, and this is the app's only
