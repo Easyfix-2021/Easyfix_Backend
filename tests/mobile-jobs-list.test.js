@@ -35,6 +35,7 @@ const DELEGATION_COLUMNS = ['delegate_efr_id', 'contact_name', 'contact_number',
 // 'present' | 'absent' | [the columns a HALF-applied migration left behind]
 let schema = 'present';
 let fault = null;         // a NON-absent error code for tbl_job_share_link reads
+let sendBackColumn = true; // does tbl_job.send_back_to_tx exist (INFORMATION_SCHEMA probe)
 
 const PROBE = /FROM tbl_job_share_link LIMIT 1/i;
 const sqlError = (code, errno, message) => Object.assign(new Error(message), { code, errno });
@@ -70,6 +71,7 @@ const fake = installFakePool([
     if (named) throw sqlError('ER_BAD_FIELD_ERROR', 1054, `Unknown column '${named}' in 'field list'`);
     return /SELECT COUNT\(\*\) AS total/i.test(sql) ? [{ total: 0 }] : [];
   }],
+  [/COLUMN_NAME\s*=\s*'send_back_to_tx'/i, () => (sendBackColumn ? [{ 1: 1 }] : [])],
   [/SELECT COUNT\(\*\) AS total/i, () => [{ total: 0 }]],
 ]);
 
@@ -295,4 +297,30 @@ test('an explicit status behaves exactly as before: `= ?`, and no IN', async () 
       assert.equal(call.params[0], status);
     }
   }
+});
+
+/* ─── 4. Waiting for Me: actionRequired=true → send_back_to_tx = 1 ───── */
+
+test('actionRequired=true narrows rows AND total to sent-back jobs; without it, no such clause', async () => {
+  const { data, count } = await getJobs('?status=2&actionRequired=true&limit=20');
+  for (const [name, call] of [['data', data], ['COUNT', count]]) {
+    assert.match(call.sql, /j\.send_back_to_tx = 1/, `${name}: the dashboard's actionRequired predicate`);
+    assert.match(call.sql, /j\.job_status = \?/, `${name}: still status 2`);
+    assert.ok(bindsExactly(call.sql, call.params), `${name}: no placeholder added or dropped`);
+  }
+  for (const qs of ['?status=2&limit=20', '?status=2&actionRequired=false']) {
+    const plain = await getJobs(qs);
+    assert.doesNotMatch(plain.data.sql, /send_back_to_tx/, `${qs}: every status-2 job, as before`);
+  }
+});
+
+test('actionRequired with the column ABSENT → an empty list, never a 500', async () => {
+  sendBackColumn = false;
+  try {
+    await freshList()({ easyfixerId: 7, status: 2, sendBackToTx: true, limit: 20, offset: 0 });
+    const probed = fake.calls.some((c) => /COLUMN_NAME\s*=\s*'send_back_to_tx'/i.test(c.sql));
+    assert.ok(probed, 'the probe must have run — else "absent" was never measured');
+    assert.match(dataCall().sql, /1 = 0/, 'nothing can have been sent back');
+    assert.doesNotMatch(dataCall().sql, /send_back_to_tx/, 'the missing column is never named');
+  } finally { sendBackColumn = true; }
 });
