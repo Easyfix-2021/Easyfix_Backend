@@ -63,7 +63,9 @@ function loadWith(handler) {
       closePool: async () => {},
     },
   };
-  for (const m of ['services/pincode.service', 'services/city.service']) {
+  // state.service too: both services require it, and a copy cached from an
+  // earlier case would keep that case's stub pool (and its column probes).
+  for (const m of ['services/pincode.service', 'services/city.service', 'services/state.service']) {
     delete require.cache[require.resolve(path.join(ROOT, m))];
   }
   return {

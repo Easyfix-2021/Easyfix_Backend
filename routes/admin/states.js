@@ -28,11 +28,12 @@ const listQuery = Joi.object({ includeInactive: Joi.boolean().default(false) });
 const name = Joi.string().trim().min(2).max(100);
 const code = Joi.string().trim().max(10).allow('', null);
 const manager = Joi.number().integer().positive();
+const stateType = Joi.string().valid(...stateSvc.STATE_TYPES);
 
 // A state can never be saved without a manager (decided 2026-09-21), so it is
 // REQUIRED on create. On update it is optional — absent means "rename only".
-const createBody = Joi.object({ state_name: name.required(), state_code: code.optional(), state_user: manager.required() });
-const updateBody = Joi.object({ state_name: name.optional(), state_code: code.optional(), state_user: manager.optional() }).min(1);
+const createBody = Joi.object({ state_name: name.required(), state_code: code.optional(), state_user: manager.required(), state_type: stateType.optional() });
+const updateBody = Joi.object({ state_name: name.optional(), state_code: code.optional(), state_user: manager.optional(), state_type: stateType.optional() }).min(1);
 const assignBody = Joi.object({
   state_ids:  Joi.array().items(Joi.number().integer().positive()).min(1).max(100).unique().required(),
   state_user: manager.required(),

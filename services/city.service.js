@@ -216,6 +216,7 @@ async function createCity({ city_name, state_id, district, tier, reference_pinco
     'SELECT state_id FROM tbl_state WHERE state_id = ? LIMIT 1', [state_id]
   );
   if (!stateRow) throw mkErr(400, `Unknown state_id ${state_id}`);
+  await stateService.assertActiveStates([state_id]);
 
   const [[dup]] = await pool.query(
     `SELECT city_id FROM tbl_city
@@ -271,6 +272,7 @@ async function updateCity(cityId, fields) {
   if (fields.state_id !== undefined) {
     const [[s]] = await pool.query('SELECT state_id FROM tbl_state WHERE state_id = ? LIMIT 1', [fields.state_id]);
     if (!s) throw mkErr(400, `Unknown state_id ${fields.state_id}`);
+    await stateService.assertActiveStates([fields.state_id]);
     sets.push('state_id = ?'); params.push(Number(fields.state_id));
     /*
      * The city takes its state's zonal manager. The edit dialog always sends

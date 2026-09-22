@@ -28,7 +28,9 @@ const USERS = {
  * every statement is recorded with where it ran so a test can tell a write
  * inside the transaction from one outside it.
  */
-function install({ hasCols = true, states = { 1: null, 2: 5, 3: 5 }, handler = () => null } = {}) {
+function install({ hasCols = true, states = { 1: null, 2: 5, 3: 5, 4: 5 }, inactive = [4], handler = () => null } = {}) {
+  const off = new Set(inactive);
+  const row = (id) => ({ state_id: id, state_name: 'State ' + id, state_user: states[id], state_status: off.has(id) ? 0 : 1 });
   const calls = [];
   const conn = { committed: false, rolledBack: false, released: false };
   const answer = async (sql, params, via) => {
@@ -38,14 +40,14 @@ function install({ hasCols = true, states = { 1: null, 2: 5, 3: 5 }, handler = (
     if (own) return [own, []];
     if (/SHOW COLUMNS FROM tbl_state/i.test(text)) return [hasCols ? [{ Field: 'state_user' }] : [], []];
     if (/FROM tbl_user WHERE user_id = \?/i.test(text)) return [[USERS[params[0]]].filter(Boolean), []];
-    if (/SELECT state_id FROM tbl_state WHERE state_id IN/i.test(text)) {
-      return [params.filter((id) => id in states).map((id) => ({ state_id: id })), []];
+    if (/SELECT state_id, state_name, state_status FROM tbl_state WHERE state_id IN/i.test(text)) {
+      return [params.filter((id) => id in states).map(row), []];
     }
-    if (/SELECT state_id FROM tbl_state WHERE state_id = \? FOR UPDATE/i.test(text)) {
-      return [params[0] in states ? [{ state_id: params[0] }] : [], []];
+    if (/SELECT state_id, state_name, state_status FROM tbl_state WHERE state_id = \? FOR UPDATE/i.test(text)) {
+      return [params[0] in states ? [row(params[0])] : [], []];
     }
-    if (/SELECT state_id, state_user FROM tbl_state/i.test(text)) {
-      return [params[0] in states ? [{ state_id: params[0], state_user: states[params[0]] }] : [], []];
+    if (/SELECT state_id, state_name, state_user, state_status FROM tbl_state/i.test(text)) {
+      return [params[0] in states ? [row(params[0])] : [], []];
     }
     if (/SELECT state_user FROM tbl_state/i.test(text)) {
       return [params[0] in states ? [{ state_user: states[params[0]] }] : [], []];
@@ -212,4 +214,138 @@ test('routes · state writes are gated on isStateEdit and a manager is required 
     assert.ok(src.includes(verb), 'ungated write: ' + verb);
   }
   assert.match(src, /createBody = Joi\.object\(\{[^}]*state_user: manager\.required\(\)/);
+});
+
+/* ─── 2026-09-22: active states only ─────────────────────────────────── */
+
+test('assignManager · refuses an INACTIVE state and writes nothing', async () => {
+  const { calls, conn, state } = install();
+  await assert.rejects(state.assignManager([2, 4], 7, 42), (e) => e.status === 422 && /Inactive state/.test(e.message));
+  assert.equal(stateUpdates(calls).length + cityUpdates(calls).length, 0);
+  assert.ok(conn.rolledBack);
+});
+
+test('updateState · a manager change on an inactive state is refused; a rename is not', async () => {
+  const a = install();
+  await assert.rejects(a.state.updateState(4, { state_user: 7 }, 42), (e) => e.status === 422);
+  assert.equal(cityUpdates(a.calls).length, 0);
+  const b = install();
+  await b.state.updateState(4, { state_name: 'Renamed' }, 42);
+  assert.equal(stateUpdates(b.calls).length, 1);
+});
+
+test('resyncState · refuses an inactive state', async () => {
+  const { calls, state } = install();
+  await assert.rejects(state.resyncState(4, 42), (e) => e.status === 422);
+  assert.equal(cityUpdates(calls).length, 0);
+});
+
+test('assertActiveStates · names every inactive id it finds, ignores active and unknown ones', async () => {
+  const { state } = install({
+    handler: (t, p) => (/FROM tbl_state WHERE state_id IN \(\?\) AND state_status = 0/i.test(t)
+      ? p[0].filter((id) => id === 40).map((id) => ({ state_id: id, state_name: 'Orisa' })) : null),
+  });
+  await assert.rejects(state.assertActiveStates([26, 40, 999]), (e) => e.status === 422 && /Orisa/.test(e.message));
+  await state.assertActiveStates([26, 999]);
+  await state.assertActiveStates([]);
+});
+
+/*
+ * A stub tbl_state with an old duplicate kept INACTIVE: 26 Odisha active, 40
+ * "Orisa" inactive; 27 Puducherry active, 42 "Pondicherry" inactive. Answers
+ * the resolver's by-name read the way MySQL would: LOWER/TRIM, the IN list,
+ * and the ORDER BY (active first, then exact raw name, then normalised name).
+ */
+function installStates({ status = true } = {}) {
+  const rows = [
+    { state_id: 26, state_name: 'Odisha', state_status: 1 },
+    { state_id: 40, state_name: 'Orisa', state_status: 0 },
+    { state_id: 27, state_name: 'Puducherry', state_status: 1 },
+    { state_id: 42, state_name: 'Pondicherry', state_status: 0 },
+    { state_id: 15, state_name: 'Jammu & Kashmir', state_status: 1 },
+  ];
+  return install({
+    handler: (t, p) => {
+      if (/SHOW COLUMNS FROM tbl_state LIKE/i.test(t)) return status ? [{ Field: p[0] }] : [];
+      if (/FROM tbl_state WHERE LOWER\(TRIM\(state_name\)\) IN \(\?, \?, \?\)/i.test(t)) {
+        const [raw, given, official] = p;
+        const lc = (r) => r.state_name.trim().toLowerCase();
+        const hits = rows.filter((r) => [raw, given, official].includes(lc(r)));
+        hits.sort((a, b) => (status ? b.state_status - a.state_status : 0)
+          || (lc(b) === raw) - (lc(a) === raw) || (lc(b) === given) - (lc(a) === given) || a.state_id - b.state_id);
+        return hits.slice(0, 1);
+      }
+      return null;
+    },
+  });
+}
+
+for (const [given, id] of [
+  ['Odisha', 26], ['  odisha ', 26], ['Orissa', 26], ['Orisa', 26], ['ORISA', 26],
+  ['Pondicherry', 27], ['Puducherry', 27], ['Jammu & Kashmir', 15],
+]) {
+  test(`resolveStateByName · "${given}" → the ACTIVE state ${id}`, async () => {
+    const { state } = installStates();
+    assert.equal((await state.resolveStateByName(given)).state_id, id);
+  });
+}
+
+test('resolveStateByName · an unknown name is null, never a guess', async () => {
+  const { state } = installStates();
+  assert.equal(await state.resolveStateByName('Atlantis'), null);
+  assert.equal(await state.resolveStateByName(''), null);
+});
+
+test('resolveStateByName · before the migration the exact stored name still wins', async () => {
+  const { state } = installStates({ status: false });
+  assert.equal((await state.resolveStateByName('Orisa')).state_id, 40);
+  assert.equal((await state.resolveStateByName('Orissa')).state_id, 26);
+});
+
+test('normaliseStateName · & and punctuation fold, so "Jammu & Kashmir" matches "Jammu and Kashmir"', () => {
+  const { state } = install();
+  assert.equal(state.normaliseStateName(' Jammu  &  Kashmir. '), 'jammu and kashmir');
+});
+
+test('stateNameVariants · active names plus aliases; inactive rows never offered', async () => {
+  const { state } = install({
+    handler: (t) => (/SELECT state_id, state_name, state_status FROM tbl_state$/i.test(t.trim()) ? [
+      { state_id: 26, state_name: 'Odisha', state_status: 1 },
+      { state_id: 40, state_name: 'Orisa', state_status: 0 },
+    ] : null),
+  });
+  const v = await state.stateNameVariants();
+  assert.ok(v.every((x) => x.state_id === 26), 'every variant points at the active row');
+  assert.ok(v.some((x) => x.name === 'Odisha') && v.some((x) => x.name === 'orissa') && v.some((x) => x.name === 'orisa'));
+});
+
+test('state_type · refused with a 400 when not State/UT, and a 503 before the column exists', async () => {
+  const typed = install();
+  await assert.rejects(typed.state.updateState(2, { state_type: 'Province' }, 42), (e) => e.status === 400);
+  const untyped = install({ handler: (t, p) => (/SHOW COLUMNS FROM tbl_state LIKE/i.test(t) && p[0] === 'state_type' ? [] : null) });
+  await assert.rejects(untyped.state.updateState(2, { state_type: 'UT' }, 42), (e) => e.status === 503);
+});
+
+test('state_type · written on update when the column exists', async () => {
+  const { calls, state } = install();
+  await state.updateState(2, { state_type: 'UT' }, 42);
+  assert.match(stateUpdates(calls)[0].sql, /state_type = \?/);
+});
+
+test('lookup states · the dropdown offers ACTIVE states only, with their type', async () => {
+  const { calls } = install();
+  delete require.cache[require.resolve(path.join(ROOT, 'services/lookup.service'))];
+  await require(path.join(ROOT, 'services/lookup.service')).states();
+  const q = calls.find((c) => /FROM tbl_state/i.test(c.sql) && /ORDER BY state_name/i.test(c.sql));
+  assert.match(q.sql, /WHERE state_status = 1/);
+  assert.match(q.sql, /state_type/);
+});
+
+test('migration · every state starts with manager 121, and nothing is moved or merged', () => {
+  // Via the helper, so the test survives the file moving to migrations/executed/.
+  const sql = require('./helpers/migration-file').readMigration('2026-09-21-state-zonal-manager.sql')
+    .replace(/^\s*--.*$/gm, '');
+  assert.match(sql, /ADD COLUMN state_user INT NULL DEFAULT 121/);
+  assert.doesNotMatch(sql, /UPDATE tbl_city/i, 'the migration must not touch cities');
+  assert.doesNotMatch(sql, /DELETE /i);
 });

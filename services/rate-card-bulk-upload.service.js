@@ -5,6 +5,7 @@ const { nameKey } = require('../utils/name-key');
 const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../utils/xlsx-styled-export');
 const clientServicesSvc = require('./client-services.service');
 const materialRatesSvc = require('./client-material-rates.service');
+const stateService = require('./state.service');
 
 /*
  * Rate Card Bulk Upload (Services + Materials tabs) — see
@@ -441,15 +442,18 @@ async function generateMaterialRatesTemplate(res) {
 }
 
 async function loadMaterialRatesRef() {
-  const [[materials], [brands], [states]] = await Promise.all([
+  const [[materials], [brands], states] = await Promise.all([
     pool.query('SELECT material_id, material_name FROM tbl_material_master WHERE status = 1'),
     pool.query('SELECT brand_id, brand_name, brand_key FROM tbl_brand_master WHERE status = 1'),
-    pool.query('SELECT state_id, state_name FROM tbl_state'),
+    // Every accepted spelling → an ACTIVE state (its own name as state_name),
+    // so the template lists active states only and an old spelling in a filled
+    // sheet ("Orissa") still lands on Odisha, never on an inactive row.
+    stateService.stateNameVariants(),
   ]);
   return {
     materialByKey: new Map(materials.map((m) => [nameKey(m.material_name), m])),
     brandByKey: new Map(brands.map((b) => [nameKey(b.brand_name), b])),
-    stateByKey: new Map(states.map((s) => [nameKey(s.state_name), s])),
+    stateByKey: new Map(states.map((s) => [nameKey(s.name), { state_id: s.state_id, state_name: s.state_name }])),
   };
 }
 
