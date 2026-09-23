@@ -55,5 +55,8 @@ router.use('/premature-confirmations', require('./premature-confirmations'));
 // Employee Performance: an MIS-built snapshot (targets, TimeChamp, IVR are not in
 // easyfix_core), uploaded as data.js and rendered as the original dashboard page.
 router.use('/employee-performance',   require('./employee-performance'));
+// Custom Reports: operator-defined columns, uploaded .xlsx/.csv snapshots
+// (rows in private S3), per-report audience, owner-only edits, public link.
+router.use('/dynamic-reports',        require('./dynamic-reports'));
 
 module.exports = router;
