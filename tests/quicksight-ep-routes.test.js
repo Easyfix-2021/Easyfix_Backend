@@ -262,13 +262,16 @@ test('the snapshot is parsed once per upload and replaced by a newer one', async
   assert.ok(first && first.employees.Asha, 'the uploaded D');
   assert.equal(await service.getSnapshotD(), first, 'the same parsed object on every read');
 
-  // Another instance (sharing the storage) uploads: data first, then meta —
-  // written straight to storage so this process's cache knows nothing of it.
+  // Another instance (sharing the storage) uploads: its own data object first,
+  // then meta naming it — written straight to storage so this process's cache
+  // knows nothing of it.
   const next = syntheticD();
   next.employees.Asha.daily[0].revenue += 1000;
-  fs.writeFileSync(path.join(TMP, 'data.json.gz'), zlib.gzipSync(JSON.stringify(next)));
+  fs.writeFileSync(path.join(TMP, 'data-other-instance.json.gz'), zlib.gzipSync(JSON.stringify(next)));
   const meta = JSON.parse(fs.readFileSync(path.join(TMP, 'meta.json'), 'utf8'));
-  fs.writeFileSync(path.join(TMP, 'meta.json'), JSON.stringify({ ...meta, uploadedAt: new Date(Date.parse(meta.uploadedAt) + 1000).toISOString() }));
+  fs.writeFileSync(path.join(TMP, 'meta.json'), JSON.stringify({
+    ...meta, dataKey: 'data-other-instance.json.gz', uploadedAt: new Date(Date.parse(meta.uploadedAt) + 1000).toISOString(),
+  }));
 
   const [a, b] = await Promise.all([service.getSnapshotD(), service.getSnapshotD()]);
   assert.notEqual(a, first, 'a new uploadedAt replaces the entry');
@@ -287,12 +290,9 @@ test('the snapshot is parsed once per upload and replaced by a newer one', async
   assert.deepEqual(await ok('/summary?vertical=Sports'), json(agg.buildSummary(third, { verticals: ['Sports'] })));
 });
 
-test('the existing /meta and /dashboard reads still answer', async () => {
+test('/meta still answers; the retired /dashboard page does not', async () => {
   const meta = await get('/meta');
   assert.equal(meta.status, 200);
   assert.equal(meta.body.data.employeeCount, Object.keys(D.employees).length);
-  const dash = await get('/dashboard');
-  assert.equal(dash.status, 200);
-  assert.equal(dash.cache, 'no-store');
-  assert.match(dash.body.data.html, /const D=/);
+  assert.equal((await fetch(`${base}/dashboard`)).status, 404);
 });

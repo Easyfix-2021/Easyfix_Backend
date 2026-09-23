@@ -5,6 +5,8 @@ const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 const logger = require('../../logger');
+// Material Request Flow v2 (2026-09-21) — the single line-state derivation.
+const quotationLineState = require('../../services/quotation-line-state');
 
 // Helper: given a jobId, return {client_id, city_id, vertical_id} for scope check.
 async function jobScopeFields(jobId) {
@@ -60,7 +62,8 @@ router.get('/', async (req, res, next) => {
       `SELECT id, type, name, unit, unit_price,
               tx_charge, client_charge, approved_charge, margin,
               status, easyfxer_id, action_by, sent_by, sent_on, action_on,
-              job_id, client_service_id, material_id, job_service_id
+              job_id, client_service_id, material_id, job_service_id,
+              ${quotationLineState.quotationLineStateSql('quotation_details')} AS state
          FROM quotation_details
         WHERE job_id = ?
         ORDER BY id DESC`,
@@ -138,6 +141,27 @@ router.post('/material', validate(productBody.fork(['name'], (s) => s)
   } catch (e) { logger.error('Add material quotation failed · ' + e.message); next(e); }
 });
 
+/*
+ * Both approve and reject below are now (Material Request Flow v2,
+ * 2026-09-21) restricted to a line currently in `review_pending` — else 409.
+ * Re-reads the line's own columns (not just its job_id, as the existing
+ * quotationScopeGuard fetch does) so the state check runs against the SAME
+ * row the UPDATE is about to touch, never a stale caller-supplied guess.
+ */
+async function assertQuotationLineReviewPending(quotationId) {
+  const [[line]] = await pool.query(
+    `SELECT sent_on, action_on,
+            CAST(status AS UNSIGNED) AS status,
+            CAST(client_status AS SIGNED) AS client_status
+       FROM quotation_details WHERE id = ? LIMIT 1`,
+    [quotationId],
+  );
+  if (!line) return { ok: false, notFound: true };
+  const state = quotationLineState.quotationLineState(line);
+  if (state !== quotationLineState.STATE.REVIEW_PENDING) return { ok: false, state };
+  return { ok: true };
+}
+
 // SPOC approval / rejection — sets approved_charge and action_*
 router.patch('/:id/approve', validate(Joi.object({
   approvedCharge: Joi.number().min(0).required(),
@@ -146,6 +170,12 @@ router.patch('/:id/approve', validate(Joi.object({
     logger.info('Approve quotation · id=' + req.params.id);
     const guard = await quotationScopeGuard(req, req.params.id);
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
+    const lineGuard = await assertQuotationLineReviewPending(req.params.id);
+    if (!lineGuard.ok) {
+      if (lineGuard.notFound) return modernError(res, 404, 'quotation not found');
+      logger.warn('Approve quotation refused · id=' + req.params.id + ' · state=' + lineGuard.state);
+      return modernError(res, 409, 'This line is not pending review');
+    }
     const [r] = await pool.query(
       `UPDATE quotation_details
           SET approved_charge = ?, action_by = ?, action_on = ?, status = 1
@@ -163,6 +193,12 @@ router.patch('/:id/reject', async (req, res, next) => {
     logger.info('Reject quotation · id=' + req.params.id);
     const guard = await quotationScopeGuard(req, req.params.id);
     if (!guard.ok) return modernError(res, 404, 'quotation not found');
+    const lineGuard = await assertQuotationLineReviewPending(req.params.id);
+    if (!lineGuard.ok) {
+      if (lineGuard.notFound) return modernError(res, 404, 'quotation not found');
+      logger.warn('Reject quotation refused · id=' + req.params.id + ' · state=' + lineGuard.state);
+      return modernError(res, 409, 'This line is not pending review');
+    }
     const [r] = await pool.query(
       `UPDATE quotation_details
           SET status = 0, action_by = ?, action_on = ?

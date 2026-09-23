@@ -14,6 +14,12 @@ const { installFakePool } = require('./helpers/fake-pool');
 const fake = installFakePool([
   [/SELECT job_id, fk_client_id, fk_easyfixter_id, job_status\s+FROM tbl_job/i,
     () => [{ job_id: 100, fk_client_id: 5, fk_easyfixter_id: 42, job_status: 2 }]],
+  // Material Request Flow v2 (2026-09-21): sendForApproval now requires at
+  // least one DRAFT line to exist before it will send — one fixture draft
+  // row (sent_on IS NULL) so this file keeps testing what it always tested
+  // (the Date-sharing behaviour), not the new 422 guard (covered elsewhere).
+  [/^\s*SELECT id FROM quotation_details/i, () => [{ id: 1 }]],
+  [/^\s*UPDATE quotation_details\b/i, () => ({ affectedRows: 1 })],
   [/^\s*UPDATE tbl_job\b/i, () => ({ affectedRows: 1 })],
   [/^\s*INSERT INTO tbl_job_image/i, () => ({ affectedRows: 1 })],
 ]);

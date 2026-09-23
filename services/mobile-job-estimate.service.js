@@ -56,19 +56,90 @@ const {
 } = require('../utils/job-image-buckets');
 const { deleteJobImage } = require('./job-image.service');
 const { resolveMaterialPrice } = require('./material-price-resolver');
+// Material Request Flow v2 (2026-09-21) — the single line-state derivation
+// and the pre_material_status get/store pair. Neither depends on
+// job.service.js, so requiring them here carries none of the circular-import
+// risk the STATUS constants below were duplicated to avoid.
+const quotationLineState = require('./quotation-line-state');
+const { getPreMaterialStatus, storePreMaterialStatus } = require('./material-review-store');
 
 // Job status codes (mirror services/job.service.js STATUS — duplicated as a
 // local const so this service has no circular dependency on job.service.js,
 // which the no-edit rule forbids us touching).
+const STATUS_SCHEDULED = 1;
 const STATUS_ESTIMATE_PENDING_APPROVAL = 15;
 // Material Management phase 2, sub-project D (2026-09-18) — see
 // docs/superpowers/specs/2026-09-18-pending-for-material-status-16-design.md.
 const STATUS_IN_PROGRESS = 2;
 const STATUS_IN_PROGRESS_ALT = 20;
 const STATUS_PENDING_FOR_MATERIAL = 16;
-// material_sub_status: 1 = Quotation Pending, 2 = Review Pending.
+// material_sub_status: 1 = Quotation Pending (RETIRED — Material Request Flow
+// v2, 2026-09-21, no longer writes this value; kept for old rows / old app
+// builds that still read it), 2 = Review Pending.
 const MATERIAL_SUB_STATUS_QUOTATION_PENDING = 1;
 const MATERIAL_SUB_STATUS_REVIEW_PENDING = 2;
+
+/*
+ * Material Request Flow v2 (2026-09-21) — job-status LOCK for every
+ * technician quotation WRITE (add / bulk-add / delete / bulk-delete /
+ * send-for-approval). See the design's "Locks":
+ *   - at 15 (client approval pending), every technician write is refused —
+ *     the client has the quote now.
+ *   - anywhere else outside {1 SCHEDULED, 2/20 IN_PROGRESS, 16 PENDING_FOR_
+ *     MATERIAL}, there is no defined transition for a technician to write
+ *     into, so it is refused too (closed allowlist, not an open denylist —
+ *     the safe direction when a status this backend gains later should be
+ *     refused until someone decides it belongs here).
+ */
+const TECH_QUOTATION_WRITE_STATUSES = new Set([
+  STATUS_SCHEDULED, STATUS_IN_PROGRESS, STATUS_IN_PROGRESS_ALT, STATUS_PENDING_FOR_MATERIAL,
+]);
+
+function assertTechCanWriteQuotation(jobStatus) {
+  const s = Number(jobStatus);
+  if (s === STATUS_ESTIMATE_PENDING_APPROVAL) {
+    const e = new Error('Waiting for client approval'); e.status = 409; throw e;
+  }
+  if (!TECH_QUOTATION_WRITE_STATUSES.has(s)) {
+    const e = new Error('This material is locked'); e.status = 409; throw e;
+  }
+}
+
+/*
+ * Per-LINE lock — a technician may only touch a line in `draft` or
+ * `review_pending` (quotationLineState.TECH_EDITABLE_STATES); every other
+ * state (approval_pending, rejected, client_approved, client_rejected) is
+ * locked to the technician even when the JOB-level check above passes (e.g.
+ * an old rejected line sitting on a job back at 2/20).
+ */
+function assertTechLineEditable(state) {
+  if (!quotationLineState.isTechEditable(state)) {
+    const e = new Error('This material is locked'); e.status = 409; throw e;
+  }
+}
+
+/*
+ * "Tech deletes the last non-draft (review_pending) line at 16 → job returns
+ * to its pre-status; material_sub_status cleared." Re-checks the LIVE count
+ * after the delete (rather than trusting what the caller just removed), so a
+ * single-line delete and a bulk delete-all share one, always-correct rule:
+ * only revert when NO review_pending line remains for the job.
+ */
+async function maybeRevertFromPendingMaterial(jobId, efrId) {
+  const [[cnt]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM quotation_details
+      WHERE job_id = ? AND (${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.REVIEW_PENDING)})`,
+    [jobId],
+  );
+  if (Number(cnt.n) > 0) return false;
+  const preStatus = await getPreMaterialStatus(jobId);
+  await pool.query(
+    `UPDATE tbl_job SET job_status = ?, material_sub_status = NULL, last_update_time = ?
+      WHERE job_id = ? AND fk_easyfixter_id = ?`,
+    [preStatus, new Date(), jobId, efrId],
+  );
+  return true;
+}
 
 // S3 key convention for job-supporting images:
 //   JobSupportings/<Category>_<JobID>_<Seq>   (no file extension on the key)
@@ -263,12 +334,26 @@ async function getJobMaterials(jobId, efrId, { search } = {}) {
  *              material_name is used regardless of what the client sends —
  *              this is a master-list picker now, not free text.
  *   quantity   → quotation_details.unit  (legacy column name for qty)
- *   amount     → quotation_details.unit_price for PRODUCT lines. For a
- *              MATERIAL line this is only a suggestion: the server
- *              re-resolves the price via resolveMaterialPrice() and stores
- *              THAT, ignoring `amount` unless the resolver has no price at
- *              all (source 'none' — phase-1 "Price Pending"), so a modified
- *              app can never quote an arbitrary number.
+ *   amount     → quotation_details.unit_price for PRODUCT lines, unchanged.
+ *
+ *              OWNER DECISION (2026-09-21): for a MATERIAL line, the
+ *              technician's own quoted `amount` is now what gets billed as
+ *              unit_price — a material priced ₹500 in the rate card but
+ *              actually bought for ₹550 must quote ₹550. The OLD rule (the
+ *              server re-resolved the price and ignored `amount`) is
+ *              RETIRED. `amount` is required (> 0); when it is absent (or
+ *              not a positive number) it defaults to the resolver's price,
+ *              and only 422s when NEITHER is available.
+ *
+ *              `client_charge` now carries the resolveMaterialPrice() result
+ *              as a SNAPSHOT of what the rate card said at quote time (NULL
+ *              when the resolver has no price at all — source 'none' —
+ *              because client_charge is a nullable float column and NULL is
+ *              the only value a reader can tell apart from a genuine ₹0
+ *              rate-card price). This lets the CRM show Rate Card
+ *              (client_charge) vs Amount Quoted (unit_price) vs Approved
+ *              (approved_charge) side by side — see routes/admin/jobs.js's
+ *              job/transaction view, which already reads client_charge.
  *
  * status defaults to 1 (active, pending approval) — same default the admin
  * route uses. easyfxer_id (legacy typo) stamps the technician who raised
@@ -276,17 +361,21 @@ async function getJobMaterials(jobId, efrId, { search } = {}) {
  *
  * Returns { lineId }.
  */
-async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, amount, materialId, brandId }) {
-  logger.info('Add quotation line · jobId=' + jobId + ' · type=' + type + ' · itemId=' + (itemId || null) + ' · materialId=' + (materialId || null) + ' · qty=' + quantity);
-  const job = await jobForTech(jobId, efrId);
-  if (!job) logger.warn('Add quotation line failed · job not found or not owned · jobId=' + jobId);
-  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
-
+/*
+ * Resolve one line's shape + pricing WITHOUT writing anything — the shared
+ * core between the single add, the bulk draft add, and send-for-approval's
+ * inline `lines`. `job` is the jobForTech() row (already ownership-checked
+ * by the caller); `ctx` is jobEstimateContext(jobId) (also already fetched
+ * by the caller — resolving it once per bulk call, not once per line).
+ * Throws { status: 422 } exactly as the single-add path always has.
+ */
+async function resolveLineForInsert(job, ctx, { type, itemId, name, quantity, amount, materialId, brandId }) {
   const isProduct = type === 'product';
   let clientServiceId = null;
   let materialIdOut = null;
   let lineName = name || null;
   let unitPrice = amount;
+  let clientCharge = 0; // product lines: unchanged, always 0 (out of scope of this change)
 
   if (isProduct) {
     clientServiceId = itemId || null;
@@ -296,44 +385,133 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
     // endpoint by mistake, which it never should — Others posts to
     // material-request instead) — reject rather than silently accepting it.
     if (!materialId) {
-      logger.warn('Add quotation line rejected · material_id required · jobId=' + jobId);
+      logger.warn('Add quotation line rejected · material_id required · jobId=' + job.job_id);
       const e = new Error('material_id is required for material lines'); e.status = 422; throw e;
     }
 
-    const ctx = await jobEstimateContext(jobId);
     const [[material]] = await pool.query(
       `SELECT material_id, material_name, service_catg_id, CAST(status AS SIGNED) AS status
          FROM tbl_material_master WHERE material_id = ? LIMIT 1`,
       [materialId],
     );
     if (!material || material.status !== 1 || Number(material.service_catg_id) !== Number(ctx.fk_service_catg_id)) {
-      logger.warn('Add quotation line rejected · material not available for this job · jobId=' + jobId + ' · materialId=' + materialId);
+      logger.warn('Add quotation line rejected · material not available for this job · jobId=' + job.job_id + ' · materialId=' + materialId);
       const e = new Error('material not found for this job'); e.status = 422; throw e;
     }
 
     const resolved = await resolveMaterialPrice({
       clientId: job.fk_client_id, materialId, brandId: brandId || null, stateId: ctx.state_id,
     });
-    unitPrice = resolved.source === 'none' ? (Number(amount) || 0) : (Number(resolved.price) || 0);
+    // resolvedPrice is the rate-card snapshot: NULL for 'none' (no price
+    // anywhere), a real number — possibly 0 — otherwise.
+    const resolvedPrice = resolved.source === 'none' ? null : (Number(resolved.price) || 0);
+
+    const quotedAmount = Number(amount);
+    const hasQuote = Number.isFinite(quotedAmount) && quotedAmount > 0;
+    if (!hasQuote && resolvedPrice === null) {
+      logger.warn('Add quotation line rejected · no technician amount and no resolvable rate-card price · jobId=' + job.job_id + ' · materialId=' + materialId);
+      const e = new Error('amount is required for material lines with no resolvable rate-card price'); e.status = 422; throw e;
+    }
+    /*
+     * quotation_details.unit_price is a legacy INT column: a fractional quote
+     * would be TRUNCATED by MySQL with no error (₹550.50 → ₹550). Refuse it
+     * instead — the app only offers whole rupees — so a technician's money is
+     * never silently rounded down. client_charge / approved_charge are FLOAT
+     * and keep their paise.
+     */
+    if (hasQuote && !Number.isInteger(quotedAmount)) {
+      const e = new Error('amount must be in whole rupees'); e.status = 422; throw e;
+    }
+    // The technician's own quote wins when given; the rate-card price is only
+    // a fallback for a line with no quote at all (owner decision, 2026-09-21).
+    // The fallback is rounded for the same INT column, rather than truncated.
+    unitPrice = hasQuote ? quotedAmount : Math.round(resolvedPrice);
+    clientCharge = resolvedPrice;
     materialIdOut = materialId;
     lineName = material.material_name;
   }
 
-  const [ins] = await pool.query(
+  return { type, name: lineName, quantity, unitPrice, clientCharge, clientServiceId, materialId: materialIdOut };
+}
+
+/*
+ * Insert ONE resolved line as a DRAFT (sent_on = NULL — Material Request
+ * Flow v2, 2026-09-21: a line is never "raised from app" at insert time
+ * any more; sendForApproval's bulk sent_on stamp is what raises it). Takes
+ * an explicit `conn` so a bulk caller can insert several lines inside its
+ * own transaction; defaults to `pool` for the single-add path.
+ */
+async function insertDraftLine(conn, jobId, efrId, resolved) {
+  const [ins] = await conn.query(
     `INSERT INTO quotation_details
        (type, name, unit, unit_price,
         tx_charge, client_charge, margin,
         status, easyfxer_id, sent_on,
         job_id, client_service_id, material_id)
-     VALUES (?, ?, ?, ?, 0, 0, 0, 1, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, 0, ?, 0, 1, ?, ?, ?, ?, ?)`,
     [
-      type, lineName, quantity, unitPrice,
-      efrId, new Date(),
-      jobId, clientServiceId, materialIdOut,
+      resolved.type, resolved.name, resolved.quantity, resolved.unitPrice,
+      resolved.clientCharge,
+      efrId, null,
+      jobId, resolved.clientServiceId, resolved.materialId,
     ],
   );
-  logger.info('Quotation line created · id=' + ins.insertId + ' · jobId=' + jobId);
-  return { lineId: ins.insertId };
+  return ins.insertId;
+}
+
+/*
+ * Add ONE draft line (existing single-add path). Draft — sent_on NULL — per
+ * the design's "State model": the estimate's old "Send for Approval" button
+ * is now "Save"; sending is a separate, explicit step (sendForApproval).
+ */
+async function addQuotationLine(jobId, efrId, input) {
+  logger.info('Add quotation line · jobId=' + jobId + ' · type=' + input.type + ' · itemId=' + (input.itemId || null) + ' · materialId=' + (input.materialId || null) + ' · qty=' + input.quantity);
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Add quotation line failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+  assertTechCanWriteQuotation(job.job_status);
+
+  const ctx = await jobEstimateContext(jobId);
+  const resolved = await resolveLineForInsert(job, ctx, input);
+  const lineId = await insertDraftLine(pool, jobId, efrId, resolved);
+  logger.info('Quotation line created (draft) · id=' + lineId + ' · jobId=' + jobId);
+  return { lineId };
+}
+
+/*
+ * NEW — POST /:id/quotation/draft. Bulk add, 1..50 lines (Joi-bounded at the
+ * route), one transaction: either every line lands or none does. Returns
+ * { lineIds } in the SAME order as the input array.
+ */
+async function addQuotationLines(jobId, efrId, lines) {
+  logger.info('Add quotation lines (bulk draft) · jobId=' + jobId + ' · count=' + ((Array.isArray(lines) ? lines : []).length));
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Bulk add quotation lines failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+  assertTechCanWriteQuotation(job.job_status);
+
+  const list = Array.isArray(lines) ? lines : [];
+  if (list.length === 0) { const e = new Error('lines must contain at least one item'); e.status = 422; throw e; }
+
+  const ctx = await jobEstimateContext(jobId);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const lineIds = [];
+    for (const input of list) {
+      const resolved = await resolveLineForInsert(job, ctx, input);
+      lineIds.push(await insertDraftLine(conn, jobId, efrId, resolved));
+    }
+    await conn.commit();
+    logger.info('Bulk draft lines created · jobId=' + jobId + ' · count=' + lineIds.length);
+    return { lineIds };
+  } catch (e) {
+    logger.warn('Bulk add quotation lines failed, rolled back · jobId=' + jobId + ' · ' + e.message);
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
 
 /*
@@ -342,58 +520,191 @@ async function addQuotationLine(jobId, efrId, { type, itemId, name, quantity, am
  * and re-check ownership) so a tech can't delete another tech's estimate
  * line by guessing an id. Returns { deleted: true }; throws 404 if the
  * line doesn't exist or isn't this tech's.
+ *
+ * Material Request Flow v2 (2026-09-21) adds two lock checks — the job-level
+ * one (15 -> "Waiting for client approval"; anything else outside
+ * {1,2,20,16} -> "This material is locked") and a per-LINE one (only
+ * draft/review_pending are technician-editable) — plus the "deletes the last
+ * review_pending line at 16" revert-to-pre-status transition.
  */
 async function deleteQuotationLine(jobId, efrId, lineId) {
   logger.info('Delete quotation line · jobId=' + jobId + ' · lineId=' + lineId);
   const job = await jobForTech(jobId, efrId);
   if (!job) logger.warn('Delete quotation line failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+  assertTechCanWriteQuotation(job.job_status);
 
-  // Ensure the line belongs to THIS job (defends against cross-job ids).
+  // Ensure the line belongs to THIS job (defends against cross-job ids), and
+  // fetch exactly the columns quotationLineState needs to derive its state.
   const [[line]] = await pool.query(
-    'SELECT id, job_id FROM quotation_details WHERE id = ? LIMIT 1',
+    `SELECT id, job_id, sent_on, action_on,
+            CAST(status AS UNSIGNED) AS status, CAST(client_status AS SIGNED) AS client_status
+       FROM quotation_details WHERE id = ? LIMIT 1`,
     [lineId],
   );
   if (!line || Number(line.job_id) !== Number(jobId)) {
     logger.warn('Delete quotation line failed · line not found for job · jobId=' + jobId + ' · lineId=' + lineId);
     const e = new Error('quotation line not found'); e.status = 404; throw e;
   }
+  assertTechLineEditable(quotationLineState.quotationLineState(line));
+
   await pool.query('DELETE FROM quotation_details WHERE id = ? AND job_id = ?', [lineId, jobId]);
   logger.info('Quotation line deleted · id=' + lineId + ' · jobId=' + jobId);
+
+  let reverted = false;
+  if (Number(job.job_status) === STATUS_PENDING_FOR_MATERIAL) {
+    reverted = await maybeRevertFromPendingMaterial(jobId, efrId);
+    if (reverted) logger.info('Job reverted to pre-material status after last review_pending line deleted · jobId=' + jobId);
+  }
   return { deleted: true };
 }
 
-/* ─── Send estimate for SPOC approval ───────────────────────────────────
+/*
+ * NEW — DELETE /:id/quotation. Deletes every technician-editable line
+ * (draft + review_pending) in one statement — the app's "Delete All". Locked
+ * / client-approved / rejected lines are left untouched (not in the SQL's
+ * state predicate at all), same as a single delete would refuse them one by
+ * one. Applies the same "last review_pending line" revert as the single
+ * delete. Returns { deleted: n }.
+ */
+async function deleteAllQuotationLines(jobId, efrId) {
+  logger.info('Delete all technician-editable quotation lines · jobId=' + jobId);
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('Delete-all quotation lines failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+  assertTechCanWriteQuotation(job.job_status);
+
+  const editableSql = quotationLineState.anyStateSql('quotation_details', quotationLineState.TECH_EDITABLE_STATES);
+  const [result] = await pool.query(
+    `DELETE FROM quotation_details WHERE job_id = ? AND (${editableSql})`,
+    [jobId],
+  );
+  logger.info('Deleted ' + result.affectedRows + ' technician-editable quotation lines · jobId=' + jobId);
+
+  if (Number(job.job_status) === STATUS_PENDING_FOR_MATERIAL) {
+    await maybeRevertFromPendingMaterial(jobId, efrId);
+  }
+  return { deleted: result.affectedRows };
+}
+
+/*
+ * NEW — GET /:id/quotation. The spec names this exact path as "the existing
+ * list" — no such endpoint existed before this change (grep confirms: no
+ * GET quotation route in this router, and no reader of quotation_details
+ * anywhere under routes/mobile/). Added new, to the spec's exact contract
+ * shape, since the CRM and the technician app are building against it in
+ * parallel. See the closing report for this deviation.
+ */
+async function listQuotationLines(jobId, efrId) {
+  logger.info('List quotation lines · jobId=' + jobId);
+  const job = await jobForTech(jobId, efrId);
+  if (!job) logger.warn('List quotation lines failed · job not found or not owned · jobId=' + jobId);
+  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+
+  const [rows] = await pool.query(
+    `SELECT id, type, name, unit, unit_price, material_id, client_service_id,
+            client_charge, approved_charge, sent_on, action_on,
+            ${quotationLineState.quotationLineStateSql('quotation_details')} AS state
+       FROM quotation_details
+      WHERE job_id = ?
+      ORDER BY id DESC`,
+    [jobId],
+  );
+  return {
+    items: rows.map((r) => ({
+      lineId: r.id,
+      type: r.type,
+      name: r.name,
+      quantity: r.unit,
+      amount: r.unit_price,
+      materialId: r.material_id,
+      itemId: r.client_service_id,
+      clientCharge: r.client_charge,
+      approvedCharge: r.approved_charge,
+      sentOn: r.sent_on,
+      actionOn: r.action_on,
+      state: r.state,
+    })),
+  };
+}
+
+/* ─── Send estimate for SPOC approval (Material Request Flow v2) ────────
  * Marks the estimate "sent for approval": stamps
- * tbl_job.approval_sent_on_date_time = now, bumps no_of_req_approval,
- * and moves the order into PENDING_FOR_MATERIAL (16) with
- * material_sub_status = 2 (Review Pending) — NOT 15. This is the behaviour
- * change sub-project D exists for: an unreviewed quote used to reach the
- * client straight from here (job_status = 15, which the client portal
- * treats as "awaiting your decision"); now a PM reviews it first
- * (POST /api/admin/jobs/:id/material-review) and ONLY an approve there
- * moves the job to 15. This is the single source of "estimate sent" the
- * admin quotations expiry endpoint reads (routes/admin/quotations.js GET
+ * tbl_job.approval_sent_on_date_time = now, bumps no_of_req_approval, and
+ * moves the order into PENDING_FOR_MATERIAL (16) with material_sub_status = 2
+ * (Review Pending) — NOT 15. A PM reviews it first
+ * (POST /api/admin/jobs/:id/material-review) and ONLY an approve there moves
+ * the job to 15. This is the single source of "estimate sent" the admin
+ * quotations expiry endpoint reads (routes/admin/quotations.js GET
  * /expiry/:jobId) — that reader is unaffected, since it keys off
  * approval_sent_on_date_time, not job_status.
  *
+ * 2026-09-21 (Material Request Flow v2) rewrites this around the
+ * draft/review_pending line-state model — see the design's "Transitions":
+ *   - `lines` (optional, same shape as the single/bulk add) are inserted as
+ *     DRAFTS in the SAME transaction FIRST, so a send with an inline line
+ *     list is one atomic call.
+ *   - every CURRENT draft for the job (pre-existing + just-inserted) is
+ *     stamped sent_on = now — this is what "drafts -> sent" means; a line
+ *     drafted minutes ago and one drafted in this same call are sent
+ *     together.
+ *   - no draft at all (before OR after inserting `lines`) -> 422 "Add
+ *     materials before sending for approval". Nothing is written.
+ *   - allowed from 1/2/20/16 (job-level lock — see assertTechCanWriteQuotation);
+ *     16 stays 16; 1/2/20 move to 16 and the job's PRE-status is stored
+ *     (services/material-review-store.js) so a later delete-last-line or a
+ *     CRM Reject Request can put it back. 15 -> 409 "Waiting for client
+ *     approval" (via the same job-level lock).
+ *
  * `checkInImageRefs` (optional) — if the app passes check-in image S3 keys
  * alongside the send, we record them as Booking-stage refs so the estimate
- * carries its site photos. Multi-step write (job UPDATE + N image inserts)
- * → wrapped in a transaction per the coding rules.
+ * carries its site photos.
  *
  * Returns { sent: true }.
  */
-async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
-  logger.info('Send estimate for approval · jobId=' + jobId + ' · checkInImageRefs=' + ((Array.isArray(checkInImageRefs) ? checkInImageRefs : []).length));
+async function sendForApproval(jobId, efrId, { checkInImageRefs, lines } = {}) {
+  logger.info('Send estimate for approval · jobId=' + jobId + ' · checkInImageRefs=' + ((Array.isArray(checkInImageRefs) ? checkInImageRefs : []).length) + ' · lines=' + ((Array.isArray(lines) ? lines : []).length));
   const job = await jobForTech(jobId, efrId);
   if (!job) logger.warn('Send for approval failed · job not found or not owned · jobId=' + jobId);
   if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
+  assertTechCanWriteQuotation(job.job_status);
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     const now = new Date();
+
+    if (Array.isArray(lines) && lines.length) {
+      const ctx = await jobEstimateContext(jobId);
+      for (const input of lines) {
+        const resolved = await resolveLineForInsert(job, ctx, input);
+        await insertDraftLine(conn, jobId, efrId, resolved);
+      }
+    }
+
+    // Lock the job's current drafts so a concurrent add can't sneak a line
+    // past the "at least one draft" check between the count and the UPDATE.
+    const [draftRows] = await conn.query(
+      `SELECT id FROM quotation_details
+        WHERE job_id = ? AND (${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.DRAFT)})
+        FOR UPDATE`,
+      [jobId],
+    );
+    if (draftRows.length === 0) {
+      const e = new Error('Add materials before sending for approval'); e.status = 422; throw e;
+    }
+
+    await conn.query(
+      `UPDATE quotation_details SET sent_on = ?
+        WHERE job_id = ? AND (${quotationLineState.statePredicateSql('quotation_details', quotationLineState.STATE.DRAFT)})`,
+      [now, jobId],
+    );
+
+    // Store the pre-status only on the FIRST entry into the material flow —
+    // a job already at 16 keeps whatever it stored the first time.
+    if (Number(job.job_status) !== STATUS_PENDING_FOR_MATERIAL) {
+      await storePreMaterialStatus(jobId, Number(job.job_status), conn);
+    }
 
     await conn.query(
       `UPDATE tbl_job
@@ -424,51 +735,33 @@ async function sendForApproval(jobId, efrId, { checkInImageRefs } = {}) {
     logger.info('Estimate sent for approval · jobId=' + jobId + ' · status=' + STATUS_PENDING_FOR_MATERIAL + '/' + MATERIAL_SUB_STATUS_REVIEW_PENDING);
     return { sent: true };
   } catch (e) {
-    logger.error('Send for approval failed, rolled back · jobId=' + jobId + ' · ' + e.message);
-    await conn.rollback();
+    if (!e.status) logger.error('Send for approval failed, rolled back · jobId=' + jobId + ' · ' + e.message);
+    try { await conn.rollback(); } catch { /* already rolled back above (422 path) */ }
     throw e;
   } finally {
     conn.release();
   }
 }
 
-/* ─── Material Required (Material Management phase 2, sub-project D) ───
- * A technician on a 2/20 job flags that the job cannot close without
- * material: moves the order to PENDING_FOR_MATERIAL (16) with
- * material_sub_status = 1 (Quotation Pending). The estimate stays editable
- * in this sub-state — send-for-approval (above) is the transition into
- * sub-status 2 (Review Pending), which the PM then approves/rejects via
- * POST /api/admin/jobs/:id/material-review.
+/* ─── Material Required — RETIRED as its own transition, kept as an ALIAS
+ * (Material Request Flow v2, 2026-09-21) ───────────────────────────────
+ * material_sub_status = 1 (Quotation Pending) is no longer written by this
+ * codebase — the "raise a request" and "send it for review" steps have
+ * merged into ONE action (sendForApproval). This endpoint is kept only so
+ * older app builds that still call it keep working: it is now a literal
+ * alias, with sendForApproval's own rules (a job with no draft line -> 422;
+ * only reachable from 1/2/20/16; 15 -> 409). Positive behaviour change
+ * older builds must tolerate: previously a bare 2/20 job with NO lines could
+ * be marked material-required; now it 422s ("Add materials before sending
+ * for approval") because there is nothing to send.
  *
- * Guarded to source statuses 2/20 only — those are exactly the "Pending to
- * Close on App" statuses the design's flow diagram starts from. Anything
- * else 409s rather than silently accepting: a job not yet checked in, or
- * already closed/cancelled, has no "material required" moment.
- *
- * Returns { ok: true, status: 16 }.
+ * Returns { ok: true, status: 16 } (sendForApproval's own `{ sent: true }`
+ * carries no `status` key — normalised here so old callers reading
+ * `out.status` still see 16 on success).
  */
 async function materialRequired(jobId, efrId) {
-  logger.info('Mark job material-required · jobId=' + jobId);
-  const job = await jobForTech(jobId, efrId);
-  if (!job) logger.warn('Material-required failed · job not found or not owned · jobId=' + jobId);
-  if (!job) { const e = new Error('job not found'); e.status = 404; throw e; }
-
-  if (![STATUS_IN_PROGRESS, STATUS_IN_PROGRESS_ALT].includes(Number(job.job_status))) {
-    logger.warn('Material-required refused · jobId=' + jobId + ' · job_status=' + job.job_status);
-    const e = new Error('Only a job pending to close on the app can be marked material-required');
-    e.status = 409; throw e;
-  }
-
-  const now = new Date();
-  await pool.query(
-    `UPDATE tbl_job
-        SET job_status = ?,
-            material_sub_status = ?,
-            last_update_time = ?
-      WHERE job_id = ? AND fk_easyfixter_id = ?`,
-    [STATUS_PENDING_FOR_MATERIAL, MATERIAL_SUB_STATUS_QUOTATION_PENDING, now, jobId, efrId],
-  );
-  logger.info('Job marked material-required · jobId=' + jobId + ' · status=' + STATUS_PENDING_FOR_MATERIAL + '/' + MATERIAL_SUB_STATUS_QUOTATION_PENDING);
+  logger.info('Material required (alias of sendForApproval) · jobId=' + jobId);
+  await sendForApproval(jobId, efrId, {});
   return { ok: true, status: STATUS_PENDING_FOR_MATERIAL };
 }
 
@@ -815,8 +1108,11 @@ module.exports = {
   jobForTech,
   getRateCard,
   getJobMaterials,
+  listQuotationLines,
   addQuotationLine,
+  addQuotationLines,
   deleteQuotationLine,
+  deleteAllQuotationLines,
   sendForApproval,
   materialRequired,
   recordImages,

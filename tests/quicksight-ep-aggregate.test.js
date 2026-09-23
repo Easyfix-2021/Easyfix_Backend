@@ -196,6 +196,38 @@ test('txRows without their dates copy count as spanning D.dates', () => {
   }
 });
 
+/*
+ * The Current TX Performance grouping key is feed-dependent, and the parity
+ * fixture cannot see it: build_data.py never emits an Unattributed bucket, so
+ * the dashboard comparison only ever exercises the snapshot branch.
+ */
+test('technicians: the snapshot feed keeps the page\'s (spoc, tx, txid) grouping', () => {
+  const d = syntheticD();
+  // One technician, same TX ID and name, working under two different SPOCs.
+  const base = d.txRows[0];
+  d.txRows = [
+    { ...base, spoc: 'Asha', total: 3, closed: 1, open: 2, ageSum: 9 },
+    { ...base, spoc: 'Bharat', total: 5, closed: 2, open: 3, ageSum: 12 },
+  ];
+  const rows = agg.listTechnicians(d, {}, {});
+  assert.equal(rows.length, 2, 'no Unattributed bucket: the page splits them, so we must too');
+  assert.deepEqual(rows.map((r) => [r.spoc, r.total]), [['Asha', 3], ['Bharat', 5]]);
+});
+
+test('technicians: the live feed merges a technician across SPOCs, because the bucket splits them', () => {
+  const d = syntheticD();
+  // compose.js puts the bucket in primarySpocs; that is what marks the feed.
+  d.primarySpocs = [...d.primarySpocs, 'Unattributed — Furniture'];
+  const base = d.txRows[0];
+  d.txRows = [
+    { ...base, spoc: 'Asha', total: 3, closed: 1, open: 2, ageSum: 9 },
+    { ...base, spoc: 'Unattributed — Furniture', total: 5, closed: 2, open: 3, ageSum: 12 },
+  ];
+  const rows = agg.listTechnicians(d, {}, {});
+  assert.equal(rows.length, 1, 'one technician, one row — not two rows with the same TX ID and name');
+  assert.deepEqual([rows[0].txId, rows[0].total, rows[0].closed, rows[0].open], [base.txid, 8, 3, 5]);
+});
+
 test('member detail: unknown and prototype names are null; only month and dates apply', () => {
   for (const name of ['Hari', 'Nobody', '__proto__', 'constructor', 'toString', undefined, 42]) {
     assert.equal(agg.memberDetail(D, {}, name), null, String(name));

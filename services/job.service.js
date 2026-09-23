@@ -28,6 +28,11 @@ const {
 const { deriveTimeSlot, resolveTimeSlot, hasTimeOfDay, wallClockTime } = require('./time-slot');
 const easyfixerLifecycle = require('./easyfixer-lifecycle.service');
 const easyfixerWorkEligibility = require('./easyfixer-work-eligibility.service');
+// Material Request Flow v2 (2026-09-21) — pre_material_status read/write +
+// the single line-state derivation. See services/material-review-store.js and
+// services/quotation-line-state.js headers.
+const { storePreMaterialStatus } = require('./material-review-store');
+const quotationLineState = require('./quotation-line-state');
 const {
   persistJobOfferBatch,
   MAX_OFFER_RECIPIENTS,
@@ -567,6 +572,39 @@ const SORTABLE_COLUMNS = {
   // Category, on the alias the projection already emits it from.
   service_category: 'sc.service_catg_name',
 };
+
+/*
+ * material_state / material_count (Material Request Flow v2, 2026-09-21) —
+ * job-level rollup over quotation_details, unconditional (every column it
+ * touches — job_status, sent_on, action_on, status, client_status — is
+ * either long-standing or shipped in the SAME migration as this feature; see
+ * migrations/2026-09-21-material-request-flow-v2.sql). One fragment, used by
+ * both the LIST projection and getByIdCore, so the mobile list, the mobile
+ * detail and the admin detail can never disagree about a job's material
+ * state. Built ONLY from services/quotation-line-state.js's predicates —
+ * never a hand-written copy of "sent_on IS NULL" etc.
+ *
+ * material_state: 'review_pending' at job_status 16, 'approval_pending' at
+ * job_status 15, else 'draft' when any draft line exists, else NULL.
+ * material_count: count of lines in draft/review_pending/approval_pending —
+ * the technician/CRM "still open" set (quotationLineState.OPEN_STATES).
+ */
+function materialStateColumns() {
+  const draftExists = quotationLineState.statePredicateSql('mst', quotationLineState.STATE.DRAFT);
+  const openLine = quotationLineState.openLineSql('msc');
+  return `,
+  CASE
+    WHEN j.job_status = 16 THEN 'review_pending'
+    WHEN j.job_status = 15 THEN 'approval_pending'
+    WHEN EXISTS (SELECT 1 FROM quotation_details mst WHERE mst.job_id = j.job_id AND ${draftExists})
+      THEN 'draft'
+    ELSE NULL
+  END AS material_state,
+  (SELECT COUNT(*) FROM quotation_details msc
+     WHERE msc.job_id = j.job_id
+       AND (${openLine})
+  ) AS material_count`;
+}
 
 // ─── Projections ────────────────────────────────────────────────────
 // Note: extra columns (ticket_created_date_time, time_slot, client_spoc*,
@@ -1400,6 +1438,35 @@ async function resolveClientPrimarySpoc(clientId, conn) {
     [clientId],
   );
   return head?.user_id ?? null;
+}
+
+/*
+ * The client's Primary (user_type 1) and Secondary (user_type 2) EasyFix SPOCs
+ * WITH their emails — the same tbl_vertical_mapping rule the job console's
+ * Primary/Secondary SPOC names read (latest active mapping per type), so a mail
+ * CC and the header can never disagree about who the SPOCs are. Either may be
+ * null. Used to CC both on the material "Send Request to Client" email.
+ */
+async function resolveClientSpocUsers(clientId, conn) {
+  if (!clientId) return { primary: null, secondary: null };
+  const db = conn || pool;
+  const orderBy = (await hasVerticalMappingInsertedOnColumn())
+    ? 'vm.inserted_on DESC, vm.id DESC'
+    : 'vm.id DESC';
+  const one = async (userType) => {
+    const [[row]] = await db.query(
+      `SELECT u.user_id, u.user_name, u.official_email AS email
+         FROM tbl_vertical_mapping vm
+         JOIN tbl_user u ON u.user_id = vm.user_id
+        WHERE vm.client_id = ? AND vm.user_type = ?
+          AND (vm.status IS NULL OR vm.status = 1)
+        ORDER BY ${orderBy}
+        LIMIT 1`,
+      [clientId, userType],
+    );
+    return row || null;
+  };
+  return { primary: await one(1), secondary: await one(2) };
 }
 
 /*
@@ -2695,6 +2762,13 @@ async function list({
    */
   delegatedToEfrId,
   /*
+   * `sendBackToTx` (2026-09-22) — the tech app's "Waiting for Me" chip: jobs
+   * the CRM sent back (send_back_to_tx = 1). Same predicate as the dashboard's
+   * actionRequired count, so the chip's list and its count agree. Passed only
+   * by GET /api/mobile/jobs?actionRequired=true.
+   */
+  sendBackToTx,
+  /*
    * `readyForBilling` (2026-08-26) — the client portal's "In-Warranty Orders"
    * tab. Two predicates, always together: ready_for_billing = 'Yes' AND
    * sub_job_id IS NULL. They travel as ONE filter because the second is not a
@@ -2876,6 +2950,7 @@ async function list({
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
     + JOB_AGE_COLUMNS()
+    + materialStateColumns()
     + escalationColumns(wantsEscalation)
     + manageColumns(wantsManage, hasJobOffer);
   const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
@@ -3054,6 +3129,8 @@ async function list({
       params.push(easyfixerId);
     }
   }
+  // No column → nothing can have been sent back, so an empty list, not a 500.
+  if (sendBackToTx) clauses.push(await hasSendBackToTxColumn() ? 'j.send_back_to_tx = 1' : '1 = 0');
   if (ownerId != null)     { clauses.push('j.job_client_owner = ?');        params.push(ownerId); }
   if (Array.isArray(clientOwnerIds) && clientOwnerIds.length) {
     clauses.push(`j.job_client_owner IN (${clientOwnerIds.map(() => '?').join(',')})`);
@@ -3891,6 +3968,7 @@ async function getByIdCore(jobId) {
                JOB_AGE_COLUMNS is a LEADING-comma fragment, so the line above
                must NOT end in one. */
             ${JOB_AGE_COLUMNS()}
+            ${materialStateColumns()}
      ${DETAIL_JOIN}
      WHERE j.job_id = ? LIMIT 1`,
     [jobId]
@@ -6157,7 +6235,7 @@ async function hasAfterWorkPhoto(jobId) {
   return rows.length > 0;
 }
 
-async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { partnerApi = false } = {}) {
+async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { partnerApi = false, conn: externalConn = null } = {}) {
   logger.info('Set job status · id=' + jobId + ' · status=' + status + (reasonId != null ? ' · reasonId=' + reasonId : ''));
   if (!ALL_STATUS_VALUES.has(Number(status))) {
     logger.warn('Set status rejected, invalid status · id=' + jobId + ' · status=' + status);
@@ -6338,6 +6416,26 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     extras = rest;
   }
 
+  /*
+   * pre_material_status (Material Request Flow v2, 2026-09-21) — same
+   * treatment as material_reject_reason immediately above: no tbl_job column
+   * exists for it (row-size ceiling), so it routes to tbl_job_material_review
+   * instead of the UPDATE. Callers pass it in `extras` under this name (the
+   * CRM add-line → 15 path stores the job's status just before this move);
+   * the Reject Request → pre-status path READS it first (via
+   * getPreMaterialStatus, before calling setStatus with the resolved target
+   * status) rather than through this key.
+   */
+  let preMaterialStatus;
+  let hasPreMaterialStatus = false;
+  if (extras && typeof extras === 'object' && 'pre_material_status' in extras) {
+    preMaterialStatus = extras.pre_material_status;
+    hasPreMaterialStatus = preMaterialStatus !== undefined;
+    const rest = { ...extras };
+    delete rest.pre_material_status;
+    extras = rest;
+  }
+
   // Tier-specific extras — caller passes a map of column→value pairs
   // for transition side-effects that don't generalise (mobile GPS
   // checkin, app_checkout_date_time, etc.). Whitelisted to prevent
@@ -6417,7 +6515,15 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
         + ' · fix the job, then a CRM move into 3/5 or the backfill posts it');
     }
   } else {
-    await pool.query(updateSql, values);
+    /*
+     * Ops Material Review (sub-project E, 2026-09-18) hands its OWN open
+     * transaction here via `conn` so the quotation_details line writes it
+     * already did and this job_status move commit or roll back together —
+     * a line write failing must leave the job at 16, not partway to 15. Every
+     * other caller omits `conn` and gets the pre-existing pool.query
+     * behaviour unchanged.
+     */
+    await (externalConn || pool).query(updateSql, values);
     if (entersCompletion) {
       logger.warn('Completed without a CRM user · id=' + jobId + ' · ' + existing.job_status + '->' + Number(status)
         + ' · ledger not posted; the next CRM move into 3/5 or the backfill posts it');
@@ -6446,6 +6552,15 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
                                reviewed_at   = VALUES(reviewed_at)`,
       [jobId, materialRejectReason, crmUserId || null, new Date()],
     );
+  }
+
+  // pre_material_status — same non-atomic caveat as material_reject_reason
+  // above (a separate pool.query, not the same transaction as the status
+  // UPDATE): writing the pre-status a beat after the job moves into 16/15 is
+  // recoverable (the job just re-enters the material flow), unlike a lost
+  // reject reason there is no user-facing message to lose.
+  if (hasPreMaterialStatus) {
+    await storePreMaterialStatus(jobId, preMaterialStatus);
   }
 
   /*
@@ -8534,6 +8649,8 @@ module.exports = {
   getJobTimelineActors,
   // The console header's client-side extras (SPOCs, vertical, escalation) — see its docblock.
   getJobConsoleExtras,
+  // Primary + Secondary SPOC users with emails — the material client-request CC.
+  resolveClientSpocUsers,
   hasAfterWorkPhoto, afterPhotoRequiredError,
   // Technician app requests. rejectAppRequest is the Reject button; there is no
   // approve twin because Approve is the ordinary cancel/reschedule, and

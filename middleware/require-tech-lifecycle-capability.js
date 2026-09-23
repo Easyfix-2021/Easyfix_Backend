@@ -101,6 +101,27 @@ function applyLifecycleGate(req, res, next) {
 async function applyShareLock(req, res, next) {
   const path = req.path || req.originalUrl || '';
   const match = JOB_ID_PATH.exec(path);
+
+  // A shared-job GUEST (web link) is the delegate by construction: requireTechAuth
+  // already resolved it to the sharer's identity and confirmed the share is
+  // live, and requireShareGuestScope confined it to this job. Without this
+  // branch resolveLock would see the SHARER's efr_id and refuse every write.
+  if (req.shareGuest) {
+    req.jobShare = req.shareGuest.share;
+    if (req.shareGuest.status === 'accepted' && !SAFE_METHODS.has(String(req.method || '').toUpperCase())) {
+      try {
+        req.jobShare = await delegation.markStarted(req.shareGuest.share);
+        req.shareGuest.status = 'started';
+      } catch (e) {
+        if (e.status === 409) {
+          return modernError(res, 409, 'This shared job was just taken back.', { code: 'share_conflict' });
+        }
+        throw e;
+      }
+    }
+    return applyLifecycleGate(req, res, next);
+  }
+
   const efrId = req.tech && req.tech.efr_id;
   // Not a single-job route, or no identity to compare against (the lifecycle
   // guard's own unit tests call it with a bare `{ lifecycle }` tech).

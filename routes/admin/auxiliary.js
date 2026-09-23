@@ -86,6 +86,13 @@ router.post('/attendance', validate(Joi.object({
 // `total_price` is server-side computed = unit_price × quantity so the
 // stored value can never drift from the math, regardless of what the
 // client sends.
+// Material Request Flow v2 (2026-09-21): job_material also holds the Billing
+// & Charges typed rows (Penalty/Travel/Incentive — see
+// services/job-charges.service.js), discriminated by the SAME `type` column
+// this route never used to filter on. type IS NULL is the shape this route's
+// own POST /materials below writes (it never sets `type` at all); an
+// explicit type='Material' is left open for a future writer. Travel/Penalty/
+// Incentive rows are the Billing tab's, never this one's.
 router.get('/materials/job/:jobId', async (req, res, next) => {
   try {
     logger.info('List materials for job · jobId=' + req.params.jobId);
@@ -94,6 +101,7 @@ router.get('/materials/job/:jobId', async (req, res, next) => {
               unit, unit_price, total_price
          FROM job_material
         WHERE job_id = ?
+          AND (type IS NULL OR type = 'Material')
         ORDER BY id DESC`,
       [req.params.jobId]
     );

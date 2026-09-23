@@ -130,6 +130,50 @@ router.post('/:id/quotation', validate(idParam, 'params'), validate(quotationBod
   } catch (e) { logger.warn('Add quotation line failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
+// ─── Quotation: list (Material Request Flow v2) ────────────────────────
+// GET /:id/quotation → { items: [{ lineId, type, name, quantity, amount,
+//   materialId, itemId, clientCharge, approvedCharge, sentOn, actionOn,
+//   state }] } — each line's `state` from services/quotation-line-state.js.
+router.get('/:id/quotation', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('List quotation lines · jobId=' + req.params.id);
+    const out = await estimateService.listQuotationLines(Number(req.params.id), req.tech.efr_id);
+    logger.info('Returning ' + (out.items ? out.items.length : 0) + ' quotation lines');
+    modernOk(res, out);
+  } catch (e) { logger.warn('List quotation lines failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
+// ─── Quotation: bulk draft add (Material Request Flow v2) ──────────────
+// POST /:id/quotation/draft { lines: [...] } (1..50, same shape as the
+// single add) → { lineIds }, one transaction.
+const quotationDraftBody = Joi.object({
+  lines: Joi.array().items(quotationBody).min(1).max(50).required(),
+});
+
+router.post('/:id/quotation/draft', validate(idParam, 'params'), validate(quotationDraftBody), async (req, res, next) => {
+  try {
+    logger.info('Add quotation lines (bulk draft) · jobId=' + req.params.id + ' · count=' + req.body.lines.length);
+    const out = await estimateService.addQuotationLines(Number(req.params.id), req.tech.efr_id, req.body.lines.map((l) => ({
+      type: l.type, itemId: l.itemId, name: l.name, quantity: l.quantity, amount: l.amount,
+      materialId: l.materialId, brandId: l.brandId,
+    })));
+    logger.info('Bulk draft lines created · jobId=' + req.params.id + ' · count=' + out.lineIds.length);
+    res.status(201);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Add quotation lines (bulk draft) failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
+// ─── Quotation: delete ALL technician-editable lines ────────────────────
+// DELETE /:id/quotation → { deleted: n } — draft + review_pending lines only.
+router.delete('/:id/quotation', validate(idParam, 'params'), async (req, res, next) => {
+  try {
+    logger.info('Delete all technician-editable quotation lines · jobId=' + req.params.id);
+    const out = await estimateService.deleteAllQuotationLines(Number(req.params.id), req.tech.efr_id);
+    logger.info('Deleted ' + out.deleted + ' quotation lines · jobId=' + req.params.id);
+    modernOk(res, out);
+  } catch (e) { logger.warn('Delete all quotation lines failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
+});
+
 // ─── Quotation: delete a line ──────────────────────────────────────────
 // The RN client calls POST to quotation/:lineId to DELETE the line, so we
 // implement delete semantics on BOTH POST and DELETE for the same path.
@@ -167,14 +211,23 @@ router.post('/:id/material-required', validate(idParam, 'params'), async (req, r
 });
 
 // ─── Send for approval ─────────────────────────────────────────────────
-// POST /:id/send-for-approval { checkInImageRefs? } → { sent: true }
+// POST /:id/send-for-approval { checkInImageRefs?, lines? } → { sent: true }
+// `lines` (Material Request Flow v2, 2026-09-21) — same shape as the draft
+// add — are inserted as drafts in the SAME transaction before the send.
 router.post('/:id/send-for-approval', validate(idParam, 'params'), validate(Joi.object({
   checkInImageRefs: Joi.array().items(Joi.string().trim().max(512)).optional(),
+  lines: Joi.array().items(quotationBody).max(50).optional(),
 })), async (req, res, next) => {
   try {
-    logger.info('Send estimate for approval · jobId=' + req.params.id + ' · checkInImageRefs=' + ((req.body.checkInImageRefs && req.body.checkInImageRefs.length) || 0));
+    logger.info('Send estimate for approval · jobId=' + req.params.id + ' · checkInImageRefs=' + ((req.body.checkInImageRefs && req.body.checkInImageRefs.length) || 0) + ' · lines=' + ((req.body.lines && req.body.lines.length) || 0));
     const out = await estimateService.sendForApproval(
-      Number(req.params.id), req.tech.efr_id, { checkInImageRefs: req.body.checkInImageRefs },
+      Number(req.params.id), req.tech.efr_id, {
+        checkInImageRefs: req.body.checkInImageRefs,
+        lines: req.body.lines && req.body.lines.map((l) => ({
+          type: l.type, itemId: l.itemId, name: l.name, quantity: l.quantity, amount: l.amount,
+          materialId: l.materialId, brandId: l.brandId,
+        })),
+      },
     );
     logger.info('Estimate sent for approval · jobId=' + req.params.id);
     modernOk(res, out);

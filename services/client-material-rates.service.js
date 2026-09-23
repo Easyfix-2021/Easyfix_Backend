@@ -243,7 +243,16 @@ async function options(clientId) {
 
 // ─── Replace (add / edit — same call) ────────────────────────────────
 
-async function replace(clientId, materialId, input, actor = {}) {
+/*
+ * `conn` (optional, 5th arg): pass an open transaction connection so a
+ * caller writing several materials atomically (the rate-card bulk-upload
+ * commit — one file, one transaction, all materials or none) shares that
+ * ONE transaction instead of each replace() beginning/committing its own.
+ * Same idiom as job.service.js#setStatus's `conn: externalConn` param.
+ * Omitted (every existing caller), replace() manages its own transaction
+ * exactly as before.
+ */
+async function replace(clientId, materialId, input, actor = {}, { conn: externalConn = null } = {}) {
   clientId = Number(clientId);
   materialId = Number(materialId);
   const groups = Array.isArray(input.groups) ? input.groups : [];
@@ -254,9 +263,10 @@ async function replace(clientId, materialId, input, actor = {}) {
   validateClientGroupsPayload(groups);
   await assertBrandsAndStatesExist(groups);
 
-  const conn = await pool.getConnection();
+  const conn = externalConn || await pool.getConnection();
+  const manageTx = !externalConn;
   try {
-    await conn.beginTransaction();
+    if (manageTx) await conn.beginTransaction();
     await conn.query(
       `DELETE FROM tbl_client_material_state_price_state
         WHERE group_id IN (SELECT group_id FROM tbl_client_material_price_group WHERE client_id = ? AND material_id = ?)`,
@@ -303,15 +313,15 @@ async function replace(clientId, materialId, input, actor = {}) {
         }
       }
     }
-    await conn.commit();
+    if (manageTx) await conn.commit();
     logger.info({ client_id: clientId, material_id: materialId }, 'Client material rate saved');
     return { material_id: materialId, saved: true };
   } catch (e) {
-    await conn.rollback();
+    if (manageTx) await conn.rollback();
     logger.error('Save client material rate failed, rolled back · ' + e.message);
     throw e;
   } finally {
-    conn.release();
+    if (manageTx) conn.release();
   }
 }
 

@@ -40,11 +40,15 @@ const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
 const materialRatesSvc = require('../../services/client-material-rates.service');
+const rateCardUploadSvc = require('../../services/rate-card-bulk-upload.service');
+const lookupSvc = require('../../services/lookup.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
 // Same module the client portal's Performance book judges against — see the
 // GET /:clientId/targets handler for why this is a passthrough, not a copy.
 const targetSvc = require('../../services/client-target.service');
 const xlsxSvc = require('../../services/client-xlsx.service');
+const { renderRateCardPdf } = require('../../utils/pdf-rate-card');
+const { todayIst } = require('../../utils/ist-calendar');
 const { pool } = require('../../db');
 const s3 = require('../../utils/s3-storage');
 const v = require('../../validators/client.validator');
@@ -61,6 +65,18 @@ const DOC_MIME = new Set([
   'image/png', 'image/jpeg', 'image/webp', 'image/gif',
   'application/pdf',
 ]);
+
+// Multer in-memory storage for the Rate Card Bulk Upload (.xlsx only) —
+// same shape as routes/admin/materials.js's `upload` for the Manage
+// Materials import.
+const uploadRateCardXlsx = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/\.(xlsx|xls)$/i.test(file.originalname)) cb(null, true);
+    else cb(new Error('Only .xlsx / .xls files are accepted'));
+  },
+});
 
 /* ─── Permission gates ────────────────────────────────────────────── */
 // Migrated 2026-05-30 from inline `req.user.permissions.actionPermissions`
@@ -1636,6 +1652,65 @@ router.delete(
   },
 );
 
+/*
+ * Rate Card Bulk Upload — Services tab
+ * (docs/superpowers/specs/2026-09-21-rate-card-bulk-upload-design.md).
+ *
+ * GET  /:clientId/rate-cards/template        → blank template (header + 1 example row)
+ * POST /:clientId/rate-cards/upload/preview  → parse + validate, writes nothing
+ * POST /:clientId/rate-cards/upload/commit   → re-validates, writes in ONE transaction
+ *
+ * Accepts exactly what GET /:clientId/rate-cards/download writes
+ * (exportRateCards' columns). Client id is ALWAYS the URL param — never
+ * read from the file. All three sit behind isClientEdit, unlike the
+ * read-only rate-cards routes above.
+ */
+router.get('/:clientId/rate-cards/template', requireClientEdit, async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    logger.info('Download services rate-card template · clientId=' + req.params.clientId);
+    await rateCardUploadSvc.generateServicesTemplate(res);
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/:clientId/rate-cards/upload/preview',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Preview services rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.previewServicesUpload(req.file.buffer, req.params.clientId);
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.post(
+  '/:clientId/rate-cards/upload/commit',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Commit services rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.commitServicesUpload(
+        req.file.buffer, req.params.clientId, { userId: req.user && req.user.user_id },
+      );
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.rows ? { rows: e.rows, summary: e.summary } : undefined);
+      next(e);
+    }
+  },
+);
+
 /* ─── Client Material Rates (Material Management phase 2, sub-project C) ──
  *
  * Client-specific material price overrides on top of the material master
@@ -1666,6 +1741,15 @@ const clientMaterialGroupEntry = Joi.object({
 const clientMaterialRatesBody = Joi.object({
   groups: Joi.array().items(clientMaterialGroupEntry).min(1).required(),
 });
+// Batch add (CRM "Add Materials" modal) — one POST replaces N sequential
+// picker→PUT round trips. Same group shape as the single PUT above, just
+// keyed by material_id per entry.
+const clientMaterialBatchBody = Joi.object({
+  materials: Joi.array().items(Joi.object({
+    material_id: Joi.number().integer().positive().required(),
+    groups: Joi.array().items(clientMaterialGroupEntry).min(1).required(),
+  })).min(1).required(),
+});
 
 // materialId is a path segment shared with :clientId — validated inline
 // (rather than via the `validate()` Joi middleware) so a schema scoped to
@@ -1695,6 +1779,104 @@ router.get('/:clientId/material-rates/options', async (req, res, next) => {
     if (!(await loadAndGuardClient(req, res))) return;
     const items = await materialRatesSvc.options(req.params.clientId);
     modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /:clientId/material-rates/download
+ * Streams the client's material rate card as XLSX — same recipe as
+ * GET /:clientId/rate-cards/download (loadAndGuardClient scope guard, same
+ * read-level permission as the list route above, xlsxSvc → buffer → attachment
+ * headers). One row per client price GROUP (list() already shapes materials
+ * into groups; a material with several brand-scoped groups gets one row per
+ * group), so we project it straight into the exporter rather than re-querying.
+ */
+router.get('/:clientId/material-rates/download', async (req, res, next) => {
+  try {
+    logger.info('Download client material rates XLSX · clientId=' + req.params.clientId);
+    const client = await loadAndGuardClient(req, res);
+    if (!client) return;
+    const items = await materialRatesSvc.list(req.params.clientId);
+    const states = await lookupSvc.states();
+    const stateNameById = new Map(states.map((s) => [s.state_id, s.state_name]));
+    logger.info('Exporting ' + items.length + ' client material-rate materials to XLSX');
+    const buf = await xlsxSvc.exportMaterialRates(items, stateNameById);
+    const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="material-rates-${safeName}.xlsx"`);
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+/*
+ * The client's business vertical, for the PDF's "<Client Name> · <Vertical>"
+ * line (e.g. "A10 Design · Furniture") — same tbl_client.vertical_id →
+ * tbl_vertical.vertical_name join job.service.js's job-detail endpoint uses.
+ * A one-off SELECT rather than lookupSvc.verticals() (which filters to
+ * status = 1 only — a client on an since-deactivated vertical would then
+ * show no line at all).
+ */
+async function getVerticalName(verticalId) {
+  if (!verticalId) return null;
+  const [[row]] = await pool.query('SELECT vertical_name FROM tbl_vertical WHERE vertical_id = ?', [verticalId]);
+  return row ? row.vertical_name : null;
+}
+
+/*
+ * GET /:clientId/rate-cards/export.xlsx
+ *
+ * ONE workbook, sheet "Services" + sheet "Materials" — the single Download
+ * button that replaced the CRM's two per-tab Download buttons. Same guard
+ * and read-level permission as the per-tab downloads above; reuses their
+ * exact data sources (rateCardsSvc.listForClient / materialRatesSvc.list),
+ * just handed to xlsxSvc.exportRateCardWorkbook() instead of the two
+ * single-sheet exporters.
+ */
+router.get('/:clientId/rate-cards/export.xlsx', async (req, res, next) => {
+  try {
+    logger.info('Download combined rate-card workbook · clientId=' + req.params.clientId);
+    const client = await loadAndGuardClient(req, res);
+    if (!client) return;
+    const [rateCards, items, states] = await Promise.all([
+      rateCardsSvc.listForClient(req.params.clientId),
+      materialRatesSvc.list(req.params.clientId),
+      lookupSvc.states(),
+    ]);
+    const stateNameById = new Map(states.map((s) => [s.state_id, s.state_name]));
+    const buf = await xlsxSvc.exportRateCardWorkbook(rateCards, items, stateNameById);
+    const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="rate-card-${safeName}.xlsx"`);
+    res.send(buf);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /:clientId/rate-cards/export.pdf
+ *
+ * Letterhead PDF for sharing OUTSIDE EasyFix — see utils/pdf-rate-card.js
+ * for why the Services table shows only the charged rate (tbl_client_
+ * service.total_amount, aliased `total_amount` by rateCardsSvc.listForClient)
+ * and never the internal Easyfix Direct / Overhead / Client split.
+ */
+router.get('/:clientId/rate-cards/export.pdf', async (req, res, next) => {
+  try {
+    logger.info('Download rate-card letterhead PDF · clientId=' + req.params.clientId);
+    const client = await loadAndGuardClient(req, res);
+    if (!client) return;
+    const [rateCards, items, states, verticalName] = await Promise.all([
+      rateCardsSvc.listForClient(req.params.clientId),
+      materialRatesSvc.list(req.params.clientId),
+      lookupSvc.states(),
+      getVerticalName(client.vertical_id),
+    ]);
+    const stateNameById = new Map(states.map((s) => [s.state_id, s.state_name]));
+    const brandLine = verticalName ? `${client.client_name} · ${verticalName}` : null;
+    const safeName = String(client.client_name || `client-${client.client_id}`).replace(/[^a-z0-9_-]+/gi, '_');
+    const today = todayIst();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="rate-card-${safeName}-${today}.pdf"`);
+    renderRateCardPdf({ client, brandLine, services: rateCards, materialItems: items, stateNameById, stream: res });
   } catch (e) { next(e); }
 });
 
@@ -1745,6 +1927,124 @@ router.post(
       modernOk(res, out);
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+/*
+ * POST /:clientId/material-rates/batch — CRM "Add Materials" modal.
+ *
+ * Writes several materials' price groups in ONE transaction — same
+ * all-or-nothing contract as rate-card-bulk-upload's commitMaterialRatesUpload
+ * (see that function in services/rate-card-bulk-upload.service.js for the
+ * identical open-conn/loop/replace(conn)/commit-or-rollback shape). Each
+ * material still goes through materialRatesSvc.replace()'s own validation
+ * (material active, validateClientGroupsPayload, assertBrandsAndStatesExist)
+ * before it writes anything, so a bad entry anywhere in the batch rolls back
+ * every entry already written ahead of it — nothing partially lands.
+ */
+router.post(
+  '/:clientId/material-rates/batch',
+  requireClientEdit,
+  validate(clientMaterialBatchBody),
+  async (req, res, next) => {
+    try {
+      logger.info('Batch-add client material rates · clientId=' + req.params.clientId);
+      if (!(await loadAndGuardClient(req, res))) return;
+
+      const materials = req.body.materials;
+      const seen = new Set();
+      for (const m of materials) {
+        if (seen.has(m.material_id)) return modernError(res, 422, `Duplicate material_id ${m.material_id} in batch.`);
+        seen.add(m.material_id);
+      }
+
+      const actor = { userId: req.user && req.user.user_id };
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        for (const m of materials) {
+          try {
+            await materialRatesSvc.replace(req.params.clientId, m.material_id, { groups: m.groups }, actor, { conn });
+          } catch (e) {
+            // Any per-material failure (material inactive/missing, bad groups,
+            // unknown brand/state) surfaces as 422 naming the material — per
+            // spec, nothing written, regardless of replace()'s own status
+            // (e.g. its 404 "Material not found").
+            if (e.status) { e.status = 422; e.message = `material_id ${m.material_id}: ${e.message}`; }
+            throw e;
+          }
+        }
+        await conn.commit();
+      } catch (e) {
+        await conn.rollback();
+        logger.error('Batch client material rates failed, rolled back · ' + e.message);
+        if (e.status) return modernError(res, e.status, e.message);
+        throw e;
+      } finally {
+        conn.release();
+      }
+
+      modernOk(res, { saved: materials.length, material_ids: materials.map((m) => m.material_id) });
+    } catch (e) { next(e); }
+  },
+);
+
+/*
+ * Rate Card Bulk Upload — Materials tab
+ * (docs/superpowers/specs/2026-09-21-rate-card-bulk-upload-design.md).
+ *
+ * GET  /:clientId/material-rates/template        → blank template
+ * POST /:clientId/material-rates/upload/preview  → parse + validate, writes nothing
+ * POST /:clientId/material-rates/upload/commit   → re-validates, writes in ONE transaction
+ *
+ * Accepts exactly what GET /:clientId/material-rates/download writes
+ * (exportMaterialRates' flat Material | Brand | Price | State columns —
+ * 2026-09-21 redesign). Client id is ALWAYS the URL param. All three sit
+ * behind isClientEdit, unlike the read-only material-rates routes above.
+ */
+router.get('/:clientId/material-rates/template', requireClientEdit, async (req, res, next) => {
+  try {
+    if (!(await loadAndGuardClient(req, res))) return;
+    logger.info('Download material rate-card template · clientId=' + req.params.clientId);
+    await rateCardUploadSvc.generateMaterialRatesTemplate(res);
+  } catch (e) { next(e); }
+});
+
+router.post(
+  '/:clientId/material-rates/upload/preview',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Preview material rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.previewMaterialRatesUpload(req.file.buffer, req.params.clientId);
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message);
+      next(e);
+    }
+  },
+);
+
+router.post(
+  '/:clientId/material-rates/upload/commit',
+  requireClientEdit,
+  uploadRateCardXlsx.single('file'),
+  async (req, res, next) => {
+    try {
+      if (!(await loadAndGuardClient(req, res))) return;
+      if (!req.file) return modernError(res, 400, 'file required');
+      logger.info('Commit material rate-card upload · clientId=' + req.params.clientId);
+      const out = await rateCardUploadSvc.commitMaterialRatesUpload(
+        req.file.buffer, req.params.clientId, { userId: req.user && req.user.user_id },
+      );
+      modernOk(res, out);
+    } catch (e) {
+      if (e.status) return modernError(res, e.status, e.message, e.rows ? { rows: e.rows, summary: e.summary } : undefined);
       next(e);
     }
   },

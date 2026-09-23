@@ -4,6 +4,7 @@ const multer = require('multer');
 
 const validate       = require('../../middleware/validate');
 const requireAction   = require('../../middleware/require-action');
+const { requireAnyAction } = requireAction;
 const svc      = require('../../services/material.service');
 const brandSvc = require('../../services/brand.service');
 const imports  = require('../../services/material-import.service');
@@ -101,7 +102,13 @@ router.post('/import/errors.xlsx', requireAction('isMaterialImport'), upload.sin
 
 // ─── CRUD ────────────────────────────────────────────────────────────────
 
-router.get('/', requireAction('isMaterialView'), validate(listQuery, 'query'), async (req, res, next) => {
+// Read-only any-of: the CRM's Material Review "Add Material" dialog
+// (isJobMaterialReview — roles 2 Admin and 13 Project Manager) searches this
+// list to add a line, so a PM without isMaterialView must not 403 here. See
+// middleware/require-action.js's requireAnyAction header — isMaterialView is
+// deliberately NOT granted to role 13, so the standalone Manage Materials
+// screen stays closed to a PM; only these two GETs open up.
+router.get('/', requireAnyAction(['isMaterialView', 'isJobMaterialReview']), validate(listQuery, 'query'), async (req, res, next) => {
   try { modernOk(res, await svc.listMaterials(req.query)); } catch (e) { next(e); }
 });
 
@@ -111,7 +118,7 @@ router.post('/', requireAction('isMaterialAddNew'), validate(writeBody), async (
   catch (e) { sendSvcError(res, next, e); }
 });
 
-router.get('/:id', requireAction('isMaterialView'), validate(idParam, 'params'), async (req, res, next) => {
+router.get('/:id', requireAnyAction(['isMaterialView', 'isJobMaterialReview']), validate(idParam, 'params'), async (req, res, next) => {
   try {
     const row = await svc.getMaterialById(Number(req.params.id));
     if (!row) return modernError(res, 404, 'Material not found');

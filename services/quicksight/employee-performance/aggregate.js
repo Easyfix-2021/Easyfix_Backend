@@ -535,26 +535,37 @@ function pageOpenJobs(D, filters, paging) {
 
 /*
  * Current TX Performance: rows filtered on their own vertical/spoc/zm and on
- * having any selected date, re-grouped by (tx, txid) in first-seen order.
+ * having any selected date, grouped in first-seen order.
  *
- * The page grouped by (spoc, tx, txid), which split ONE technician into two
- * rows — identical TX ID, identical name, and no SPOC column to tell them
- * apart — whenever their jobs sat under two SPOCs. The Unattributed bucket
- * makes that the normal case (half a technician's jobs attributed, half not),
- * so the group is the technician. `spoc` is kept on the row for callers that
- * key on it; when a technician's jobs span several SPOCs it is the first one
- * seen, which is why nothing renders it as "the" SPOC.
+ * The grouping KEY depends on the feed, because the two differ:
+ *
+ *   LIVE (compose.js) — (tx, txid), so the group is the technician. The
+ *     Unattributed bucket routinely splits one technician's jobs across two
+ *     SPOCs (half attributed, half not), and keying on the SPOC would print
+ *     them as two rows with an identical TX ID and name and no SPOC column
+ *     to tell them apart.
+ *   SNAPSHOT (build_data.py) — (spoc, tx, txid), the page's own key. That
+ *     feed never emits an Unattributed bucket, and this endpoint is
+ *     parity-tested against the MIS dashboard, which groups by SPOC.
+ *     Merging here would make the tab and the dashboard disagree for any
+ *     technician who worked under two SPOCs.
+ *
+ * The bucket's presence in D.primarySpocs is what tells them apart, so
+ * neither caller has to pass a flag. `spoc` is kept on the row for callers
+ * that key on it; in the live case it is the first SPOC seen, which is why
+ * nothing renders it as "the" SPOC.
  */
 function technicianGroups(D, filters) {
   const nf = normaliseFilters(D, filters);
   const ds = new Set(selectedDateList(D, nf));
   const allDates = list(D.dates);
   const groups = new Map();
+  const mergeAcrossSpocs = list(D.primarySpocs).some(isUnattributedKey);
   list(D.txRows)
     .filter((x) => verticalOk(nf, x.vertical) && employeeOk(nf, x.spoc) && (nf.zm === ALL || x.zm === nf.zm))
     .filter((x) => (Array.isArray(x.dates) ? x.dates : allDates).some((z) => ds.has(z)))
     .forEach((x) => {
-      const k = x.tx + '|' + x.txid;
+      const k = mergeAcrossSpocs ? x.tx + '|' + x.txid : x.spoc + '|' + x.tx + '|' + x.txid;
       if (!groups.has(k)) groups.set(k, { spoc: x.spoc, tx: x.tx, txid: x.txid, vertical: x.vertical, total: 0, closed: 0, open: 0, ageSum: 0 });
       const g = groups.get(k);
       g.total += x.total || 0; g.closed += x.closed || 0; g.open += x.open || 0; g.ageSum += x.ageSum || 0;

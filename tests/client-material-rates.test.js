@@ -18,7 +18,7 @@
  *      guarded via the client's own loadAndGuardClient (same mechanism
  *      tests/client-rate-card-delete-scope.test.js verifies elsewhere).
  */
-const { test, beforeEach } = require('node:test');
+const { test, beforeEach, describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -290,4 +290,260 @@ test('GET routes for material-rates carry no write gate (client view only)', () 
 test('remove() 404s when the material is not on this client\'s card', async () => {
   scenario.removeGroupRow = null; // no row for this (client_id, material_id)
   await assert.rejects(ratesSvc.remove(1, 999), (e) => { assert.equal(e.status, 404); return true; });
+});
+
+// ─── 6. GET /:clientId/material-rates/download ────────────────────────────
+//
+// Full HTTP harness (same shape as tests/calls-preview-scope.test.js): a real
+// express app mounting routes/admin/clients.js, a SEPARATE fake pool wired to
+// client-material-rates.service#list()'s actual query shapes (different
+// tables/joins than the resolver tests above), and a fetch client.
+//
+// Scoped in a describe() with its own before/after so the pool-swap happens
+// at RUN time, after the resolver/validation tests above have already run
+// against the module-top-level `fake` — installFakePool() monkeypatches the
+// shared db.pool singleton, so calling it again at module-load time (as a
+// second top-level installFakePool(...)) would clobber `fake` for every test
+// in this file, resolver tests included, before any of them actually run.
+describe('GET /:clientId/material-rates/download', () => {
+  const CLIENT_ID = 55;
+  const MATERIAL_ID = 501;
+  const GROUP_ID = 9001;
+  const ZONAL_ROLE = { role_id: 12, role_name: 'Zonal Field Team', role_status: 1, menu_ids: '' };
+  const allowClients = (...ids) => ({
+    clients: { mode: 'allow', ids }, cities: { mode: 'all', ids: [] },
+    states: { mode: 'all', ids: [] }, verticals: { mode: 'all', ids: [] },
+  });
+
+  let downloadFake;
+  let downloadServer;
+  let downloadBaseUrl;
+  let scopeForDownloadTest;
+
+  before(async () => {
+    downloadFake = installFakePool([
+      [/FROM tbl_client\b/i, () => [{ client_id: CLIENT_ID, client_name: 'Acme Corp', vertical_id: 3 }]],
+      // list(): client price groups (top-level FROM — never matches the
+      // "..._brand gb" join below, which has no space before "_brand").
+      [/FROM tbl_client_material_price_group g\b/i, () => [
+        { group_id: GROUP_ID, material_id: MATERIAL_ID, price: 200, master_price_seen: 200, status: 1 },
+      ]],
+      [/FROM tbl_material_master/i, () => [{ material_id: MATERIAL_ID, material_name: 'PVC Pipe', pricing_type: 'per_unit' }]],
+      // No brands on this group — "No Brand" in the export, and the group's
+      // master-price lookup below takes the no-brand branch.
+      [/FROM tbl_client_material_price_group_brand gb/i, () => []],
+      [/FROM tbl_client_material_state_price\s+WHERE/i, () => [{ state_price_id: 701, group_id: GROUP_ID, price: 275 }]],
+      [/FROM tbl_client_material_state_price_state/i, () => [
+        { state_price_id: 701, state_id: 21 }, { state_price_id: 701, state_id: 22 },
+      ]],
+      // resolveMasterPriceForBrandSet's no-brand branch — 250 vs master_price_seen
+      // 200 above is the review-flag fixture ("Master changed ₹200.00 → ₹250.00").
+      [/FROM tbl_material_price_group g\b/i, () => [{ price: 250 }]],
+      [/FROM tbl_material_price_group_brand gb/i, () => []],
+      [/FROM tbl_state ORDER BY state_name/i, () => [
+        { state_id: 21, state_name: 'Maharashtra' }, { state_id: 22, state_name: 'Gujarat' },
+      ]],
+    ]);
+
+    const express = require('express');
+    const clientsRouter = require('../routes/admin/clients');
+
+    const app = express();
+    app.use((req, _res, next) => {
+      req.user = { user_id: 1, user_name: 'Tester' };
+      req.userRole = { ...ZONAL_ROLE };
+      if (scopeForDownloadTest !== 'absent') req.scope = scopeForDownloadTest;
+      next();
+    });
+    app.use('/clients', clientsRouter);
+    app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
+    await new Promise((resolve) => { downloadServer = app.listen(0, resolve); });
+    downloadBaseUrl = `http://127.0.0.1:${downloadServer.address().port}`;
+  });
+
+  after(async () => {
+    downloadFake.restore();
+    if (downloadServer) await new Promise((resolve) => downloadServer.close(resolve));
+  });
+
+  it('streams a flat Material|Brand|Price|State xlsx, one row per (material, brand, state)', async () => {
+    scopeForDownloadTest = allowClients(CLIENT_ID);
+    const res = await fetch(`${downloadBaseUrl}/clients/${CLIENT_ID}/material-rates/download`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+
+    const ExcelJS = require('exceljs');
+    const buf = Buffer.from(await res.arrayBuffer());
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf);
+    const ws = wb.worksheets[0];
+    // No Brand, base price 200, two overridden states at 275 → 1 base row + 2 state rows.
+    assert.equal(ws.rowCount, 4, 'header row + base row + one row per overridden state');
+
+    const header = ws.getRow(1).values.slice(1);
+    assert.deepEqual(header, ['Material', 'Brand', 'Price', 'State']);
+
+    assert.deepEqual(ws.getRow(2).values.slice(1), ['PVC Pipe', '', 200, '']);
+    assert.deepEqual(ws.getRow(3).values.slice(1), ['PVC Pipe', '', 275, 'Maharashtra']);
+    assert.deepEqual(ws.getRow(4).values.slice(1), ['PVC Pipe', '', 275, 'Gujarat']);
+  });
+
+  it('refuses a client outside the caller\'s scope, same as the list route', async () => {
+    scopeForDownloadTest = allowClients(999); // NOT this client
+    const [downloadRes, listRes] = await Promise.all([
+      fetch(`${downloadBaseUrl}/clients/${CLIENT_ID}/material-rates/download`),
+      fetch(`${downloadBaseUrl}/clients/${CLIENT_ID}/material-rates`),
+    ]);
+    assert.equal(downloadRes.status, 404);
+    assert.equal(listRes.status, 404);
+    const [downloadBody, listBody] = await Promise.all([downloadRes.json(), listRes.json()]);
+    assert.deepEqual(downloadBody, listBody, 'download must refuse identically to the list route');
+    assert.equal(downloadBody.error, 'client not found');
+  });
+});
+
+// ─── 7. POST /:clientId/material-rates/batch (CRM "Add Materials" modal) ──
+//
+// Full HTTP harness, same recipe as the download describe block above: own
+// fake pool, own express app, own before/after — installFakePool() clobbers
+// the shared db.pool singleton, so this can't share the module-top-level
+// `fake` (still in use by the resolver tests) or `downloadFake`.
+describe('POST /:clientId/material-rates/batch', () => {
+  const CLIENT_ID = 77;
+  const ZONAL_ROLE = { role_id: 12, role_name: 'Zonal Field Team', role_status: 1, menu_ids: '' };
+  const allowClients = (...ids) => ({
+    clients: { mode: 'allow', ids }, cities: { mode: 'all', ids: [] },
+    states: { mode: 'all', ids: [] }, verticals: { mode: 'all', ids: [] },
+  });
+  const groupsPayload = (price) => [{ price, brand_ids: [], states: [] }];
+
+  let batchFake;
+  let batchServer;
+  let batchBaseUrl;
+  let scopeForBatchTest;
+  let committed;
+  let rolledBack;
+  let materialStatusById; // material_id -> 1 (active) | 0 (inactive) | undefined (missing)
+
+  before(async () => {
+    materialStatusById = new Map([[301, 1], [302, 1]]);
+    batchFake = installFakePool([
+      [/FROM tbl_client\b/i, () => [{ client_id: CLIENT_ID, client_name: 'Acme', vertical_id: 3 }]],
+      // replace()'s getMaterialRow (material.service.js#getMaterialRow).
+      [/FROM tbl_material_master m\s+LEFT JOIN tbl_service_catg/i, (sql, params) => {
+        const status = materialStatusById.get(params[0]);
+        return status === undefined ? [] : [{ material_id: params[0], status, pricing_type: 'FIXED' }];
+      }],
+      // assertBrandsAndStatesExist — fixtures below use No Brand + no states, so
+      // these never actually fire; kept so an unexpected call fails loudly
+      // (empty result) rather than hanging on an unmatched query.
+      [/FROM tbl_brand_master/i, () => []],
+      [/FROM tbl_state\b/i, () => []],
+      // resolveMasterPriceForBrandSet — No Brand branch (brandIds is empty).
+      [/FROM tbl_material_price_group g\b/i, () => []],
+      [/^\s*INSERT INTO tbl_client_material_price_group\b/i, () => ({ insertId: 9001 })],
+    ]);
+
+    const db = require('../db');
+    const origGetConnection = db.pool.getConnection;
+    db.pool.getConnection = async () => {
+      const conn = await origGetConnection.call(db.pool);
+      const origCommit = conn.commit, origRollback = conn.rollback;
+      conn.commit = async (...a) => { committed = true; return origCommit(...a); };
+      conn.rollback = async (...a) => { rolledBack = true; return origRollback(...a); };
+      return conn;
+    };
+
+    const express = require('express');
+    const clientsRouter = require('../routes/admin/clients');
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.user = { user_id: 1, user_name: 'Tester', permissions: { menuIds: [], actionPermissions: ['isClientEdit'] } };
+      req.userRole = { ...ZONAL_ROLE };
+      if (scopeForBatchTest !== 'absent') req.scope = scopeForBatchTest;
+      next();
+    });
+    app.use('/clients', clientsRouter);
+    app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
+    await new Promise((resolve) => { batchServer = app.listen(0, resolve); });
+    batchBaseUrl = `http://127.0.0.1:${batchServer.address().port}`;
+  });
+
+  after(async () => {
+    batchFake.restore();
+    if (batchServer) await new Promise((resolve) => batchServer.close(resolve));
+  });
+
+  beforeEach(() => {
+    batchFake.reset();
+    committed = false;
+    rolledBack = false;
+    materialStatusById.set(301, 1);
+    materialStatusById.set(302, 1);
+    scopeForBatchTest = allowClients(CLIENT_ID);
+  });
+
+  function postBatch(materials) {
+    return fetch(`${batchBaseUrl}/clients/${CLIENT_ID}/material-rates/batch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ materials }),
+    });
+  }
+
+  it('writes both materials in one transaction when both are valid', async () => {
+    const res = await postBatch([
+      { material_id: 301, groups: groupsPayload(100) },
+      { material_id: 302, groups: groupsPayload(200) },
+    ]);
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    assert.deepEqual(body.data.material_ids, [301, 302]);
+    assert.equal(committed, true);
+    assert.equal(rolledBack, false);
+  });
+
+  it('all-or-nothing: material 302 missing rolls back material 301\'s already-attempted write', async () => {
+    materialStatusById.delete(302); // 302 no longer exists → replace() 404s mid-transaction
+    const res = await postBatch([
+      { material_id: 301, groups: groupsPayload(100) },
+      { material_id: 302, groups: groupsPayload(200) },
+    ]);
+    const body = await res.json();
+    assert.equal(res.status, 422, JSON.stringify(body));
+    assert.match(body.error, /302/, 'the error must name the failing material');
+    assert.ok(batchFake.calls.some((c) => /^\s*INSERT INTO tbl_client_material_price_group\b/i.test(c.sql)),
+      'material 301\'s write must have been attempted before material 302\'s failure');
+    assert.equal(committed, false, 'commit must never be called when a later material fails');
+    assert.equal(rolledBack, true, 'rollback must undo material 301\'s already-attempted write');
+  });
+
+  it('refuses duplicate material_id within the batch before opening a connection', async () => {
+    const res = await postBatch([
+      { material_id: 301, groups: groupsPayload(100) },
+      { material_id: 301, groups: groupsPayload(200) },
+    ]);
+    const body = await res.json();
+    assert.equal(res.status, 422, JSON.stringify(body));
+    assert.match(body.error, /301/);
+    assert.ok(!batchFake.calls.some((c) => /^\s*INSERT INTO/i.test(c.sql)),
+      'a duplicate-refused batch must write nothing');
+    assert.equal(committed, false);
+    assert.equal(rolledBack, false, 'refused before a connection was ever opened');
+  });
+
+  it('refuses a client outside the caller\'s scope, same as the other material-rates routes', async () => {
+    scopeForBatchTest = allowClients(999); // NOT this client
+    const res = await postBatch([{ material_id: 301, groups: groupsPayload(100) }]);
+    const body = await res.json();
+    assert.equal(res.status, 404, JSON.stringify(body));
+    assert.equal(body.error, 'client not found');
+  });
+
+  it('requires isClientEdit and is client-scope-guarded (static route gate)', () => {
+    const block = routeBlock("'/:clientId/material-rates/batch'");
+    assert.match(block, /requireClientEdit/, 'batch route must require isClientEdit');
+    assert.match(block, /loadAndGuardClient\(/, 'batch route must run the client scope-guard');
+  });
 });
