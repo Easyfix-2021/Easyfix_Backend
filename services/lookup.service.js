@@ -76,9 +76,19 @@ async function cities({ stateId, q, ids, limit = 500, includeInactive = false } 
 
 async function states() {
   logger.info('Lookup states');
+  /*
+   * A SELECTION surface, so it offers ACTIVE states only (tbl_state.state_status,
+   * migrations/2026-09-21-state-zonal-manager.sql). Old duplicate rows are kept
+   * but marked inactive, and must not be offered.
+   * Lazy require keeps this module's load order unchanged; the probe is the
+   * state service's memoised SHOW COLUMNS, so this stays one query.
+   */
+  const stateSvc = require('./state.service');
+  const active = await stateSvc.hasStateManagerCols();
+  const typed = await stateSvc.hasStateTypeCol();
   const [rows] = await pool.query(
-    `SELECT state_id, state_code, state_name, country_id
-       FROM tbl_state ORDER BY state_name ASC`
+    `SELECT state_id, state_code, state_name, country_id${typed ? ', state_type' : ''}
+       FROM tbl_state${active ? ' WHERE state_status = 1' : ''} ORDER BY state_name ASC`
   );
   logger.info(`Found ${rows.length} states`);
   return rows;

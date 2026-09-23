@@ -65,6 +65,7 @@ router.use('/easyfixers',      require('./easyfixer-app-mirror'));
 router.use('/zones',           require('./zones'));
 router.use('/pincodes',        require('./pincodes'));
 router.use('/cities',          require('./cities'));
+router.use('/states',          require('./states'));
 router.use('/service-categories', require('./service-categories'));
 router.use('/service-types',      require('./service-types'));
 router.use('/document-types',     require('./document-types'));

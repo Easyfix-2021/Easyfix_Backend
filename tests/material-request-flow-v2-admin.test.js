@@ -366,27 +366,20 @@ function mockRes() {
 // (the stamp/status/transaction behaviour) without each needing its own
 // edit; a test with different needs still overrides via its own `body`.
 /*
- * A slot that is ALWAYS in the future, whenever this suite runs.
- *
- * The approve routes validate the requested time against the REAL clock, so a
- * hardcoded date is a time bomb: this file pinned '2026-09-23 10:00:00' while
- * it was written on 2026-09-22, and these tests went red the following day
- * with "Pick a future visit time within 30 days" — on Production too, which
- * blocked a release PR for work that never touched this area. Derive it:
- * tomorrow, 10:00 IST (a SLOT_START_HOURS entry, inside the 30-day window).
- *
- * TZ-independent: npm test runs with TZ=UTC but a developer may not, so shift
- * to the IST wall clock explicitly and read it back with getUTC*.
+ * TOMORROW, computed — never a literal date. A hardcoded '2026-09-23 10:00:00'
+ * here stopped every QA deploy on 2026-09-23: assertSlotBookable refuses a slot
+ * that is not in the future and within 30 days, so the fixture passed CI until
+ * the day it named arrived, then failed 14 tests across two files for a reason
+ * that had nothing to do with the change being deployed. IST, and 10:00 on the
+ * NEXT day, so it is a valid slot hour (SLOT_START_HOURS) whatever time the
+ * suite runs.
  */
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-function istTomorrowSlot(hour = 10) {
-  const ist = new Date(Date.now() + IST_OFFSET_MS);
-  ist.setUTCDate(ist.getUTCDate() + 1);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${ist.getUTCFullYear()}-${p(ist.getUTCMonth() + 1)}-${p(ist.getUTCDate())} ${p(hour)}:00:00`;
-}
-
-const APPROVE_BODY_DEFAULTS = { visit_date_time: istTomorrowSlot(), permission: 'not_required' };
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+const TOMORROW_IST_10AM = (() => {
+  const ist = new Date(Date.now() + IST_OFFSET_MS + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
+const APPROVE_BODY_DEFAULTS = { visit_date_time: TOMORROW_IST_10AM, permission: 'not_required' };
 
 async function callClient(routePath, method, body = {}) {
   const r = mockRes();

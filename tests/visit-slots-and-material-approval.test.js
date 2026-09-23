@@ -366,30 +366,17 @@ async function postApproval(fields = {}, opts = {}) {
 }
 
 /*
- * A slot that is ALWAYS in the future, whenever this suite runs.
- *
- * The routes below validate the requested time against the REAL clock (unlike
- * visitSlots.assertSlotBookable further up, which takes an injectable `now` —
- * those tests keep their pinned dates on purpose). A hardcoded date here is a
- * time bomb: this file pinned '2026-09-23 10:00:00' while it was written on
- * 2026-09-22, and every approval test went red the following day with "Pick a
- * future visit time within 30 days" — on Production too, which blocked a
- * release PR for work that never touched this area. Derive it instead:
- * tomorrow, 10:00 IST (a SLOT_START_HOURS entry, well inside the 30-day window).
- *
- * TZ-independent: npm test runs with TZ=UTC but a developer may not, so shift
- * to the IST wall clock explicitly and read it back with getUTC*.
+ * TOMORROW, computed. These tests run against the REAL clock (unlike the
+ * assertSlotBookable unit tests above, which pin `now` deliberately), so a
+ * literal date is a time bomb: '2026-09-23 10:00:00' passed CI until that
+ * morning, then failed every run — and blocked the QA deploy pipeline for a
+ * change that had nothing to do with it. 10:00 IST tomorrow is always a valid
+ * slot hour, whatever time the suite runs.
  */
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-const VALID_SLOT_HOUR = 10;
-function istTomorrow() {
-  const ist = new Date(Date.now() + IST_OFFSET_MS);
-  ist.setUTCDate(ist.getUTCDate() + 1);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${ist.getUTCFullYear()}-${p(ist.getUTCMonth() + 1)}-${p(ist.getUTCDate())}`;
-}
-const VALID_SLOT_DATE = istTomorrow();
-const VALID_SLOT = `${VALID_SLOT_DATE} ${String(VALID_SLOT_HOUR).padStart(2, '0')}:00:00`;
+const VALID_SLOT = (() => {
+  const ist = new Date(Date.now() + ((5 * 60 + 30) * 60 * 1000) + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
 
 test('on-behalf: 400 without visit_date_time', async () => {
   const res = await postApproval({ permission: 'not_required' });
@@ -415,7 +402,7 @@ test('on-behalf: nothing is written when a 400 fires before any write', async ()
 });
 
 test('on-behalf: 409 when the chosen slot is already booked', async () => {
-  state.busyHour = { date: VALID_SLOT_DATE, hour: VALID_SLOT_HOUR };
+  state.busyHour = { date: VALID_SLOT.slice(0, 10), hour: 10 };  // must collide with VALID_SLOT
   const res = await postApproval({ visit_date_time: VALID_SLOT, permission: 'not_required' });
   assert.equal(res.status, 409, JSON.stringify(res.body));
   assert.equal(setStatusCalls.length, 0, 'busy slot must be caught before any write');
@@ -555,7 +542,7 @@ test('client portal approve: 400 before any write when visit_date_time is missin
 
 test('client portal approve: 409 on a busy slot, before any write', async () => {
   jobFixture = makeJob({ job_status: 15 });
-  state.busyHour = { date: VALID_SLOT_DATE, hour: VALID_SLOT_HOUR };
+  state.busyHour = { date: VALID_SLOT.slice(0, 10), hour: 10 };  // must collide with VALID_SLOT
   const r = await callClient({ visit_date_time: VALID_SLOT, permission: 'not_required' });
   assert.equal(r.statusCode, 409, JSON.stringify(r.body));
   assert.equal(setStatusCalls.length, 0);
