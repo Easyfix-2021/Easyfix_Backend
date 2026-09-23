@@ -195,28 +195,62 @@ test('a technician is counted once even when several of their pincodes match', a
  * actually printed in. A pincode with four technicians and one with a single
  * technician looked identical, and the number is what that column exists to say.
  */
-test('counts every technician covering a pincode, not just the first', async () => {
+test('counts every technician servicing a pincode, not just the first', async () => {
   scenario.home = [{ efr_id: 1, pin: '110001', ...ACTIVE }];
   scenario.csv = [
     { efr_id: 2, pincodes: '110001,560001', ...ACTIVE },
     { efr_id: 3, pincodes: '110001', ...ACTIVE },
   ];
-  const counts = await coverage.getCoverageCounts(['110001', '560001']);
-  assert.equal(counts.get('110001'), 3, 'one resident + two servicers');
+  const counts = await coverage.getServiceAreaCounts(['110001', '560001']);
+  assert.equal(counts.get('110001'), 2, 'two servicers — the resident does not count');
   assert.equal(counts.get('560001'), 1);
 });
 
-test('a technician is counted ONCE per pincode, however they reach it', async () => {
-  // Home pincode AND the same pincode in their serviceable CSV.
+/*
+ * ── The 38-vs-5 bug ────────────────────────────────────────────────────────
+ *
+ * The Mapping badge counted home pincodes; the drill-down it opens lists only
+ * tbl_efr_serviceable_pincodes. 122001 rendered "Local · 38 Technicians" over a
+ * list of 5 names. The badge now reports the declared service area, which is
+ * the population the list shows.
+ */
+test('a home pincode alone is NOT a service area — the badge counts commitments', async () => {
+  scenario.home = [
+    { efr_id: 1, pin: '122001', ...ACTIVE },
+    { efr_id: 2, pin: '122001', ...ACTIVE },
+  ];
+  scenario.csv = [{ efr_id: 3, pincodes: '122001', ...ACTIVE }];
+  const counts = await coverage.getServiceAreaCounts(['122001']);
+  assert.equal(counts.get('122001'), 1, 'only the technician who DECLARED 122001');
+});
+
+test('residents still COUNT AS COVERED for dispatch — TAT and allocation are unchanged', async () => {
+  scenario.home = [{ efr_id: 1, pin: '122001', ...ACTIVE }];
+  scenario.csv = [];
+  assert.equal((await coverage.getCoveredPincodes(['122001'])).size, 1,
+    'getCoveredPincodes is the dispatch question and still unions home pincodes');
+  assert.equal((await coverage.getServiceAreaCounts(['122001'])).has('122001'), false,
+    'the service-area question says nobody signed up to work there');
+});
+
+test('getServiceAreaSet excludes pincodes covered only by residence', async () => {
+  scenario.home = [{ efr_id: 1, pin: '122001', ...ACTIVE }];
+  scenario.csv = [{ efr_id: 2, pincodes: '110001', ...ACTIVE }];
+  const area = await coverage.getServiceAreaSet();
+  assert.equal(area.has('110001'), true);
+  assert.equal(area.has('122001'), false, 'LOCAL filter must select what the badge counts');
+});
+
+test('a technician is counted ONCE per pincode, however many entries match', async () => {
   scenario.home = [{ efr_id: 7, pin: '110001', ...ACTIVE }];
   scenario.csv = [{ efr_id: 7, pincodes: '110001,110001', ...ACTIVE }];
-  const counts = await coverage.getCoverageCounts(['110001']);
+  const counts = await coverage.getServiceAreaCounts(['110001']);
   assert.equal(counts.get('110001'), 1, 'one person is one technician');
 });
 
-test('an uncovered pincode is ABSENT from the map, never 0-that-reads-as-covered', async () => {
+test('an unserviced pincode is ABSENT from the map, never 0-that-reads-as-covered', async () => {
   scenario.csv = [{ efr_id: 2, pincodes: '560001', ...ACTIVE }];
-  const counts = await coverage.getCoverageCounts(['110001', '560001']);
+  const counts = await coverage.getServiceAreaCounts(['110001', '560001']);
   assert.equal(counts.has('110001'), false);
   assert.equal(counts.get('110001') ?? 0, 0);
 });
@@ -227,8 +261,15 @@ test('inactive and unverified technicians are not counted', async () => {
     { efr_id: 3, pincodes: '110001', efr_status: 1, is_technician_verified: 0 },
     { efr_id: 4, pincodes: '110001', ...ACTIVE },
   ];
-  const counts = await coverage.getCoverageCounts(['110001']);
+  const counts = await coverage.getServiceAreaCounts(['110001']);
   assert.equal(counts.get('110001'), 1, 'only the dispatchable one counts');
+});
+
+test('the space bug is fixed for the service-area count too', async () => {
+  scenario.csv = [{ efr_id: 2, pincodes: '110001, 122001, 560001', ...ACTIVE }];
+  const counts = await coverage.getServiceAreaCounts(['110001', '122001', '560001']);
+  assert.equal(counts.get('122001'), 1, 'entries after the first must not be invisible');
+  assert.equal(counts.get('560001'), 1);
 });
 
 test('the tally costs no extra query — same cached supply as everyone else', async () => {
@@ -236,6 +277,7 @@ test('the tally costs no extra query — same cached supply as everyone else', a
   scenario.csv = [{ efr_id: 2, pincodes: '110001', ...ACTIVE }];
   await coverage.getCoveredPincodes(['110001']);
   const before = homeQueries + csvQueries;
-  await coverage.getCoverageCounts(['110001']);
+  await coverage.getServiceAreaCounts(['110001']);
+  await coverage.getServiceAreaSet();
   assert.equal(homeQueries + csvQueries, before, 'no second read of the supply');
 });
