@@ -761,10 +761,10 @@ function mapJobForMobile(j) {
     serviceType:       j.service_type ?? null,            // populated when projection includes it
     requestedAt:       j.requested_date_time ?? null,
     minsToAppointment,
-    // Pass through any free/paid signal the projection happens to
-    // expose; mobile app can also derive these from j.total_amount /
-    // services[].job_charge_type on the detail call.
-    totalAmount:       j.total_amount ?? null,
+    // totalAmount (j.total_amount) REMOVED 2026-09-24 — V3 3.9: a client
+    // price never reaches the technician's phone. His figure is
+    // technician_share on GET /jobs; routes/mobile/money-split.js also strips
+    // the key from this payload in case a projection brings it back.
     helperReq:         j.helper_req ?? null,
     // Offer countdown (offer rows only — see listOfferedForTech). Deliberately
     // kept in the projection's own snake_case rather than camelCased, so the

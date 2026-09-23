@@ -28,6 +28,9 @@ const { checkoutPin: checkoutPinAttempts, sharedRateLimit, techMobileRateKey } =
 const { stripCustomerMobiles } = require('../../utils/mask-mobile');
 const { technicianSharesForJobs } = require('../../services/job-ledger.service');
 const incentives = require('../../services/job-incentive.service');
+const jobLog = require('../../services/job-log.service');
+const claims = require('../../services/mobile-job-claims.service');
+const { stripClientPrices } = require('./money-split');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
@@ -373,6 +376,11 @@ router.use('/jobs', require('./permission-requests'));
 // middleware/require-tech-lifecycle-capability.js.
 router.use('/jobs', require('./job-share'));
 
+// V3 Phase 3 — the technician's on-site claims, chat and money view
+// (/jobs/:id/{additional-work,cant-complete,cancel/undo,help,chat,money}).
+// Two-segment-plus paths like the routers above; same mount reason.
+router.use('/jobs', require('./jobs-phase3'));
+
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
 // Technician-initiated re-application. The protected-router idempotency layer
@@ -423,10 +431,11 @@ router.get(
   async (req, res, next) => {
     try {
       logger.info('Load dashboard · noticesLimit=' + (req.query.noticesLimit != null ? req.query.noticesLimit : 'default'));
-      modernOk(res, await mobileDashboardService.getDashboard(
+      // 3.9: no client price on the phone — see ./money-split.js.
+      modernOk(res, stripClientPrices(await mobileDashboardService.getDashboard(
         req.tech.efr_id,
         { noticesLimit: req.query.noticesLimit },
-      ));
+      )));
     } catch (e) {
       if (e.status) return modernError(res, e.status, e.message);
       next(e);
@@ -560,7 +569,15 @@ router.get('/jobs', async (req, res, next) => {
     // jobService.list is the CRM's list too, so it carries customer_mob_no.
     // Not to the device — same rule as GET /jobs/:id below.
     await decorateEscalation(rows);
-    modernOk(res, { items: stripCustomerMobiles(await decorateTechnicianShare(rows)), total });
+    /*
+     * V3 3.7 / 3.9: pendingOn · waitingFor · visitNo drive "My Jobs Today"'s
+     * four groups, and collectFromCustomer is the only client figure a cash job
+     * may carry. Batched for the page (services/mobile-job-claims
+     * decorateJobState) and done HERE for the same reason as the share: the
+     * shared list is also the CRM's. Then every client price is stripped.
+     */
+    await claims.decorateJobState(rows);
+    modernOk(res, stripClientPrices({ items: stripCustomerMobiles(await decorateTechnicianShare(rows)), total }));
   } catch (e) { next(e); }
 });
 
@@ -637,7 +654,7 @@ router.get('/jobs/offered', async (req, res, next) => {
     }
     // An OFFERED technician has not even accepted the job — the customer's
     // number is not his to hold. Same list projection as GET /jobs.
-    modernOk(res, stripCustomerMobiles(result));
+    modernOk(res, stripClientPrices(stripCustomerMobiles(result)));
   } catch (e) { next(e); }
 });
 
@@ -726,7 +743,22 @@ router.get('/jobs/:id', async (req, res, next) => {
         logger.warn('Job media lookup failed · id=' + job.job_id + ' · ' + me.message);
       }
     }
-    modernOk(res, stripCustomerMobiles(job));
+    /*
+     * V3 Phase 3 — the job's claim state, from the server, so the phone shows
+     * "Help on the way", the cannot-complete card or the additional-work
+     * waiting section from what the desk sees rather than from what it
+     * remembers tapping. OWNER ONLY, like the selfie: an offered or pending-
+     * delegate technician has no claims on a job he has not taken.
+     */
+    await claims.decorateJobState([job]);
+    if (job.fk_easyfixter_id === req.tech.efr_id) {
+      const { reports, cancelRequest } = await claims.detailClaims(job);
+      job.reports = reports;
+      if (cancelRequest) job.cancelRequest = cancelRequest;
+    }
+    // 3.9: the service lines keep their names and quantities, never their
+    // client prices — see ./money-split.js.
+    modernOk(res, stripClientPrices(stripCustomerMobiles(job)));
   } catch (e) { next(e); }
 });
 
@@ -1132,6 +1164,28 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
         logger.warn('On-time bonus not awarded · id=' + job.job_id + ' · ' + err.message);
       }
     }
+    /*
+     * JOB HISTORY (V3 3.1). Two facts the job row cannot hold: that the
+     * customer's PIN matched at the door, and that the bonus was paid.
+     *
+     * AFTER the response's own work, never before, and never awaited into the
+     * check-in's success: jobLog swallows its own errors by contract, so these
+     * cannot fail the check-in, and they are written from the same `at` instant
+     * the award was scored against rather than "now".
+     *
+     * `incentive.awarded` — not `incentive` — is the condition. awardOnTimeStart
+     * returns a result object either way, and its `awarded` is false on the
+     * retry that correctly refused to pay twice. Logging on the object alone
+     * would give a job two bonus rows in its history and one in its ledger.
+     */
+    if (pinMatched === true) {
+      await jobLog.logCustomerPinVerified(
+        job.job_id, { late: false }, { efr_id: req.tech.efr_id }, extras.checkin_date_time);
+    }
+    if (incentive && incentive.awarded) {
+      await jobLog.logIncentiveAwarded(
+        job.job_id, { amount: incentive.amount }, { efr_id: req.tech.efr_id }, extras.checkin_date_time);
+    }
     modernOk(res, { checkedIn: true, pinMatched, incentive });
   } catch (e) {
     if (e.status) {
@@ -1212,6 +1266,20 @@ router.post('/jobs/:id/verify-pin', validate(Joi.object({
       });
     } catch (err) {
       logger.warn('On-time bonus not awarded on late PIN · id=' + job.job_id + ' · ' + err.message);
+    }
+    /*
+     * Same two rows as check-in, with `late: true` — and the PIN row is stamped
+     * NOW while the bonus row is stamped at the ARRIVAL it pays for. That is
+     * not an inconsistency: the verification genuinely happened now, the
+     * on-time arrival genuinely happened earlier, and collapsing them onto one
+     * clock would make a late verification look like an on-time one.
+     */
+    await jobLog.logCustomerPinVerified(
+      job.job_id, { late: true }, { efr_id: req.tech.efr_id });
+    if (incentive && incentive.awarded) {
+      await jobLog.logIncentiveAwarded(
+        job.job_id, { amount: incentive.amount }, { efr_id: req.tech.efr_id },
+        job.checkin_date_time ? new Date(job.checkin_date_time) : undefined);
     }
     // signatureWaived is the OTHER half of 2.4: a verified PIN is the customer
     // acknowledging the visit, so the signature fallback (2.5) is not also asked
@@ -1304,7 +1372,17 @@ router.post('/jobs/:id/checkout',
       await checkoutPinAttempts.clear(pinKey);
     }
     const b = req.body;
-    const isRevisit = b.isNextVisit === true;
+    /*
+     * ADDITIONAL WORK STILL WAITING → THIS IS VISIT 1, NOT THE END (V3 3.3,
+     * design sheet 12): "If he has reported additional work that is still
+     * unapproved, this same step lets him submit the booked portion and go;
+     * the additional comes back as visit 2, and visit 2 is paid." Decided
+     * HERE, from the server's own record of the claim, not from the app's
+     * isNextVisit — so a build that never learned to ask cannot close a job
+     * whose extra work the client has not yet answered. One indexed read.
+     */
+    const pendingExtraWork = await claims.hasUnresolvedAdditionalWork(job.job_id);
+    const isRevisit = b.isNextVisit === true || pendingExtraWork;
     const extras = {
       app_checkout_date_time: new Date(),
       is_collected_cash_by_app: b.isCashCollected ? 1 : 0,
@@ -1399,6 +1477,13 @@ router.post('/jobs/:id/checkout',
         });
       } catch (ve) {
         logger.warn('Visit charge not awarded · id=' + job.job_id + ' · ' + ve.message);
+      }
+      // 250 billed to a client is the event on this job most likely to be
+      // queried later, and until now it left no trace anyone but a developer
+      // could find. Again gated on `awarded`, so the idempotent retry is silent.
+      if (visitCharge && visitCharge.awarded) {
+        await jobLog.logVisitChargeAwarded(
+          job.job_id, { amount: visitCharge.amount }, { efr_id: req.tech.efr_id });
       }
     }
 

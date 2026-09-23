@@ -2046,6 +2046,42 @@ router.get('/:id/offers', validate(idParam, 'params'), scopedJob, async (req, re
   }
 });
 
+/*
+ * GET /api/admin/jobs/:id/activity — the job's event stream (V3 plan 3.1).
+ *
+ * WHAT IS NEW HERE IS THE READING, NOT THE WRITING. tbl_job_logs has been
+ * written since 2015 and this backend has written it since services/
+ * job-log.service.js landed; no screen has ever shown it. The CRM's five
+ * existing history surfaces each answer ONE question (why was this
+ * rescheduled, who called, when was it scheduled) from a DIFFERENT table.
+ * This answers "what has happened to this job", once, in order.
+ *
+ * `scopedJob` is the same guard every other /:id/* route on this router uses,
+ * so a job outside the operator's geo/client scope 404s here exactly as it
+ * does on /header and /offers. This route adds NO new permission surface: if
+ * you can open the job you can read its history, which is the same rule the
+ * Audit & History card on the Summary tab already follows.
+ *
+ * NOT PAGINATED, CAPPED INSTEAD. A job's history is tens of rows, not
+ * thousands — the busiest jobs in the archive sit in the low hundreds — so a
+ * cap with a stated ceiling is honest where a pager would imply a depth that
+ * does not exist. The service takes the MOST RECENT `limit` and returns them
+ * oldest-first; `truncated` tells the screen to say so rather than silently
+ * presenting a partial life as a whole one.
+ */
+router.get('/:id/activity', validate(idParam, 'params'), scopedJob, async (req, res, next) => {
+  try {
+    logger.info('List job activity · jobId=' + req.params.id);
+    const limit = Number(req.query.limit) || undefined;
+    const items = await jobLog.listForJob(Number(req.params.id), { limit });
+    logger.info('Returning ' + items.length + ' job activity rows · jobId=' + req.params.id);
+    modernOk(res, { items, truncated: items.length >= jobLog.ACTIVITY_LIMIT_MAX });
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.message);
+    next(e);
+  }
+});
+
 router.patch('/:id/owner', validate(idParam, 'params'), validate(ownerBody), scopedJob, async (req, res, next) => {
   try {
     logger.info('Change job owner · jobId=' + req.params.id + ' newOwnerId=' + (req.body?.newOwnerId ?? '-'));
@@ -3950,6 +3986,9 @@ router.post(
         permissionSpocId: null,    // no client contact on this path
       });
 
+      // A desk-priced additional-work claim is approved with the estimate (V3
+      // 3.3) — the desk's "Approve as client". Post-commit, fail-soft.
+      await require('../../services/ops-desk.service').settleAdditionalWork(jobId, true, req.user);
       const updated = await job.getById(jobId);
       logger.info('Client-approval-on-behalf done · jobId=' + jobId + ' · status->' + updated.job_status
         + ' · rescheduled=' + result.rescheduled + ' · permission=' + result.permission.choice);

@@ -28,6 +28,8 @@ const holidayService = require('../../services/holiday.service');
 const noticeService = require('../../services/notice.service');
 const clientService = require('../../services/client.service');
 const clientXlsx = require('../../services/client-xlsx.service');
+const opsDesk = require('../../services/ops-desk.service');
+const jobVerification = require('../../services/job-verification.service');
 
 // ─── Public: SPOC OTP login ─────────────────────────────────────────
 const identifier = Joi.alternatives(Joi.string().email(), Joi.string().pattern(/^[0-9]{10}$/));
@@ -1157,6 +1159,9 @@ router.patch('/jobs/:id/estimate/approve', permissionFileUploadOr400, async (req
         [req.spoc.id, new Date(), job.job_id],
       ),
     });
+    // A desk-priced additional-work claim on this job is now approved (V3 3.3):
+    // the technician's screen flips to "you can do it now". Post-commit, fail-soft.
+    await opsDesk.settleAdditionalWork(job.job_id, true, { user_id: link?.user_id ?? null });
     logger.info('Estimate approved · id=' + job.job_id + ' · rescheduled=' + result.rescheduled);
     modernOk(res, {
       approved: true,
@@ -1209,10 +1214,62 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
       conn.release();
     }
     fireRejectEscalation(job, req.body.reason, req.spoc).catch(() => {});
+    // The client said no to a desk-priced additional-work line: close the claim.
+    await opsDesk.settleAdditionalWork(job.job_id, false, { user_id: link?.user_id ?? null });
     logger.info('Estimate rejected · id=' + job.job_id);
     modernOk(res, { rejected: true });
   } catch (e) { next(e); }
 });
+
+/*
+ * ─── Quality Check (V3 3.8) ─────────────────────────────────────────────
+ * After EasyFix passes its audit (POST /api/admin/jobs/:id/verify), the job sits
+ * with the client for QC until they approve, dispute, or their window lapses
+ * and the 15-minute cron auto-passes it (services/job-verification.service.js).
+ * Approve is what releases the technician's money: it posts the completion
+ * ledger (postAfterQc) — design sheet 14's "Client QC → In wallet".
+ *
+ * SCOPE: exactly the conventions above. The list filters on the SPOC's
+ * client_id plus hierarchyFilter (allStores / top of tree → whole client);
+ * the two writes go through loadJobInScope, the one by-id gate every other
+ * write here uses.
+ */
+router.get('/qc', async (req, res, next) => {
+  try {
+    const hier = await resolveClientHierarchy(req);
+    const out = await jobVerification.clientQcList({
+      clientId: req.spoc.client_id,
+      scopeIds: hierarchyFilter(hier, req),
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    logger.info('Client QC list · clientId=' + req.spoc.client_id + ' · ' + out.items.length + '/' + out.total);
+    modernOk(res, out);
+  } catch (e) { next(e); }
+});
+
+async function qcDecision(req, res, next, outcome) {
+  try {
+    const job = await loadJobInScope(req, res, 'QC-' + outcome);
+    if (!job) return;
+    // The SPOC's linked tbl_user id — the same actor the estimate approve passes,
+    // so the history row names a person, never a client-contact id in a user FK.
+    const [[link]] = await pool.query('SELECT user_id FROM tbl_client_contacts WHERE id = ?', [req.spoc.id]);
+    const out = await jobVerification.clientQcDecide(job.job_id, {
+      outcome, contactId: req.spoc.id, note: req.body?.note || null, actor: { user_id: link?.user_id ?? null },
+    });
+    logger.info('Client QC ' + outcome + ' · id=' + job.job_id + (out.post ? ' · posted=' + out.post.posted : ''));
+    modernOk(res, out, outcome === 'passed' ? 'quality check approved' : 'quality check disputed');
+  } catch (e) {
+    if (e.status) return modernError(res, e.status, e.code ? { message: e.message, code: e.code } : e.message);
+    next(e);
+  }
+}
+
+router.post('/jobs/:id/qc/approve', (req, res, next) => qcDecision(req, res, next, 'passed'));
+router.post('/jobs/:id/qc/dispute',
+  validate(Joi.object({ note: Joi.string().trim().min(3).max(255).required() })),
+  (req, res, next) => qcDecision(req, res, next, 'disputed'));
 
 // Human-readable stage stored on an escalation row (job_stage), matching the
 // vocabulary the legacy Client Dashboard already writes to this table.

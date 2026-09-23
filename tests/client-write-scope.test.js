@@ -112,6 +112,9 @@ const WRITES = [
   ['/jobs/:id/escalate',         'post',  { reasonId: 1 }],
   ['/jobs/:id/client-request',   'post',  { kind: 'retry' }],
   ['/jobs/:id/images',           'post',  {}],
+  // V3 3.8 client quality check (2026-09-24).
+  ['/jobs/:id/qc/approve',       'post',  {}],
+  ['/jobs/:id/qc/dispute',       'post',  { note: 'door still sticks' }],
 ];
 
 /*

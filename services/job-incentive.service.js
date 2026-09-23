@@ -65,6 +65,7 @@ const DEFAULT_VISIT = 250;
  */
 const REASON_ON_TIME = 'On-time start incentive (system)';
 const REASON_VISIT = 'Visit charge — could not complete (system)';
+const REASON_ADDITIONAL_WORK = 'Additional work approved (system)';
 
 function amount(key, fallback) {
   const raw = Number(getProperty(key));
@@ -182,9 +183,95 @@ async function awardVisitCharge(jobId, { actorId }) {
   return { awarded, amount: charge };
 }
 
+/**
+ * Take back the ₹250 visit charge — "customer changed their mind" (V3 3.6a/b,
+ * design sheet 13: the only action left after a claim is the undo).
+ *
+ * ONLY WHILE THE LEDGER IS UNPOSTED. Once a completion has posted,
+ * tbl_job_transaction and tbl_easyfixer_transaction carry the ₹250 inside
+ * efr_charge and the technician's running balance; deleting the job_material
+ * row then would make the job's own charges disagree with the money already
+ * in his wallet, and nothing downstream re-posts. The two tables are the
+ * ledger's OWN "is posted" tests — technicianSharesForJobs reads the first,
+ * postCompletionLedger's second guard reads the second — so either one present
+ * means posted. A posted charge is left alone and the caller is told why; a
+ * reversal after posting is a finance adjustment, not an app tap.
+ *
+ * The DELETE repeats both NOT EXISTS guards rather than trusting the read
+ * before it: the same one-statement reasoning as awardOnce, so a completion
+ * posting between the read and the delete cannot be undercut in this process.
+ * Scoped by the exact REASON_VISIT string (the award's own idempotency key), so
+ * an operator's hand-typed Incentive row can never be what this removes.
+ */
+async function reverseVisitCharge(jobId) {
+  const id = Number(jobId);
+  const [[posted]] = await pool.query(
+    `SELECT EXISTS (SELECT 1 FROM tbl_job_transaction WHERE fk_job_id = ?)
+         OR EXISTS (SELECT 1 FROM tbl_easyfixer_transaction WHERE job_id = ?) AS posted`,
+    [id, id],
+  );
+  if (Number(posted && posted.posted) === 1) return { reversed: false, reason: 'ledger already posted' };
+  const [res] = await pool.query(
+    `DELETE FROM job_material
+      WHERE job_id = ? AND type = 'Incentive' AND reason = ?
+        AND NOT EXISTS (SELECT 1 FROM tbl_job_transaction WHERE fk_job_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM tbl_easyfixer_transaction WHERE job_id = ?)`,
+    [id, REASON_VISIT, id, id],
+  );
+  const reversed = Number(res.affectedRows) > 0;
+  if (reversed) logger.info(`System charge reversed · jobId=${id} · ${REASON_VISIT}`);
+  return { reversed, reason: reversed ? null : 'no visit charge on this job' };
+}
+
+/*
+ * The ₹250 as configured NOW — for the app's "₹250 visit charge is yours" line
+ * on a claim this module has already paid. ponytail: a property change after
+ * the award shows the new figure on an old claim; read job_material's
+ * tx_charge instead if ops ever changes it mid-flight.
+ */
+function visitChargeAmount() {
+  return amount(PROP_VISIT, DEFAULT_VISIT);
+}
+
+/*
+ * Pay the technician for additional work the CLIENT APPROVED (V3 3.3).
+ *
+ * WHY A job_material ROW, AND WHY client_charge IS 0. The desk prices the work
+ * into a quotation_details line so the client's existing estimate-approve flow
+ * can act on it. That line is what the client is INVOICED from —
+ * routes/admin/finance.js bills approved quotation lines at approved_charge. But
+ * the completion ledger (job-ledger.service computeCompletionAmounts) reads
+ * service lines and job_material only, so the technician's tx_charge on the
+ * quotation line never reached his wallet: "additional work you report is
+ * priced and paid to you" (design sheet 09) was a promise nothing kept.
+ *
+ * A system job_material row is how the ₹250 visit charge already reaches the
+ * wallet, so the same road carries this. client_charge is 0 ON PURPOSE: the
+ * client is already billed once, by the invoice, from the quotation line.
+ * Billing it here too would double-charge the client in the client ledger.
+ *
+ * Keyed on the report id, so a retry, or a second approve path firing for the
+ * same report, cannot pay twice — while a second additional-work report on the
+ * same job is its own row.
+ */
+async function awardAdditionalWork(jobId, { reportId, txCharge, actorId }) {
+  const tx = Number(txCharge);
+  const rid = Number(reportId);
+  if (!Number.isInteger(rid) || rid <= 0) return { awarded: false, reason: 'no report' };
+  if (!Number.isFinite(tx) || tx <= 0) return { awarded: false, reason: 'amount is zero' };
+  const awarded = await awardOnce(jobId, {
+    reason: `${REASON_ADDITIONAL_WORK} · report ${rid}`, txCharge: tx, clientCharge: 0, actorId,
+  });
+  return { awarded, amount: tx };
+}
+
 module.exports = {
   awardOnTimeStart,
+  awardAdditionalWork,
+  REASON_ADDITIONAL_WORK,
   awardVisitCharge,
+  reverseVisitCharge,
+  visitChargeAmount,
   startedInSlot,
   PROP_ON_TIME,
   PROP_VISIT,

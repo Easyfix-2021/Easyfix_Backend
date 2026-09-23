@@ -208,6 +208,14 @@ router.use('/rewards',           require('./rewards'));
  * isIssueManage, so the admin queue would be invisible rather than empty.
  */
 router.use('/issues',            require('./issues'));
+/*
+ * V3 Phase 3 live-ops desk (2026-09-24): /ops-desk/*, /verification and the
+ * /jobs/:id/{verify,chat,money} trio. Mounted at the root because it spans
+ * three prefixes; every route in it names its full path and carries its own
+ * isJobAppRequestResolve gate. The /jobs/:id/* paths are disjoint from the
+ * /jobs routers above, which fall through to it. See routes/admin/ops-desk.js.
+ */
+router.use('/',                  require('./ops-desk'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 

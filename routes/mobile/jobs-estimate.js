@@ -4,6 +4,7 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const estimateService = require('../../services/mobile-job-estimate.service');
+const { stripClientPrices } = require('./money-split');
 const materialRequestService = require('../../services/material-request.service');
 const logger = require('../../logger');
 
@@ -55,13 +56,19 @@ function fail(res, next, e) {
 
 // ─── Rate card ─────────────────────────────────────────────────────────
 // GET /:id/rate-card → product/material rate-card items for the job's client.
-// { items: [{ clientRateCardId, name, price, serviceTypeId }] }
+// { items: [{ clientRateCardId, name, serviceTypeId }] }
+//
+// `price` REMOVED from the wire 2026-09-24 (V3 3.9): it is the CLIENT's rate-card
+// price, and the technician no longer prices anything — the desk prices
+// additional work from his photos (design sheet 10). The service still reads it
+// (its own tests pin the resolver); only the phone stops receiving it. The same
+// holds for the material picker's prices and the quotation lines' amounts below.
 router.get('/:id/rate-card', validate(idParam, 'params'), async (req, res, next) => {
   try {
     logger.info('Fetch rate-card for job · jobId=' + req.params.id);
     const out = await estimateService.getRateCard(Number(req.params.id), req.tech.efr_id);
     logger.info('Returning ' + (out.items ? out.items.length : 0) + ' rate-card items');
-    modernOk(res, out);
+    modernOk(res, stripClientPrices(out, ['price']));
   } catch (e) { logger.warn('Fetch rate-card failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
@@ -79,7 +86,8 @@ router.get('/:id/materials', validate(idParam, 'params'), validate(materialsQuer
     logger.info('Fetch job materials · jobId=' + req.params.id + ' · search=' + (req.query.search || ''));
     const out = await estimateService.getJobMaterials(Number(req.params.id), req.tech.efr_id, { search: req.query.search });
     logger.info('Returning ' + (out.items ? out.items.length : 0) + ' materials');
-    modernOk(res, out);
+    // 3.9 — resolved client prices stay server-side (see the rate card above).
+    modernOk(res, stripClientPrices(out, ['price']));
   } catch (e) { logger.warn('Fetch job materials failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
@@ -142,7 +150,9 @@ router.get('/:id/quotation', validate(idParam, 'params'), async (req, res, next)
     logger.info('List quotation lines · jobId=' + req.params.id);
     const out = await estimateService.listQuotationLines(Number(req.params.id), req.tech.efr_id);
     logger.info('Returning ' + (out.items ? out.items.length : 0) + ' quotation lines');
-    modernOk(res, out);
+    // 3.9 — a line keeps its name, quantity and state for the read-only 15/16
+    // banners; its amount / clientCharge / approvedCharge are client prices.
+    modernOk(res, stripClientPrices(out, ['amount']));
   } catch (e) { logger.warn('List quotation lines failed · jobId=' + req.params.id + ' · ' + e.message); fail(res, next, e); }
 });
 
@@ -238,8 +248,8 @@ router.post('/:id/send-for-approval', validate(idParam, 'params'), validate(Joi.
 });
 
 // ─── Job images ────────────────────────────────────────────────────────
-// POST /:id/images?category=Booking|Completion { refs: [<s3-key>...] }
-//   → { ok: true, inserted: <n> }
+// POST /:id/images?category=Booking|Completion|Proof { refs: [<s3-key>...] }
+//   → { ok: true, inserted: <n>, imageIds: [<tbl_job_image.image_id>...] }
 // Accepts JSON refs[] for now. Multipart byte upload is a // VERIFY: when the
 // app moves to multipart, this handler will need multer + the s3-storage
 // putJobImage() helper (as in routes/admin/jobs.js); the JSON-refs contract
@@ -247,7 +257,9 @@ router.post('/:id/send-for-approval', validate(idParam, 'params'), validate(Joi.
 router.post(
   '/:id/images',
   validate(idParam, 'params'),
-  validate(Joi.object({ category: Joi.string().valid('Booking', 'Completion').required() }), 'query'),
+  // 'Proof' (V3 3.6a/b): a claim's photo — stored as 'proof', see
+  // utils/job-image-buckets.js; its status window is enforced in the service.
+  validate(Joi.object({ category: Joi.string().valid('Booking', 'Completion', 'Proof').required() }), 'query'),
   validate(Joi.object({ refs: Joi.array().items(Joi.string().trim().max(512)).default([]) })),
   async (req, res, next) => {
     try {

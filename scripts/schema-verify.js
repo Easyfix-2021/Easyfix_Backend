@@ -414,6 +414,28 @@ const EXPECTED = {
     // (services/job.service.js getJobConsoleExtras).
     'no_of_escalations', 'escalated_comments',
   ],
+  /*
+   * V3 Phase 3 (migrations/2026-09-24-v3-phase3-tables.sql). Strict, not
+   * fail-soft: the technician's on-site claims, the chat and the QC/ledger
+   * state are read by every mobile job list (services/job-pending-on.js) and
+   * the ops desk, so a missing column is a 500 on the app's hottest read.
+   * open_dedupe_key is listed because a table created WITHOUT it has no
+   * idempotency rule at all — see REQUIRED_INDEXES below for the index half.
+   */
+  tbl_job_tx_report: [
+    'id', 'job_id', 'efr_id', 'kind', 'reason_code', 'reason_text', 'proof_image_ids',
+    'status', 'booked_meanwhile', 'left_site_on', 'client_amount', 'tx_amount',
+    'price_note', 'return_note', 'visit_charge_awarded', 'prev_job_status',
+    'reported_on', 'resolved_on', 'resolved_by', 'open_dedupe_key',
+  ],
+  tbl_job_chat: [
+    'id', 'job_id', 'sender_kind', 'efr_id', 'user_id', 'body', 'client_msg_id', 'sent_on',
+  ],
+  tbl_job_verification: [
+    'job_id', 'verified_on', 'verified_by', 'qc_due_on', 'qc_status', 'qc_on',
+    'qc_by_contact_id', 'qc_note', 'posted_on', 'post_error',
+  ],
+  tbl_client_qc_timing: ['client_id', 'qc_hours', 'check_hours', 'updated_on'],
 };
 
 /*
@@ -502,6 +524,33 @@ const REQUIRED_INDEXES = [
     table: 'tbl_easyfixer_withdrawal_request',
     columns: ['fk_easyfixer_id', 'status'],
     unique: false,
+  },
+  /*
+   * What keeps GET /api/admin/jobs/:id/activity off a 1.7M-row scan (V3 3.1).
+   * Declared by COLUMNS, not by name, on purpose: tbl_job_logs predates this
+   * repo by a decade, so a suitable index may already exist under a legacy
+   * name — and migrations/2026-09-23-index-job-logs-job-id.sql tells the
+   * operator to skip the CREATE in exactly that case. A name-based invariant
+   * would then fail on a server that is, in fact, correct.
+   */
+  {
+    table: 'tbl_job_logs',
+    columns: ['job_id'],
+    unique: false,
+    impact: 'every job-activity read scans ~1.7M rows instead of seeking',
+  },
+  // V3 Phase 3 — the "one open X per job" rules (migrations/2026-09-24-v3-phase3-tables.sql).
+  {
+    table: 'tbl_job_tx_report',
+    columns: ['open_dedupe_key'],
+    unique: true,
+    impact: 'a phone retry opens a SECOND additional-work / cannot-complete / help claim on the same job',
+  },
+  {
+    table: 'tbl_job_chat',
+    columns: ['job_id', 'client_msg_id'],
+    unique: true,
+    impact: 'a phone retrying a chat send posts the same line twice',
   },
 ];
 
@@ -740,11 +789,20 @@ async function verifySchemaAgainstLiveDb() {
       invariants.push({
         table: required.table,
         col: `<${required.unique ? 'UNIQUE ' : ''}INDEX(${required.columns.join(',')})>`,
-        impact: required.table === 'tbl_idempotency_key'
-          ? 'an offline mutation can execute twice'
-          : required.table === 'easyfixer_watched_video'
-            ? 'ON DUPLICATE KEY UPDATE cannot fire — training saves insert duplicate rows'
-            : 'the cross-technician Aadhaar race guard is not enforced by the database',
+        /*
+         * The entry's OWN impact line first. This used to be a ternary over
+         * three table names with a trailing else, which meant every index
+         * added after those three reported the Aadhaar guard's consequence —
+         * a confidently wrong cause for an operator to chase. The ternary is
+         * kept as the fallback so the three tables that predate `impact` keep
+         * their exact wording; new entries state their own.
+         */
+        impact: required.impact
+          || (required.table === 'tbl_idempotency_key'
+            ? 'an offline mutation can execute twice'
+            : required.table === 'easyfixer_watched_video'
+              ? 'ON DUPLICATE KEY UPDATE cannot fire — training saves insert duplicate rows'
+              : 'the cross-technician Aadhaar race guard is not enforced by the database'),
       });
     }
   }
@@ -913,6 +971,8 @@ module.exports = {
     // (every expected column present) and then take exactly one table away.
     EXPECTED,
     FAIL_SOFT_TABLES,
+    // So a migration's test can assert its UNIQUE keys are listed here.
+    REQUIRED_INDEXES,
     ACTIVE_AADHAAR_GENERATED_COLUMN_SQL,
     canonicalSql,
     matchesActiveAadhaarGeneratedColumn,
