@@ -125,8 +125,16 @@ function crudFactory(table, pk, nameCol, statusCol, allowedCols, fieldSchemas) {
  * reinstating this — a generic CRUD factory cannot express "rejecting is a
  * merge".
  */
-router.use('/states',              crudFactory('tbl_state',         'state_id',        'state_name',         null,                  ['state_name', 'state_code', 'country_id'],
-  { state_name: str.max(100), state_code: str.max(10), country_id: int }));
+/*
+ * tbl_state is NOT served by crudFactory either. Removed 2026-09-21, for the
+ * same reasons as tbl_city above: no per-action permission (any admin-group
+ * role could write), no duplicate check, and — the new reason — no zonal
+ * manager. Every state must carry one, and a manager change must reach the
+ * state's cities in the same transaction; a generic CRUD cannot express that.
+ * Nothing in this repo or CRM_UI called it. Use /api/admin/states
+ * (routes/admin/states.js, gated on isStateEdit). Read-only state lists stay
+ * at /api/shared/lookup/states.
+ */
 router.use('/service-categories',  crudFactory('tbl_service_catg',  'service_catg_id', 'service_catg_name', 'service_catg_status', ['service_catg_name', 'service_catg_desc', 'service_catg_status'],
   { service_catg_name: str, service_catg_desc: str.max(1000), service_catg_status: bit }));
 router.use('/service-types',       crudFactory('tbl_service_type',  'service_type_id', 'service_type_name', 'service_type_status', ['service_type_name', 'service_type_desc', 'service_type_status', 'service_catg_id'],

@@ -89,6 +89,9 @@ async function assertBrandsAndStatesExist(groups) {
     const found = new Set(rows.map((r) => r.state_id));
     const missing = ids.filter((id) => !found.has(id));
     if (missing.length) throw mkErr(422, `Unknown state_id(s): ${missing.join(', ')}`);
+    // Existing is not enough — prices are set on ACTIVE states only; an
+    // inactive state is offered nowhere, so a price on it would never apply.
+    await require('./state.service').assertActiveStates(ids);
   }
 }
 

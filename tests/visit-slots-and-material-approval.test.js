@@ -365,7 +365,18 @@ async function postApproval(fields = {}, opts = {}) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
-const VALID_SLOT = '2026-09-23 10:00:00';
+/*
+ * TOMORROW, computed. These tests run against the REAL clock (unlike the
+ * assertSlotBookable unit tests above, which pin `now` deliberately), so a
+ * literal date is a time bomb: '2026-09-23 10:00:00' passed CI until that
+ * morning, then failed every run — and blocked the QA deploy pipeline for a
+ * change that had nothing to do with it. 10:00 IST tomorrow is always a valid
+ * slot hour, whatever time the suite runs.
+ */
+const VALID_SLOT = (() => {
+  const ist = new Date(Date.now() + ((5 * 60 + 30) * 60 * 1000) + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
 
 test('on-behalf: 400 without visit_date_time', async () => {
   const res = await postApproval({ permission: 'not_required' });
@@ -391,7 +402,7 @@ test('on-behalf: nothing is written when a 400 fires before any write', async ()
 });
 
 test('on-behalf: 409 when the chosen slot is already booked', async () => {
-  state.busyHour = { date: '2026-09-23', hour: 10 };
+  state.busyHour = { date: VALID_SLOT.slice(0, 10), hour: 10 };  // must collide with VALID_SLOT
   const res = await postApproval({ visit_date_time: VALID_SLOT, permission: 'not_required' });
   assert.equal(res.status, 409, JSON.stringify(res.body));
   assert.equal(setStatusCalls.length, 0, 'busy slot must be caught before any write');
@@ -531,7 +542,7 @@ test('client portal approve: 400 before any write when visit_date_time is missin
 
 test('client portal approve: 409 on a busy slot, before any write', async () => {
   jobFixture = makeJob({ job_status: 15 });
-  state.busyHour = { date: '2026-09-23', hour: 10 };
+  state.busyHour = { date: VALID_SLOT.slice(0, 10), hour: 10 };  // must collide with VALID_SLOT
   const r = await callClient({ visit_date_time: VALID_SLOT, permission: 'not_required' });
   assert.equal(r.statusCode, 409, JSON.stringify(r.body));
   assert.equal(setStatusCalls.length, 0);
