@@ -32,28 +32,31 @@ const coverage = require('./pincode-coverage.service');
 
 const STATUS = Object.freeze({ LOCAL: 'LOCAL', TRAVEL: 'TRAVEL', UNZONED: 'UNZONED' });
 
-// Active+verified easyfixer count per pincode, batched.
+// Active+verified easyfixer count per pincode, batched — the number behind the
+// Manage Pincodes "Mapping" badge ("Local · N Technicians").
 //
-// Changed from the zone-chain join (tbl_pincode → tbl_zone_city_mapping →
-// tbl_easyfixer.efr_zone_city_id) to a SERVICEABLE-PINCODE count:
-// technicians whose tbl_efr_serviceable_pincodes row explicitly lists the
-// pincode value (CSV TEXT column, matched with FIND_IN_SET). This matches
-// the exact pattern used by candidate-ranking.service.js to identify
-// serviceable technicians for a job pincode — so LOCAL/TRAVEL status now
-// directly reflects "can a tech actually service this pincode" rather than
-// "is a tech in the same city zone".
+// Counts technicians whose tbl_efr_serviceable_pincodes row explicitly lists
+// the pincode: the DECLARED SERVICE AREA. The technician's own home pincode
+// (tbl_easyfixer.efr_pin_no) is NOT counted, even though the coverage module's
+// dispatch question (getCoveredPincodes — TAT, allocation) does count it.
 //
-// Performance: per-page call is ~100 rows; bounded by WHERE p.pincode_id IN (?)
-// + FIND_IN_SET scans only the serviceable_pincodes rows, not the full
-// tbl_easyfixer table. Acceptable for an ops settings page.
+// That asymmetry is deliberate and is the whole point of this function. The
+// badge is clickable and opens listTechniciansForPincode, which lists
+// tbl_efr_serviceable_pincodes and nothing else. When the count included home
+// pincodes and the list did not, 122001 rendered "Local · 38 Technicians" over
+// a drill-down of 5 — a number no one could reconcile with the names under it.
+// Ops holds technicians to their declared area, so the declared area is what
+// this column reports. Do not "restore" efr_pin_no here without also adding it
+// to listTechniciansForPincode; the two must count one population.
+//
+// Performance: one cached supply read for the whole page, regardless of page
+// size — see pincode-coverage.service.js.
 async function pincodeIdToActiveEfrCount(pincodeIds) {
   if (!pincodeIds.length) return new Map();
   // Resolve ids → pincode strings, then ask the SHARED coverage module. This
-  // used to run its own FIND_IN_SET join, which differed from every other
-  // consumer in two ways: it ignored the technician's OWN pincode
-  // (tbl_easyfixer.efr_pin_no), and it did NOT strip spaces from the CSV — so
-  // '560001, 560002' matched only the first entry and the rest of that
-  // technician's coverage was invisible. Both are fixed by delegating.
+  // used to run its own FIND_IN_SET join that did NOT strip spaces from the CSV
+  // — so '560001, 560002' matched only the first entry and the rest of that
+  // technician's service area was invisible. Delegating fixes that.
   const placeholders = pincodeIds.map(() => '?').join(',');
   const [rows] = await pool.query(
     `SELECT pincode_id, pincode FROM tbl_pincode WHERE pincode_id IN (${placeholders})`,
@@ -67,10 +70,10 @@ async function pincodeIdToActiveEfrCount(pincodeIds) {
    * one with a single technician looked identical, and the number is the whole
    * point of that column.
    *
-   * Still no extra query: getCoverageCounts walks the SAME cached supply in one
-   * pass and tallies per pincode.
+   * Still no extra query: getServiceAreaCounts walks the SAME cached supply in
+   * one pass and tallies per pincode.
    */
-  const counts = await coverage.getCoverageCounts(rows.map((r) => r.pincode));
+  const counts = await coverage.getServiceAreaCounts(rows.map((r) => r.pincode));
   const map = new Map();
   for (const r of rows) {
     map.set(Number(r.pincode_id), counts.get(String(r.pincode).trim()) || 0);
@@ -80,11 +83,20 @@ async function pincodeIdToActiveEfrCount(pincodeIds) {
 
 
 /*
- * List active+verified technicians who explicitly service a pincode.
+ * List active+verified technicians who explicitly service a pincode — the
+ * drill-down behind the Manage Pincodes "Mapping" badge.
  *
- * Reuses the same FIND_IN_SET match as pincodeIdToActiveEfrCount and
- * candidate-ranking.service.js's serviceable-pincodes query. Supports
- * free-text search (q) over efr_name / efr_id / efr_no (mobile).
+ * Counts the SAME population as pincodeIdToActiveEfrCount (declared service
+ * area: tbl_efr_serviceable_pincodes, home pincodes excluded), so `total` here
+ * and the badge's number are the same figure by construction.
+ *
+ * REPLACE(sp.pincodes, ' ', '') matters. Without it FIND_IN_SET searches for
+ * ' 122001' WITH a leading space in a CSV saved as '110001, 122001' — the
+ * natural way to type one — and every entry after the first is invisible. This
+ * query was the last reader in the backend still missing that REPLACE, while
+ * candidate-ranking.service.js, zone.service.js and pincode-coverage.service.js
+ * all had it, so the drill-down under-listed against every other surface.
+ * Supports free-text search (q) over efr_name / efr_id / efr_no (mobile).
  *
  * Returns { items: [...], total } where each item has:
  *   efr_id, efr_name, efr_no, zone_name, city_name
@@ -100,7 +112,10 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
     [pincodeId]
   );
   if (!pinRow) return { items: [], total: 0 };
-  const pincodeVal = String(pinRow.pincode);
+  // .trim() for parity with the badge, which counts via coverage.normalise()
+  // on a trimmed value. A padded tbl_pincode.pincode would otherwise make
+  // FIND_IN_SET hunt for ' 122001' here and list nobody while the badge said 5.
+  const pincodeVal = String(pinRow.pincode).trim();
 
   const searchWhere = [];
   const searchParams = [];
@@ -125,7 +140,7 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
        JOIN tbl_easyfixer e ON e.efr_id = sp.easyfixer_id
                            AND e.efr_status = 1
                            AND e.is_technician_verified = 1
-      WHERE FIND_IN_SET(?, sp.pincodes) > 0${extraWhere}`,
+      WHERE FIND_IN_SET(?, REPLACE(sp.pincodes, ' ', '')) > 0${extraWhere}`,
     baseParams
   );
 
@@ -142,7 +157,7 @@ async function listTechniciansForPincode(pincodeId, { q = '', limit = 20, offset
        LEFT JOIN tbl_city              c   ON c.city_id = e.efr_cityId
        LEFT JOIN tbl_zone_city_mapping zcm ON zcm.city_zone_id = e.efr_zone_city_id
        LEFT JOIN tbl_zone_master       zm  ON zm.zone_id = zcm.zone_id
-      WHERE FIND_IN_SET(?, sp.pincodes) > 0${extraWhere}
+      WHERE FIND_IN_SET(?, REPLACE(sp.pincodes, ' ', '')) > 0${extraWhere}
       GROUP BY e.efr_id, e.efr_name, e.efr_no
       ORDER BY e.efr_name ASC
       LIMIT ? OFFSET ?`,
@@ -262,6 +277,12 @@ async function listPincodes({ q, status, cityId, createdByTech = false, includeI
    * cache, so the honest fix is to resolve the covered SET once and narrow the
    * SQL with it — then LIMIT, COUNT and the filter all describe one population.
    *
+   * getServiceAreaSet, NOT getCoveredSet: the filter has to select the same
+   * population the badge counts (pincodeIdToActiveEfrCount → getServiceAreaCounts
+   * — declared service area, home pincodes excluded). Using the wider dispatch
+   * set here would let a row render TRAVEL inside a list its own LOCAL filter
+   * had just selected it into.
+   *
    * TRIM(p.pincode), not p.pincode: the covered set is keyed on trimmed 6-digit
    * strings (coverage.normalise) and so is the per-row status computed below. A
    * bare column compare would let a padded value display LOCAL while the filter
@@ -270,7 +291,7 @@ async function listPincodes({ q, status, cityId, createdByTech = false, includeI
    */
   if (status) {
     const wantLocal = String(status).toUpperCase() === STATUS.LOCAL;
-    const covered = [...(await coverage.getCoveredSet())];
+    const covered = [...(await coverage.getServiceAreaSet())];
     if (covered.length === 0) {
       // No coverage anywhere: nothing is LOCAL, everything is TRAVEL.
       if (wantLocal) where.push('1=0');
