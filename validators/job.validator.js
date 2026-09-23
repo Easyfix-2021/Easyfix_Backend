@@ -359,6 +359,38 @@ const pendingStartCountsQuery = Joi.object(Object.fromEntries(
   PENDING_START_COUNT_FILTERS.map((key) => [key, listQuery.extract(key)]),
 ));
 
+/*
+ * ── THE DASHBOARD FILTER BAR (2026-09-23) ─────────────────────────────────
+ *
+ * The four filters on /dashboard — Client, City, Project Manager, Zonal
+ * Manager. Same construction and the same reason as the two tab-strip schemas
+ * above: every key is EXTRACTED from listQuery, so a card's number and the
+ * Manage Jobs grid an operator opens next accept a value identically. A
+ * hand-copied `csvIds.optional()` would be a second copy of the CSV cap for
+ * someone to keep in step by hand, and nothing would say when it stopped being
+ * in step.
+ *
+ * Four, not more. The dashboard has roughly one filter row of above-the-fold
+ * headroom, and the set is deliberately the four ways an EasyFix manager owns a
+ * queue rather than every column a job has — /jobs is where a twenty-field
+ * filter panel belongs.
+ *
+ * No date range, deliberately: both endpoints count LIVE OPEN STATE, so a date
+ * filter would quietly redefine every number on the page ("146 pending for
+ * scheduling" means right now, not booked-this-month). If ops asks for one it
+ * needs its own treatment on the card subtitles, not a silent extra key here.
+ */
+const DASHBOARD_FILTERS = ['clientId', 'cityId', 'projectManagerId', 'zonalManagerId'];
+const dashboardFilterKeys = () => Object.fromEntries(
+  DASHBOARD_FILTERS.map((key) => [key, listQuery.extract(key)]),
+);
+/*
+ * /counts additionally accepts ownerId — the My Orders flow scopes the same
+ * cards to the operator's own jobs. /attention-summary never had it.
+ */
+const dashboardCountsQuery    = Joi.object({ ...dashboardFilterKeys(), ownerId: listQuery.extract('ownerId') });
+const dashboardAttentionQuery = Joi.object(dashboardFilterKeys());
+
 const customerBlock = Joi.object({
   customer_id: intId.optional(),
   customer_name: Joi.string().max(255).when('customer_id', { is: Joi.exist(), then: Joi.optional(), otherwise: Joi.required() }),
@@ -750,4 +782,8 @@ module.exports = {
   // so a test can assert the strip honours every filter the grid sends.
   pendingSchedulingCountsQuery, PENDING_SCHEDULING_COUNT_FILTERS,
   pendingStartCountsQuery, PENDING_START_COUNT_FILTERS,
+  // Same pairing for the dashboard bar: the two schemas plus the key list they
+  // are built from, so the route can lift exactly those keys off a validated
+  // query without re-typing them a third time.
+  dashboardCountsQuery, dashboardAttentionQuery, DASHBOARD_FILTERS,
 };
