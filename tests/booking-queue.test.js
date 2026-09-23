@@ -216,7 +216,8 @@ const SENT_ROW = {
   sent: 100, responded: 25, failed: 5, no_response: 70,
   responded_open: 7, failed_open: 4, no_response_open: 58,
 };
-const WAIT_ROW = { new_today: 12, new_old: 3, no_link_today: 8, no_link_old: 14 };
+const WAIT_ROW = { new_today: 12, new_old: 3, no_link_today: 8, no_link_old: 14,
+  open_responded: 7, open_no_response: 58, open_failed: 4 };
 
 test('links.sent always equals the three outcomes added together', async () => {
   const out = await bq.counts({ db: countsPool(SENT_ROW, WAIT_ROW).pool });
@@ -227,10 +228,44 @@ test('links.sent always equals the three outcomes added together', async () => {
   assert.deepEqual(out.waiting.no_link_needed, { today: 8, old: 14 });
 });
 
-test('the open number never exceeds its own tile — it is a subset', async () => {
+/*
+ * THE COUNT THAT WENT MISSING, pinned.
+ *
+ * `open` was once a subset of the PERIOD cohort — "of the links sent today,
+ * how many still wait". On the QA book that read 0 on every tile while 133 open
+ * orders sat in No response from links sent weeks earlier: the page described
+ * 13 of 149 orders and looked finished. An order does not stop needing a call
+ * because its link is old, and the grid lists every open order in the bucket.
+ *
+ * So `open` is now the WHOLE queue and must be free of the date window, while
+ * `period_open` keeps the subset that "closed" is derived from.
+ */
+test('open is the whole queue, NOT a slice of the period', async () => {
+  const quietDay = { sent: 0, responded: 0, failed: 0, no_response: 0,
+    responded_open: 0, failed_open: 0, no_response_open: 0 };
+  const board = { ...WAIT_ROW, open_responded: 3, open_no_response: 133, open_failed: 0 };
+  const out = await bq.counts({ db: countsPool(quietDay, board).pool });
+
+  assert.equal(out.links.sent, 0, 'no links went out in the period');
+  assert.equal(out.open.no_response, 133,
+    '133 open orders still need calling — a quiet period must not hide them');
+  assert.deepEqual(out.period_open, { response_received: 0, no_response: 0, delivery_failed: 0 });
+});
+
+test('the tiles add up to every open order — none belongs to nothing', async () => {
+  const board = { new_today: 0, new_old: 13, no_link_today: 0, no_link_old: 0,
+    open_responded: 3, open_no_response: 133, open_failed: 0 };
+  const out = await bq.counts({ db: countsPool({ sent: 0 }, board).pool });
+  const total = out.open.response_received + out.open.no_response + out.open.delivery_failed
+    + out.waiting.new.today + out.waiting.new.old
+    + out.waiting.no_link_needed.today + out.waiting.no_link_needed.old;
+  assert.equal(total, 149, 'the five tiles must sum to the tab total (measured on QA: 149)');
+});
+
+test('the period subset never exceeds the period funnel', async () => {
   const out = await bq.counts({ db: countsPool(SENT_ROW, WAIT_ROW).pool });
   for (const k of ['response_received', 'no_response', 'delivery_failed']) {
-    assert.ok(out.open[k] <= out.links[k], `${k}: still-open must be a subset of what happened`);
+    assert.ok(out.period_open[k] <= out.links[k], `${k}: the still-open slice is part of what happened`);
   }
 });
 

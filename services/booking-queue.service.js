@@ -273,24 +273,40 @@ async function counts({
   );
 
   /*
-   * PASS 2 — the two waiting tiles, over open jobs only, split Today / Old by
-   * the ticket's creation date. ticket_created_date_time is when the CLIENT
-   * raised it; created_date_time is when our row was written, and they differ
-   * on bulk uploads, so the split follows the one ops reads on the row.
+   * PASS 2 — THE WORK STILL ON THE BOARD, over open jobs (job_status = 9),
+   * every bucket, WITHOUT a date window.
+   *
+   * ⚠ WHY NO PERIOD HERE, and it is the bug this pass was rewritten to fix.
+   * The first cut counted the open work as a SUBSET OF THE PERIOD COHORT —
+   * "of the links sent today, how many are still waiting". On QA that read 0
+   * across every tile while 133 open orders sat in No response from links sent
+   * weeks earlier: the page accounted for 13 of 149 orders and looked finished.
+   * An order does not stop needing a phone call because its link is old, and
+   * the grid below lists every open order in the bucket, so a count that
+   * excluded them described a different population than the rows underneath it.
+   *
+   * So: the headline x/N stays the PERIOD funnel (what happened to the links we
+   * sent today), and this is the QUEUE — all five buckets, all open orders,
+   * summing to the tab total. One pass, one CASE, so they cannot double-count.
+   *
+   * `period_open` keeps the period-cohort subset alongside it, which is what
+   * "closed by team" is derived from: of today's links, the ones that have
+   * already been dealt with.
    */
   const optedIn = optedInSql();
   const sentP = sentSql();
   const today = istToday(now);
+  const isNew = `${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}`;
+  const ticketYmd = 'DATE(COALESCE(j.ticket_created_date_time, j.created_date_time))';
   const [[waitRow]] = await db.query(
     `SELECT
-        SUM(${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}
-            AND DATE(COALESCE(j.ticket_created_date_time, j.created_date_time)) = ?)  AS new_today,
-        SUM(${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}
-            AND DATE(COALESCE(j.ticket_created_date_time, j.created_date_time)) <> ?) AS new_old,
-        SUM(NOT ${optedIn}
-            AND DATE(COALESCE(j.ticket_created_date_time, j.created_date_time)) = ?)  AS no_link_today,
-        SUM(NOT ${optedIn}
-            AND DATE(COALESCE(j.ticket_created_date_time, j.created_date_time)) <> ?) AS no_link_old
+        SUM(${isNew} AND ${ticketYmd} = ?)  AS new_today,
+        SUM(${isNew} AND ${ticketYmd} <> ?) AS new_old,
+        SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
+        SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
+        SUM(${optedIn} AND ${responded})                                  AS open_responded,
+        SUM(${optedIn} AND NOT ${responded} AND ${failed})                AS open_failed,
+        SUM(${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS open_no_response
        FROM tbl_job j${joins}
       WHERE j.job_status = 9${scope}`,
     [today, today, today, today, ...whereParams],
@@ -308,8 +324,24 @@ async function counts({
       no_response: n(sentRow && sentRow.no_response),
       delivery_failed: n(sentRow && sentRow.failed),
     },
-    // Of those, still waiting for the team — the number that goes down.
+    /*
+     * THE QUEUE: every open order in the bucket, whatever day its link went
+     * out. This is what the grid lists and what the tile's work pill shows, and
+     * open.* + waiting.* sums to the tab total — the check that catches a
+     * bucket quietly claiming nobody.
+     */
     open: {
+      response_received: n(waitRow && waitRow.open_responded),
+      no_response: n(waitRow && waitRow.open_no_response),
+      delivery_failed: n(waitRow && waitRow.open_failed),
+    },
+    /*
+     * The same three, narrowed to the period's links. Only "closed by team"
+     * reads this: links.x - period_open.x = how many of TODAY'S links have
+     * already been dealt with. Kept separate from `open` above because mixing
+     * the two is exactly what made the tiles describe 13 of 149 orders.
+     */
+    period_open: {
       response_received: n(sentRow && sentRow.responded_open),
       no_response: n(sentRow && sentRow.no_response_open),
       delivery_failed: n(sentRow && sentRow.failed_open),
