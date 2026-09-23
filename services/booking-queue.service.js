@@ -245,7 +245,7 @@ function bucketPredicate(bucket, { hasRequestTable = true } = {}) {
 
 /* ── The period the link tiles are counted over ──────────────────────────── */
 
-const PERIODS = ['today', 'yesterday', 'last7'];
+const PERIODS = ['all', 'today', 'yesterday', 'last7'];
 
 /**
  * The period as IST calendar days, resolved to a [start, end) pair of JS
@@ -268,15 +268,23 @@ function periodRange(period, now = new Date()) {
   const todayStart = istDayStart(now, 0);
   const tomorrowStart = new Date(istDayStart(now, -1).getTime());
   switch (period) {
+    case 'today':
+      return { start: todayStart, end: tomorrowStart };
     case 'yesterday':
       return { start: istDayStart(now, 1), end: todayStart };
     case 'last7':
       // Seven calendar days ENDING today, today included — "the last 7 days"
       // as ops reads it off a calendar, not a rolling 168 hours.
       return { start: istDayStart(now, 6), end: tomorrowStart };
-    case 'today':
+    case 'all':
     default:
-      return { start: todayStart, end: tomorrowStart };
+      /*
+       * NO WINDOW AT ALL, and it is the DEFAULT (ops, 2026-09-23). The page's
+       * job is "what is open on my desk", and most of that book was raised
+       * weeks ago — a date filter that defaults to today would open on an
+       * empty screen while 149 orders waited. The other three narrow it.
+       */
+      return { start: null, end: null };
   }
 }
 
@@ -300,12 +308,15 @@ function istToday(now = new Date()) {
  * may this user see" is exactly the drift this file exists to avoid.
  */
 async function counts({
-  period = 'today', now = new Date(), scopeSql = '', scopeParams = [], scopeJoins = '',
+  period = 'all', now = new Date(), scopeSql = '', scopeParams = [], scopeJoins = '',
   ownerId, hasRequestTable = true, db = pool,
 } = {}) {
   const { start, end } = periodRange(period, now);
   const responded = respondedSql('j', hasRequestTable);
   const failed = failedSql();
+  const optedIn = optedInSql();
+  const sentP = sentSql();
+
   /*
    * The caller's row filter, verbatim. `ownerId` rides alongside it because My
    * Orders is owner-scoped for everyone outside the admin group — the tiles
@@ -315,68 +326,56 @@ async function counts({
   const whereParams = [];
   if (scopeSql) { where.push(`(${scopeSql})`); whereParams.push(...scopeParams); }
   if (Number.isFinite(Number(ownerId))) { where.push('j.job_owner = ?'); whereParams.push(Number(ownerId)); }
+
+  /*
+   * THE DATE FILTER IS THE TICKET'S CREATION DATE, and it narrows EVERY tile.
+   *
+   * It used to be "links sent in this period", which answered a different
+   * question from the one the tabs appear to ask and left the tiles describing
+   * a slice of the board nobody had asked for. Ops settled it (2026-09-23): the
+   * tabs filter ORDERS BY WHEN THE TICKET CAME IN, every bucket moves with them,
+   * and All is the default.
+   *
+   * `j.ticket_created_date_time` EXACTLY as the list's dateType=ticket applies
+   * it — not COALESCE'd onto created_date_time — because the grid underneath
+   * sends dateType=ticket&startDate&endDate, and a tile counting one column
+   * while the rows filter another is the mismatch this whole file exists to
+   * avoid. (Measured on QA: 0 of 149 open orders have a NULL ticket date.)
+   *
+   * DATE(...) bounds, not raw instants: the pool runs at +05:30, and the list
+   * truncates its own bounds the same way (job.service.js, the 2026-08-18 fix)
+   * so a one-day range means that whole IST day in both places.
+   */
+  if (start && end) {
+    where.push('DATE(j.ticket_created_date_time) >= DATE(?) AND DATE(j.ticket_created_date_time) < DATE(?)');
+    whereParams.push(start, end);
+  }
   const scope = where.length ? ` AND ${where.join(' AND ')}` : '';
   const joins = scopeJoins ? ` ${scopeJoins}` : '';
 
   /*
-   * PASS 1 — what happened to the links sent in this period.
-   *
-   * Deliberately NOT filtered by job_status: a link sent this morning counts
-   * whatever the order did afterwards. `*_open` re-counts the same rows that
-   * are still unconfirmed, which is the small "still to call" number, so the
-   * two halves of every tile come from one row and cannot disagree.
+   * ONE PASS over the open book. Every tile, the answer split, the Today/Old
+   * halves and the links-sent tally come off the same rows, so they cannot
+   * disagree with each other and the five buckets always sum to `total`.
    */
-  const [[sentRow]] = await db.query(
-    `SELECT COUNT(*) AS sent,
-            SUM(${responded})                              AS responded,
-            SUM(NOT ${responded} AND ${failed})            AS failed,
-            SUM(NOT ${responded} AND NOT ${failed})        AS no_response,
-            SUM(${responded} AND j.job_status = 9)                       AS responded_open,
-            SUM(NOT ${responded} AND ${failed} AND j.job_status = 9)     AS failed_open,
-            SUM(NOT ${responded} AND NOT ${failed} AND j.job_status = 9) AS no_response_open
-       FROM tbl_job j${joins}
-      WHERE j.magic_link_sent_at >= ? AND j.magic_link_sent_at < ?${scope}`,
-    [start, end, ...whereParams],
-  );
-
-  /*
-   * PASS 2 — THE WORK STILL ON THE BOARD, over open jobs (job_status = 9),
-   * every bucket, WITHOUT a date window.
-   *
-   * ⚠ WHY NO PERIOD HERE, and it is the bug this pass was rewritten to fix.
-   * The first cut counted the open work as a SUBSET OF THE PERIOD COHORT —
-   * "of the links sent today, how many are still waiting". On QA that read 0
-   * across every tile while 133 open orders sat in No response from links sent
-   * weeks earlier: the page accounted for 13 of 149 orders and looked finished.
-   * An order does not stop needing a phone call because its link is old, and
-   * the grid below lists every open order in the bucket, so a count that
-   * excluded them described a different population than the rows underneath it.
-   *
-   * So: the headline x/N stays the PERIOD funnel (what happened to the links we
-   * sent today), and this is the QUEUE — all five buckets, all open orders,
-   * summing to the tab total. One pass, one CASE, so they cannot double-count.
-   *
-   * `period_open` keeps the period-cohort subset alongside it, which is what
-   * "closed by team" is derived from: of today's links, the ones that have
-   * already been dealt with.
-   */
-  const optedIn = optedInSql();
-  const sentP = sentSql();
-  const today = istToday(now);
   const isNew = `${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}`;
-  const ticketYmd = 'DATE(COALESCE(j.ticket_created_date_time, j.created_date_time))';
-  const [[waitRow]] = await db.query(
-    `SELECT
-        SUM(${isNew} AND ${ticketYmd} = ?)  AS new_today,
-        SUM(${isNew} AND ${ticketYmd} <> ?) AS new_old,
+  const ticketYmd = 'DATE(j.ticket_created_date_time)';
+  const today = istToday(now);
+  const [[row]] = await db.query(
+    `SELECT COUNT(*) AS total,
+        SUM(${isNew})                                                       AS b_new,
+        SUM(NOT ${optedIn})                                                 AS b_no_link,
+        SUM(${optedIn} AND ${responded})                                    AS b_responded,
+        SUM(${optedIn} AND NOT ${responded} AND ${failed})                  AS b_failed,
+        SUM(${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS b_no_response,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable })}))      AS r_ready,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable })})) AS r_reschedule,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable })}))     AS r_cancel,
+        SUM(${isNew} AND ${ticketYmd} = ?)        AS new_today,
+        SUM(${isNew} AND ${ticketYmd} <> ?)       AS new_old,
         SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
         SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
-        SUM(${optedIn} AND ${responded})                                  AS open_responded,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable })}))      AS open_resp_ready,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable })})) AS open_resp_reschedule,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable })}))     AS open_resp_cancel,
-        SUM(${optedIn} AND NOT ${responded} AND ${failed})                AS open_failed,
-        SUM(${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS open_no_response
+        SUM(${sentP})                             AS links_sent
        FROM tbl_job j${joins}
       WHERE j.job_status = 9${scope}`,
     [today, today, today, today, ...whereParams],
@@ -387,50 +386,32 @@ async function counts({
     period,
     period_start: start,
     period_end: end,
-    // What happened to the links sent in the period. sent = the other three.
-    links: {
-      sent: n(sentRow && sentRow.sent),
-      response_received: n(sentRow && sentRow.responded),
-      no_response: n(sentRow && sentRow.no_response),
-      delivery_failed: n(sentRow && sentRow.failed),
-    },
-    /*
-     * THE QUEUE: every open order in the bucket, whatever day its link went
-     * out. This is what the grid lists and what the tile's work pill shows, and
-     * open.* + waiting.* sums to the tab total — the check that catches a
-     * bucket quietly claiming nobody.
-     */
+    /* Every open order in the range, one bucket each. These sum to `total`. */
     open: {
-      response_received: n(waitRow && waitRow.open_responded),
-      no_response: n(waitRow && waitRow.open_no_response),
-      delivery_failed: n(waitRow && waitRow.open_failed),
+      new: n(row && row.b_new),
+      no_link_needed: n(row && row.b_no_link),
+      response_received: n(row && row.b_responded),
+      no_response: n(row && row.b_no_response),
+      delivery_failed: n(row && row.b_failed),
     },
+    total: n(row && row.total),
     /*
-     * WHAT the customers who answered actually asked for. Sums to
-     * open.response_received, because `ready` is the remainder rather than a
-     * third test — a job cannot answer and match none of the three.
+     * WHAT the customers who answered asked for. Sums to open.response_received
+     * because `ready` is the remainder rather than a third test — a job cannot
+     * answer and match none of the three.
      */
     response_breakdown: {
-      ready: n(waitRow && waitRow.open_resp_ready),
-      reschedule: n(waitRow && waitRow.open_resp_reschedule),
-      cancel: n(waitRow && waitRow.open_resp_cancel),
+      ready: n(row && row.r_ready),
+      reschedule: n(row && row.r_reschedule),
+      cancel: n(row && row.r_cancel),
     },
-    /*
-     * The same three, narrowed to the period's links. Only "closed by team"
-     * reads this: links.x - period_open.x = how many of TODAY'S links have
-     * already been dealt with. Kept separate from `open` above because mixing
-     * the two is exactly what made the tiles describe 13 of 149 orders.
-     */
-    period_open: {
-      response_received: n(sentRow && sentRow.responded_open),
-      no_response: n(sentRow && sentRow.no_response_open),
-      delivery_failed: n(sentRow && sentRow.failed_open),
-    },
-    // No link outcome to report — plain work counts, split by ticket date.
+    /* The two tiles with no link outcome, split by the ticket's own date. */
     waiting: {
-      new: { today: n(waitRow && waitRow.new_today), old: n(waitRow && waitRow.new_old) },
-      no_link_needed: { today: n(waitRow && waitRow.no_link_today), old: n(waitRow && waitRow.no_link_old) },
+      new: { today: n(row && row.new_today), old: n(row && row.new_old) },
+      no_link_needed: { today: n(row && row.no_link_today), old: n(row && row.no_link_old) },
     },
+    /* How many of these orders have had a link go out. Context, not a bucket. */
+    links_sent: n(row && row.links_sent),
     meta: BUCKET_META,
   };
 }

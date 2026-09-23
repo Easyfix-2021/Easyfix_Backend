@@ -19,9 +19,12 @@
  *    Date against a +05:30 pool, so a link sent at 02:00 IST belongs to that
  *    IST day — computing the window in UTC would file it under yesterday.
  *
- * 4. links.sent = response_received + no_response + delivery_failed, ALWAYS.
- *    That identity is the whole reason the counts are one query: it cannot hold
- *    if the three numbers come from three passes over a moving table.
+ * 4. THE FIVE TILES SUM TO THE TOTAL, always. That identity is the whole reason
+ *    the counts are ONE query: it cannot hold if five numbers come from five
+ *    passes over a table that is moving underneath them.
+ *
+ * 5. THE DATE TABS FILTER THE TICKET'S CREATION DATE, on the same column the
+ *    grid below filters, and All (the default) narrows nothing.
  *
  * No DB, no network. Runner: `node --test`.
  */
@@ -227,16 +230,6 @@ test('without the request table every answer counts as ready, never as lost', ()
   }
 });
 
-test('the breakdown sums to the Response-received tile', async () => {
-  const board = { ...WAIT_ROW, open_responded: 3, open_resp_ready: 0,
-    open_resp_reschedule: 2, open_resp_cancel: 1 };
-  const out = await bq.counts({ db: countsPool({ sent: 0 }, board).pool });
-  const b = out.response_breakdown;
-  assert.deepEqual(b, { ready: 0, reschedule: 2, cancel: 1 }, 'measured on QA');
-  assert.equal(b.ready + b.reschedule + b.cancel, out.open.response_received,
-    'an answer that belongs to no pill has gone missing between the tile and the rows');
-});
-
 /* ── 2. The period window, in IST ────────────────────────────────────────── */
 
 const IST = (s) => new Date(new Date(`${s}+05:30`).toISOString());
@@ -266,9 +259,11 @@ test('last7 is seven calendar days ending today, today included', () => {
   assert.equal((end - start) / 86400000, 7);
 });
 
-test('an unknown period falls back to today rather than an empty window', () => {
+test('all, and anything unrecognised, means NO window', () => {
   const now = IST('2026-09-23T14:00:00');
-  assert.deepEqual(bq.periodRange('garbage', now), bq.periodRange('today', now));
+  assert.deepEqual(bq.periodRange('all', now), { start: null, end: null });
+  assert.deepEqual(bq.periodRange('garbage', now), { start: null, end: null },
+    'an unknown tab shows the whole desk — never an empty screen that looks like "nothing to do"');
 });
 
 test('istToday reads the IST date even when UTC is still on yesterday', () => {
@@ -277,100 +272,84 @@ test('istToday reads the IST date even when UTC is still on yesterday', () => {
 
 /* ── 3. counts(): the shape the tiles render ─────────────────────────────── */
 
-function countsPool(sentRow, waitRow) {
-  return makeFakePool([
-    [/FROM tbl_job j[\s\S]*magic_link_sent_at >= \?/, [sentRow]],
-    [/FROM tbl_job j[\s\S]*job_status = 9/, [waitRow]],
-  ]);
+function countsPool(row) {
+  return makeFakePool([[/FROM tbl_job j/, [row]]]);
 }
-const SENT_ROW = {
-  sent: 100, responded: 25, failed: 5, no_response: 70,
-  responded_open: 7, failed_open: 4, no_response_open: 58,
+/* The QA book on 2026-09-23, which is what the numbers below are measured from. */
+const QA_ROW = {
+  total: 149, b_new: 12, b_no_link: 0, b_responded: 3, b_failed: 0, b_no_response: 134,
+  r_ready: 0, r_reschedule: 2, r_cancel: 1,
+  new_today: 0, new_old: 12, no_link_today: 0, no_link_old: 0, links_sent: 137,
 };
-const WAIT_ROW = { new_today: 12, new_old: 3, no_link_today: 8, no_link_old: 14,
-  open_responded: 7, open_no_response: 58, open_failed: 4 };
 
-test('links.sent always equals the three outcomes added together', async () => {
-  const out = await bq.counts({ db: countsPool(SENT_ROW, WAIT_ROW).pool });
-  const { sent, response_received: r, no_response: n, delivery_failed: f } = out.links;
-  assert.equal(r + n + f, sent, '25 + 70 + 5 must be the 100 links we sent');
-  assert.deepEqual(out.open, { response_received: 7, no_response: 58, delivery_failed: 4 });
-  assert.deepEqual(out.waiting.new, { today: 12, old: 3 });
-  assert.deepEqual(out.waiting.no_link_needed, { today: 8, old: 14 });
+test('every open order is in exactly one tile — the five sum to the total', async () => {
+  const out = await bq.counts({ db: countsPool(QA_ROW).pool });
+  const o = out.open;
+  const sum = o.new + o.no_link_needed + o.response_received + o.no_response + o.delivery_failed;
+  assert.equal(sum, out.total, 'a bucket quietly claiming nobody is the failure this catches');
+  assert.equal(sum, 149, 'measured on QA');
 });
 
-/*
- * THE COUNT THAT WENT MISSING, pinned.
- *
- * `open` was once a subset of the PERIOD cohort — "of the links sent today,
- * how many still wait". On the QA book that read 0 on every tile while 133 open
- * orders sat in No response from links sent weeks earlier: the page described
- * 13 of 149 orders and looked finished. An order does not stop needing a call
- * because its link is old, and the grid lists every open order in the bucket.
- *
- * So `open` is now the WHOLE queue and must be free of the date window, while
- * `period_open` keeps the subset that "closed" is derived from.
- */
-test('open is the whole queue, NOT a slice of the period', async () => {
-  const quietDay = { sent: 0, responded: 0, failed: 0, no_response: 0,
-    responded_open: 0, failed_open: 0, no_response_open: 0 };
-  const board = { ...WAIT_ROW, open_responded: 3, open_no_response: 133, open_failed: 0 };
-  const out = await bq.counts({ db: countsPool(quietDay, board).pool });
-
-  assert.equal(out.links.sent, 0, 'no links went out in the period');
-  assert.equal(out.open.no_response, 133,
-    '133 open orders still need calling — a quiet period must not hide them');
-  assert.deepEqual(out.period_open, { response_received: 0, no_response: 0, delivery_failed: 0 });
-});
-
-test('the tiles add up to every open order — none belongs to nothing', async () => {
-  const board = { new_today: 0, new_old: 13, no_link_today: 0, no_link_old: 0,
-    open_responded: 3, open_no_response: 133, open_failed: 0 };
-  const out = await bq.counts({ db: countsPool({ sent: 0 }, board).pool });
-  const total = out.open.response_received + out.open.no_response + out.open.delivery_failed
-    + out.waiting.new.today + out.waiting.new.old
-    + out.waiting.no_link_needed.today + out.waiting.no_link_needed.old;
-  assert.equal(total, 149, 'the five tiles must sum to the tab total (measured on QA: 149)');
-});
-
-test('the period subset never exceeds the period funnel', async () => {
-  const out = await bq.counts({ db: countsPool(SENT_ROW, WAIT_ROW).pool });
-  for (const k of ['response_received', 'no_response', 'delivery_failed']) {
-    assert.ok(out.period_open[k] <= out.links[k], `${k}: the still-open slice is part of what happened`);
-  }
+test('the answer split sums to the Response-received tile', async () => {
+  const out = await bq.counts({ db: countsPool(QA_ROW).pool });
+  const b = out.response_breakdown;
+  assert.deepEqual(b, { ready: 0, reschedule: 2, cancel: 1 }, 'measured on QA');
+  assert.equal(b.ready + b.reschedule + b.cancel, out.open.response_received);
 });
 
 test('an empty book reads as zeros, never NULL or NaN', async () => {
-  const out = await bq.counts({ db: countsPool({ sent: 0 }, {}).pool });
-  assert.deepEqual(out.links, { sent: 0, response_received: 0, no_response: 0, delivery_failed: 0 });
-  assert.deepEqual(out.waiting.new, { today: 0, old: 0 });
-  for (const v of Object.values(out.open)) assert.equal(Number.isFinite(v), true);
+  const out = await bq.counts({ db: countsPool({ total: 0 }).pool });
+  assert.equal(out.total, 0);
+  for (const v of Object.values(out.open)) assert.equal(v, 0);
+  for (const v of Object.values(out.response_breakdown)) assert.equal(Number.isFinite(v), true);
+  assert.equal(out.links_sent, 0);
 });
 
-test('the caller\'s row filter and owner scope reach BOTH queries', async () => {
-  const fake = countsPool(SENT_ROW, WAIT_ROW);
+/*
+ * THE DATE TABS FILTER THE TICKET'S CREATION DATE (ops, 2026-09-23), and the
+ * grid below sends the list's dateType=ticket over the SAME window. So the
+ * count must read `ticket_created_date_time` and nothing else: COALESCE'ing it
+ * onto created_date_time — which an earlier cut did — would count rows the grid
+ * then refuses to list, and the tile would disagree with its own rows.
+ */
+test('the window is the ticket date, bounded the way the list bounds it', async () => {
+  const fake = countsPool(QA_ROW);
+  const now = IST('2026-09-23T14:00:00');
+  await bq.counts({ db: fake.pool, period: 'yesterday', now });
+  const q = fake.calls[0];
+  assert.match(q.sql, /DATE\(j\.ticket_created_date_time\) >= DATE\(\?\)/);
+  assert.match(q.sql, /DATE\(j\.ticket_created_date_time\) < DATE\(\?\)/);
+  assert.doesNotMatch(q.sql, /COALESCE\(j\.ticket_created_date_time/,
+    'the grid filters on this column alone — counting a fallback would list fewer rows than the tile claims');
+  // Bound as Dates for the +05:30 pool, and they are yesterday's IST bounds.
+  const dates = q.params.filter((p) => p instanceof Date);
+  assert.equal(dates.length, 2);
+  assert.equal(dates[0].toISOString(), IST('2026-09-22T00:00:00').toISOString());
+  assert.equal(dates[1].toISOString(), IST('2026-09-23T00:00:00').toISOString());
+});
+
+test('ALL is the default and applies NO date filter', async () => {
+  const fake = countsPool(QA_ROW);
+  const out = await bq.counts({ db: fake.pool });
+  assert.equal(out.period, 'all', 'the page opens on the whole desk, not on today');
+  assert.doesNotMatch(fake.calls[0].sql, /ticket_created_date_time\) >=/,
+    'All must not narrow anything — 149 open orders would otherwise read as 0');
+  assert.equal(out.period_start, null);
+});
+
+test('the caller\'s row filter and owner scope reach the count', async () => {
+  const fake = countsPool(QA_ROW);
   await bq.counts({
     db: fake.pool, ownerId: 77,
     scopeSql: 'j.fk_client_id IN (?)', scopeParams: [42],
     scopeJoins: 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id',
   });
-  assert.equal(fake.calls.length, 2, 'two passes, not one per tile');
-  for (const c of fake.calls) {
-    assert.match(c.sql, /fk_client_id IN \(\?\)/, 'RBAC filter applied');
-    assert.match(c.sql, /LEFT JOIN tbl_address ad/, 'and the join it needs');
-    assert.match(c.sql, /j\.job_owner = \?/, 'My Orders is owner-scoped outside the admin group');
-    assert.ok(c.params.includes(42) && c.params.includes(77), 'both bound');
-  }
-});
-
-test('the period window is bound as parameters, never inlined', async () => {
-  const fake = countsPool(SENT_ROW, WAIT_ROW);
-  const now = IST('2026-09-23T14:00:00');
-  await bq.counts({ db: fake.pool, period: 'yesterday', now });
-  const q = fake.calls.find((c) => /magic_link_sent_at >= \?/.test(c.sql));
-  assert.ok(q, 'the links pass ran');
-  assert.ok(q.params[0] instanceof Date && q.params[1] instanceof Date, 'bound as Dates for the +05:30 pool');
-  assert.equal(q.params[0].toISOString(), IST('2026-09-22T00:00:00').toISOString());
+  const q = fake.calls[0];
+  assert.equal(fake.calls.length, 1, 'one pass, not one per tile');
+  assert.match(q.sql, /fk_client_id IN \(\?\)/, 'RBAC filter applied');
+  assert.match(q.sql, /LEFT JOIN tbl_address ad/, 'and the join it needs');
+  assert.match(q.sql, /j\.job_owner = \?/, 'My Orders is owner-scoped outside the admin group');
+  assert.ok(q.params.includes(42) && q.params.includes(77));
 });
 
 test('the tile list the FE renders is the one the buckets are defined by', () => {
