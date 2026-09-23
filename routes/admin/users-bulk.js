@@ -8,6 +8,7 @@ const { roleByName } = require('../../middleware/role');
 const { pool } = require('../../db');
 const userService = require('../../services/user.service');
 const roleService = require('../../services/role.service');
+const stateService = require('../../services/state.service');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
 
@@ -56,8 +57,10 @@ const upload = multer({
 /*
  * Verticals join to clients via `tbl_vertical_mapping` (which carries
  * one row per (client_id, user_id, vertical_id) — we GROUP_CONCAT the
- * vertical_ids per client). Cities are filtered by active status; the
- * states list is the full master (no status column on tbl_state).
+ * vertical_ids per client). Cities and states are filtered by active status —
+ * tbl_state gained state_status in migrations/2026-09-21-state-zonal-manager.sql
+ * (old duplicate rows are kept but marked inactive, and must not be offered).
+ * Before that migration every state counts as active.
  *
  * Internal users for the Reporting Manager picker are sourced through
  * the existing userService — only active CRM users (user_type_id=5).
@@ -84,10 +87,10 @@ router.get('/bulk-lookups', async (req, res, next) => {
         verticalIds: String(x.vertical_ids || '')
           .split(',').filter(Boolean).map(Number),
       }))),
-      pool.query(
+      stateService.hasStateManagerCols().then((active) => pool.query(
         `SELECT state_id AS id, state_name AS name
-           FROM tbl_state ORDER BY state_name ASC`,
-      ).then(([r]) => r),
+           FROM tbl_state${active ? ' WHERE state_status = 1' : ''} ORDER BY state_name ASC`,
+      )).then(([r]) => r),
       pool.query(
         `SELECT city_id AS id, city_name AS name, state_id
            FROM tbl_city WHERE city_status = 1 ORDER BY city_name ASC`,
@@ -468,12 +471,13 @@ router.get('/bulk-upload-template', roleByName(['Admin']), async (req, res, next
     // validation a soft warning the operator can dismiss, so typed
     // CSVs still write through. The cascading slice is therefore a
     // helpful single-pick affordance, not a hard gate.
+    const activeStates = (await stateService.hasStateManagerCols()) ? ' WHERE state_status = 1' : '';
     const [
       [vRows], [cRows], [sRows], [ctRows], [uRows], [vmRows], [scRows], [roleRowsAll],
     ] = await Promise.all([
       pool.query('SELECT vertical_id AS id, vertical_name AS name FROM tbl_vertical WHERE status = 1 ORDER BY vertical_name ASC'),
       pool.query('SELECT client_id   AS id, client_name   AS name FROM tbl_client   WHERE client_status = 1 ORDER BY client_name ASC'),
-      pool.query('SELECT state_id    AS id, state_name    AS name FROM tbl_state                                            ORDER BY state_name ASC'),
+      pool.query(`SELECT state_id    AS id, state_name    AS name FROM tbl_state${activeStates} ORDER BY state_name ASC`),
       pool.query('SELECT city_id     AS id, city_name     AS name, state_id FROM tbl_city WHERE city_status = 1            ORDER BY city_name ASC'),
       pool.query("SELECT user_name AS name FROM tbl_user WHERE user_status = 1 AND (user_role IS NULL OR user_role <> 19) ORDER BY user_name ASC"),
       // Vertical → Client mapping (many-to-many via tbl_vertical_mapping).
@@ -772,11 +776,14 @@ router.post('/bulk-upload',
       // for case-insensitive matching.
       const lc = (s) => String(s || '').trim().toLowerCase();
       const [
-        [verticals], [clients], [states], [cities], [users], [roleRows],
+        [verticals], [clients], states, [cities], [users], [roleRows],
       ] = await Promise.all([
         pool.query('SELECT vertical_id AS id, LOWER(vertical_name) AS name FROM tbl_vertical WHERE status = 1'),
         pool.query('SELECT client_id   AS id, LOWER(client_name)   AS name FROM tbl_client   WHERE client_status = 1'),
-        pool.query('SELECT state_id    AS id, LOWER(state_name)    AS name FROM tbl_state'),
+        // Active states' names plus common old spellings ("Orissa",
+        // "Pondicherry"), each mapped to the ACTIVE state — an upload must
+        // never write an inactive state id into manage_states.
+        stateService.stateNameVariants().then((vs) => vs.map((v) => ({ id: v.state_id, name: lc(v.name) }))),
         pool.query('SELECT city_id     AS id, LOWER(city_name)     AS name FROM tbl_city     WHERE city_status = 1'),
         pool.query("SELECT user_id AS id, LOWER(user_name) AS name FROM tbl_user WHERE user_status = 1 AND user_type_id = 5"),
         // Admin-group roles only — match the bulk-lookups filter so the

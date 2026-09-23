@@ -1620,6 +1620,47 @@ You can also run it on demand from Manage Pincodes ("Refresh Status") or with Tr
     logger.info('Deep-skill image-gen orphan reset cron registered (every 5 min, hidden from admin page).');
   }
 
+  // ─── QuickSight Custom Reports retention — daily at 02:30 IST ───────
+  // (Added 2026-09-23) No property gate: it only deletes uploads the UI already
+  // tells users are kept for 30 days, and a report's current upload is never
+  // touched. One replica runs it (MySQL named lock inside purgeExpired).
+  const dynamicReports = require('../services/quicksight/quicksight-dynamic-reports.service');
+  const dynamicReportRetentionJob = registerJob({
+    id: 'dynamic-report-retention',
+    name: 'Custom Reports Retention',
+    description:
+`What this task does: Every day at 2:30 AM IST it deletes QuickSight Custom Report uploads older than ${dynamicReports.RETENTION_DAYS} days — the stored data file (in S3) and its entry in the report's Upload History.
+
+Here's how it works, step by step:
+  1. Every day at 2:30 AM IST, the task wakes up automatically.
+  2. It finds uploads older than ${dynamicReports.RETENTION_DAYS} days in batches.
+  3. It NEVER deletes a report's current (latest) upload, however old — a report nobody refreshed for a month still shows its data. Archived reports are the exception: all their uploads age out.
+  4. For each, it deletes the S3 file first and then the history entry. If S3 refuses, the entry is kept and retried on the next run.
+  5. It logs how many were due, deleted and failed (visible in the server logs and on this page).
+
+Why this matters: every upload is a full copy of the report's data, so without a limit storage grows forever. The report pages tell users the ${dynamicReports.RETENTION_DAYS}-day rule and to download any version they need to keep.`,
+    cron: '30 2 * * *',
+    runner: async () => {
+      const result = await dynamicReports.purgeExpired();
+      logger.info(
+        `Custom reports retention cron · due=${result.expired || 0} · deleted=${result.deleted || 0} · failed=${result.failed || 0}`
+        + (result.skipped ? ` (skipped — ${result.reason})` : '')
+      );
+      return result;
+    },
+  });
+  if (cronDisabled) {
+    dynamicReportRetentionJob.skipReason = 'CRON_DISABLED=true';
+  } else {
+    dynamicReportRetentionJob.task = cron.schedule(
+      dynamicReportRetentionJob.cron,
+      () => invokeJob(dynamicReportRetentionJob, 'cron'),
+      { timezone: TZ },
+    );
+    dynamicReportRetentionJob.registered = true;
+    logger.info('Custom reports retention cron registered (02:30 IST).');
+  }
+
   // ─── Idempotency response retention — hourly, bounded ───────────────
   // Infrastructure housekeeping, not an operator workflow: one indexed
   // DELETE capped at 1,000 rows. Fourteen-day expiry keeps responses beyond

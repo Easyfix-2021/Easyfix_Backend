@@ -362,7 +362,21 @@ function mockRes() {
 // services/job-estimate-approval.js#approveWithVisitSchedule). Defaulted
 // here so every existing call below keeps exercising what it always tested
 // (the 15->1/2 move, the 16 guard) without each needing its own edit.
-const APPROVE_BODY_DEFAULTS = { visit_date_time: '2026-09-23 10:00:00', permission: 'not_required' };
+/*
+ * TOMORROW, computed — never a literal date. A hardcoded '2026-09-23 10:00:00'
+ * here stopped every QA deploy on 2026-09-23: assertSlotBookable refuses a slot
+ * that is not in the future and within 30 days, so the fixture passed CI until
+ * the day it named arrived, then failed 14 tests across two files for a reason
+ * that had nothing to do with the change being deployed. IST, and 10:00 on the
+ * NEXT day, so it is a valid slot hour (SLOT_START_HOURS) whatever time the
+ * suite runs.
+ */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+const TOMORROW_IST_10AM = (() => {
+  const ist = new Date(Date.now() + IST_OFFSET_MS + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
+const APPROVE_BODY_DEFAULTS = { visit_date_time: TOMORROW_IST_10AM, permission: 'not_required' };
 
 async function callClient(routePath, method, body = {}) {
   const r = mockRes();

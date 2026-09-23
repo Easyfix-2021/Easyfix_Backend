@@ -67,6 +67,28 @@ const FEATURES = {
    * neither lock — every CRM user may raise a bug.
    */
   canManageIssues: 'access.issues.emails',
+  /*
+   * Transfer a QuickSight Custom Report to a new owner. Outside RBAC on
+   * purpose, and it is the SOLE gate for that one route — the Custom Reports
+   * administrator key (isQuickSightDynamicReportAdmin) does NOT grant it.
+   *
+   * Two reasons it is a person, not a role. (1) It is the escape hatch: a
+   * report whose owner later loses QuickSight access is only rescuable by
+   * whoever can re-point its owner, so that capability must not itself sit
+   * behind a role grant that the same reorganisation can revoke. (2) It hands
+   * a report — including one restricted to a role the new owner is not in —
+   * to somebody else; that reach should follow a named operator rather than
+   * propagate to whoever is given the Admin role next.
+   *
+   * Unlike canManageSecrets/canManageIssues this is ONE lock, not two: the
+   * route's QuickSight gates already establish that the caller may be here at
+   * all, and requiring the Admin key on top would re-introduce the role
+   * dependency this exists to avoid. Seeded with the named operators in
+   * migrations/2026-09-23-quicksight-dynamic-report-owner-allowlist.sql; an
+   * absent or empty property is deny-all, so a fresh environment grants
+   * nobody and Transfer Owner simply does not appear.
+   */
+  canTransferReportOwner: 'access.dynamicreport.owner.emails',
   // (Re)provision a CRM user's Microsoft 365 mailbox — it CREATES an Entra
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all
