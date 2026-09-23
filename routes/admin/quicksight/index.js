@@ -55,5 +55,10 @@ router.use('/premature-confirmations', require('./premature-confirmations'));
 // Employee Performance: an MIS-built snapshot (targets, TimeChamp, IVR are not in
 // easyfix_core), uploaded as data.js and rendered as the original dashboard page.
 router.use('/employee-performance',   require('./employee-performance'));
+// MTD: five job counts per person for the window, attributed to the CLIENT'S
+// PRIMARY SPOC — "whose book of business", deliberately a different question
+// from Employee Productivity's "who did the work". The Performance report's
+// MTD tab; read live from the database, with no upload anywhere in it.
+router.use('/mtd',                    require('./mtd'));
 
 module.exports = router;

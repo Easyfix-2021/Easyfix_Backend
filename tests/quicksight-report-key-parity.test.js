@@ -83,6 +83,26 @@ test('every seeded QuickSight key belongs to a router', () => {
     + 'can tick a permission that does not do anything');
 });
 
+test('MTD is on both lists, by name', () => {
+  /*
+   * The two tests above are DERIVED — they compare whatever the routers gate on
+   * with whatever the migrations seed — which is exactly what makes them blind
+   * to a report disappearing from both sides at once (a router deleted with its
+   * seed, a key renamed in both places by a careless find-and-replace). Naming
+   * the newest report pins it: MTD must gate on isQuickSightMtdView and that
+   * key must be seeded, or this fails saying which half went missing.
+   *
+   * Name a report here when it is added; there is no value in back-filling the
+   * older ones, whose seeds have long since run in production.
+   */
+  const KEY = 'isQuickSightMtdView';
+  assert.deepEqual(routerKeys().get(KEY), ['mtd.js'],
+    `${KEY} must gate routes/admin/quicksight/mtd.js and nothing else`);
+  assert.equal(seededKeys().has(KEY), true,
+    `${KEY} must be created by migrations/2026-09-22-seed-quicksight-mtd.sql, `
+    + 'or Manage Roles cannot grant the MTD tab to anyone');
+});
+
 test('the two relation-gated reports do not rely on their key alone', () => {
   /*
    * Employee Productivity and the Floor-Discipline Admin Dashboard are open to
