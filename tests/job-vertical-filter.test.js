@@ -64,7 +64,7 @@ const topLevelWhere = () => countQuery().sql.slice(countQuery().sql.indexOf('WHE
 // `vm` is used ONLY by the vertical / project-manager filters, and the PM one
 // additionally names user_type — so this is an exact probe for "vertical fired".
 const VERTICAL_CLAUSE =
-  'EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)';
+  'EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id IN (?))';
 
 /* ── The validator side: what shape the FE is allowed to send ────────────── */
 
@@ -76,15 +76,46 @@ test('the validator accepts a single positive integer verticalId', () => {
   }
 });
 
-test('THE SINGLE-SELECT PIN: a CSV verticalId is REJECTED — the FE must use SearchSelect', () => {
-  /*
-   * clientId / cityId are `csvIds` (id OR "1,2,3") and so are backed by
-   * SearchMultiSelect. verticalId is a bare `intId`. Sending a CSV here is a
-   * hard 400, so the filter bar MUST render a single-select. If this param is
-   * ever widened to csvIds, this test fails and whoever widens it is pointed
-   * straight at the control that has to change with it.
-   */
-  for (const bad of ['3,4', '3,', ',3', '1,2,3']) {
+/*
+ * ── THE PIN, WIDENED (2026-09-23) ──────────────────────────────────────────
+ *
+ * This was THE SINGLE-SELECT PIN: verticalId was a bare `intId`, a CSV was a
+ * hard 400, and this test existed so that "whoever widens it is pointed
+ * straight at the control that has to change with it". That is exactly what
+ * happened — the dashboard filter bar swapped Project Manager for Verticals and
+ * ops asked for multi-select, so verticalId became `csvIds`, the same shape
+ * clientId and cityId already had, and the predicate became IN (...).
+ *
+ * The tripwire is kept, pointing the other way. What it now pins:
+ *   1. a CSV is ACCEPTED, so a multi-select control is legitimate;
+ *   2. a LONE ID is still accepted and still arrives as a number, so every
+ *      caller written against the old contract — Manage Jobs' Filter Job card,
+ *      the QuickSight report bodies, the jobs export — keeps working untouched
+ *      and may stay a SearchSelect;
+ *   3. junk is still refused, so widening bought range, not permissiveness.
+ *
+ * If verticalId is ever narrowed back, this fails and points at the two
+ * SearchMultiSelects (Manage Jobs and the dashboard bar) that must change with
+ * it. Same guard, same purpose, opposite direction.
+ */
+test('THE PIN, WIDENED: a CSV verticalId is ACCEPTED — multi-select is legitimate', () => {
+  for (const ok of ['3,4', '1,2,3', '17']) {
+    const { error, value } = listQuery.validate({ verticalId: ok });
+    assert.equal(error, undefined, `${JSON.stringify(ok)} must validate`);
+    assert.ok(value.verticalId != null);
+  }
+});
+
+test('THE PIN, WIDENED: a lone id still works, so single-select callers are untouched', () => {
+  for (const v of [3, '3', '17']) {
+    const { error, value } = listQuery.validate({ verticalId: v });
+    assert.equal(error, undefined, `${JSON.stringify(v)} must still validate`);
+    assert.equal(value.verticalId, Number(v), 'and must still arrive as a number');
+  }
+});
+
+test('THE PIN, WIDENED: malformed lists are still refused, not silently truncated', () => {
+  for (const bad of ['3,', ',3', '3,,4', '3,abc', '3 ,4']) {
     const { error } = listQuery.validate({ verticalId: bad });
     assert.ok(error, `${JSON.stringify(bad)} must be rejected, not silently truncated`);
   }
@@ -104,6 +135,17 @@ test('verticalId emits ONE EXISTS clause against tbl_vertical_mapping, param bou
   const where = topLevelWhere();
   assert.ok(where.includes(VERTICAL_CLAUSE), `vertical clause missing from: ${where}`);
   assert.deepEqual(countQuery().params, [0, 3]);
+});
+
+test('a CSV verticalId is ONE EXISTS with N placeholders, not N clauses', async () => {
+  await jobSvc.list({ status: 0, assigned: false, verticalId: '3,4,5', limit: 10, offset: 0 });
+  const where = topLevelWhere();
+  assert.ok(
+    where.includes('vm.vertical_id IN (?,?,?)'),
+    `expected one IN with three placeholders, got: ${where}`,
+  );
+  assert.equal((where.match(/tbl_vertical_mapping/g) || []).length, 1, 'one EXISTS, not three');
+  assert.deepEqual(countQuery().params, [0, 3, 4, 5]);
 });
 
 test('verticalId NARROWS the bucket — status=0 + assigned=false survive intact', async () => {

@@ -200,7 +200,14 @@ const listQuery = Joi.object({
   pin:        Joi.string().min(1).max(10).optional(),
   stateId:    intId.optional(),
   categoryId: intId.optional(),
-  verticalId: intId.optional(),
+  /*
+   * `verticalId` — widened from a lone id to csvIds on 2026-09-23 for the
+   * dashboard bar's Verticals multi-select, which sends what Clients and Cities
+   * already send. A single id stays valid (csvIds is alternatives(intId, csv)),
+   * so every existing caller — Manage Jobs' filter card, the QuickSight report
+   * bodies, the export — is unaffected.
+   */
+  verticalId: csvIds.optional(),
   /*
    * `sourceType` (2026-08-07) — exact match on tbl_job.source_type, the
    * booking-CHANNEL label ('website', 'Bulk Upload', 'Client_App',
@@ -380,7 +387,16 @@ const pendingStartCountsQuery = Joi.object(Object.fromEntries(
  * scheduling" means right now, not booked-this-month). If ops asks for one it
  * needs its own treatment on the card subtitles, not a silent extra key here.
  */
-const DASHBOARD_FILTERS = ['clientId', 'cityId', 'projectManagerId', 'zonalManagerId'];
+/*
+ * 2026-09-23: Project Manager gave way to Vertical on the bar, per ops. The
+ * page still shows FOUR filters and still fits one row — this is a swap, not an
+ * addition. `projectManagerId` is deliberately LEFT in listQuery and in
+ * buildDashboardFilters: it is a supported, tested filter on /admin/jobs, and
+ * keeping the predicate means putting the control back is a one-line FE change.
+ * It simply is not in this list any more, so the two dashboard endpoints stop
+ * lifting it off the query.
+ */
+const DASHBOARD_FILTERS = ['clientId', 'cityId', 'verticalId', 'zonalManagerId'];
 const dashboardFilterKeys = () => Object.fromEntries(
   DASHBOARD_FILTERS.map((key) => [key, listQuery.extract(key)]),
 );

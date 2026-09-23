@@ -1,5 +1,5 @@
 /*
- * THE DASHBOARD FILTER BAR — Client / City / Project Manager / Zonal Manager
+ * THE DASHBOARD FILTER BAR — Client / City / Vertical / Zonal Manager
  * on GET /api/admin/jobs/counts and GET /api/admin/jobs/attention-summary.
  *
  * WHAT IS ACTUALLY AT RISK
@@ -58,7 +58,7 @@ const { listQuery, dashboardCountsQuery, dashboardAttentionQuery, DASHBOARD_FILT
 
 // The four filters, all at once, in both shapes the bar can send: a lone id and
 // a CSV (SearchMultiSelect serialises one selection as the bare id).
-const FILTERS = { clientId: '3', cityId: '7,9', projectManagerId: '12', zonalManagerId: '11,12' };
+const FILTERS = { clientId: '3', cityId: '7,9', verticalId: '12', zonalManagerId: '11,12' };
 
 const statusQuery = () => fake.calls.find((c) => /GROUP BY j\.job_status/.test(c.sql));
 const bookedQuery = () => fake.calls.find((c) => /GROUP BY unassigned/.test(c.sql));
@@ -105,11 +105,34 @@ test('city filter: ad.city_id IN, and joins tbl_address only', async () => {
   assert.deepEqual(params, [7, 9]);
 });
 
-test('project manager filter: a self-contained EXISTS on user_type 1, and NO join', async () => {
+test('vertical filter: a self-contained EXISTS on vertical_id, and NO join', async () => {
+  await jobSvc.getStatusCounts({ filters: { verticalId: '12,13' } });
+  const { sql, params } = statusQuery();
+  assert.match(squash(sql), /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.vertical_id IN \(\?,\?\)\)/);
+  assert.ok(!/tbl_address|LEFT JOIN tbl_client/.test(sql), 'the EXISTS form must cost no join: ' + sql);
+  assert.deepEqual(params, [12, 13]);
+});
+
+/*
+ * The Vertical predicate must NOT pin user_type. A client is in a vertical
+ * regardless of who its SPOC is; pinning user_type = 1 here would silently turn
+ * "this vertical" into "this vertical, and only where a primary SPOC exists" —
+ * which is the Project Manager filter, a different question.
+ */
+test('vertical filter does not pin user_type — that is the PM filter, not this one', async () => {
+  await jobSvc.getStatusCounts({ filters: { verticalId: '12' } });
+  assert.ok(!/user_type/.test(statusQuery().sql), 'vertical filter must not constrain user_type');
+});
+
+/*
+ * Project Manager stays supported on the endpoint even though the bar no longer
+ * shows it (2026-09-23 swap) — the predicate is still list()'s, so putting the
+ * control back is a one-line FE change rather than a backend round trip.
+ */
+test('project manager predicate is still available, and still pins user_type 1', async () => {
   await jobSvc.getStatusCounts({ filters: { projectManagerId: '12' } });
   const { sql, params } = statusQuery();
   assert.match(squash(sql), /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.user_type = 1 AND vm\.user_id IN \(\?\)\)/);
-  assert.ok(!/tbl_address|LEFT JOIN tbl_client/.test(sql), 'the EXISTS form must cost no join: ' + sql);
   assert.deepEqual(params, [12]);
 });
 
@@ -131,14 +154,14 @@ test('both of /counts\' queries carry the filters, with placeholders and params 
   for (const [label, call] of [['status', status], ['booked-split', booked]]) {
     assert.match(call.sql, /j\.fk_client_id IN/, label);
     assert.match(call.sql, /ad\.city_id IN/, label);
-    assert.match(call.sql, /vm\.user_type = 1/, label);
+    assert.match(call.sql, /vm\.vertical_id IN/, label);
     assert.match(call.sql, /ct\.state_user IN/, label);
     // The two queries share ONE params array; a clause pushed without its
     // params shifts every binding after it, which binds silently and wrongly.
     assert.equal(placeholders(call.sql), call.params.length,
       `${label}: ${placeholders(call.sql)} placeholders vs ${call.params.length} params`);
   }
-  assert.deepEqual(status.params, [3, 7, 9, 12, 11, 12]);
+  assert.deepEqual(status.params, [3, 7, 9, 12, 11, 12]);  // client, city x2, vertical, zm x2
   assert.deepEqual(booked.params, status.params, 'both queries bind the same values');
 });
 
@@ -173,7 +196,7 @@ test('the WHERE is the LIST\'s own — whole clause + params, so neither side ca
   // to each other would pass if BOTH lost a predicate.
   assert.match(dash, /j\.fk_client_id IN \(\?\)/);
   assert.match(dash, /ad\.city_id IN \(\?,\?\)/);
-  assert.match(dash, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.user_type = 1 AND vm\.user_id IN \(\?\)\)/);
+  assert.match(dash, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.vertical_id IN \(\?\)\)/);
   assert.match(dash, /ct\.state_user IN \(\?,\?\)/);
   assert.deepEqual(dashCall.params, [3, 7, 9, 12, 11, 12]);
 });
@@ -213,7 +236,7 @@ test('every attention tile narrows with the bar — all six, not some', async ()
   for (const c of calls) {
     assert.match(c.sql, /j\.fk_client_id IN/, c.sql.slice(0, 120));
     assert.match(c.sql, /ad\.city_id IN/, c.sql.slice(0, 120));
-    assert.match(c.sql, /vm\.user_type = 1/, c.sql.slice(0, 120));
+    assert.match(c.sql, /vm\.vertical_id IN/, c.sql.slice(0, 120));
     assert.match(c.sql, /ct\.state_user IN/, c.sql.slice(0, 120));
     assert.equal(placeholders(c.sql), c.params.length,
       'tile placeholders/params out of step: ' + c.sql.slice(0, 200));
@@ -244,7 +267,7 @@ test('the validator accepts what the bar sends and strips what it does not own',
   const full = dashboardCountsQuery.validate({ ...FILTERS, ownerId: '55' }, opts);
   assert.equal(full.error, undefined, full.error && full.error.message);
   assert.deepEqual(full.value, {
-    clientId: 3, cityId: '7,9', projectManagerId: 12, zonalManagerId: '11,12', ownerId: 55,
+    clientId: 3, cityId: '7,9', verticalId: 12, zonalManagerId: '11,12', ownerId: 55,
   });
 
   // A key the bar does not own is dropped, not 400'd — the FE may reuse the
@@ -264,7 +287,7 @@ test('the validator accepts what the bar sends and strips what it does not own',
 });
 
 test('each dashboard key is EXTRACTED from listQuery, not re-declared beside it', () => {
-  assert.deepEqual(DASHBOARD_FILTERS, ['clientId', 'cityId', 'projectManagerId', 'zonalManagerId']);
+  assert.deepEqual(DASHBOARD_FILTERS, ['clientId', 'cityId', 'verticalId', 'zonalManagerId']);
   for (const key of DASHBOARD_FILTERS) {
     const fromList = listQuery.extract(key).describe();
     const fromDash = dashboardCountsQuery.extract(key).describe();
