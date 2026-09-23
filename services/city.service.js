@@ -52,6 +52,7 @@ const SORTABLE_COLUMNS = Object.freeze({
   zone_count:       'zone_count',
   pincode_count:    'pincode_count',
   technician_count: 'technician_count',
+  zonal_manager:    'zm.user_name',
   city_status:      'c.city_status',
 });
 
@@ -157,6 +158,8 @@ async function listCities({
         c.tier,
         c.reference_pincode,
         c.city_status,
+        c.state_user,
+        zm.user_name AS zonal_manager_name,
         ${creatorSelect},
         (SELECT COUNT(*) FROM tbl_zone_master z
           WHERE z.city_id = c.city_id AND z.zone_status = 1)        AS zone_count,
@@ -166,6 +169,7 @@ async function listCities({
           WHERE e.efr_cityId = c.city_id AND e.efr_status = 1)      AS technician_count
        FROM tbl_city  c
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
        ${creatorJoin}
       WHERE ${where.join(' AND ')}
       ORDER BY ${orderBy}
@@ -189,6 +193,7 @@ async function getCityById(cityId) {
   const [[row]] = await pool.query(
     `SELECT c.city_id, c.city_name, c.state_id, s.state_name,
             c.district, c.tier, c.reference_pincode, c.city_status,
+            c.state_user, zm.user_name AS zonal_manager_name,
             (SELECT COUNT(*) FROM tbl_zone_master z
               WHERE z.city_id = c.city_id AND z.zone_status = 1)        AS zone_count,
             (SELECT COUNT(*) FROM tbl_pincode p
@@ -197,6 +202,7 @@ async function getCityById(cityId) {
               WHERE e.efr_cityId = c.city_id AND e.efr_status = 1)      AS technician_count
        FROM tbl_city  c
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
       WHERE c.city_id = ? LIMIT 1`,
     [cityId]
   );
@@ -402,10 +408,13 @@ async function listPendingCities({ limit = 200, offset = 0 } = {}) {
         c.tier,
         c.reference_pincode,
         c.city_status,
+        c.state_user,
+        zm.user_name AS zonal_manager_name,
         ${creatorSelect},
         (SELECT COUNT(*) FROM tbl_pincode p WHERE p.city_id = c.city_id) AS pincode_count
        FROM tbl_city  c
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
        ${creatorJoin}
       WHERE c.city_status = ?
       ORDER BY ${orderBy}
