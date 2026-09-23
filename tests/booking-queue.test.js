@@ -230,6 +230,83 @@ test('without the request table every answer counts as ready, never as lost', ()
   }
 });
 
+/* ── 1c. How old the ticket is: the Day 0 / 1 / 2 / 3+ pills ─────────────── */
+
+/*
+ * THE LAST PILL IS 3-OR-MORE, and that is the whole point of these tests.
+ *
+ * The design sketch showed "Day 3". On the real book the oldest open
+ * unconfirmed order was raised in APRIL — five months out. A plain `= 3` would
+ * put every one of those in no pill at all: the pills would stop summing to the
+ * tile above them, and the orders that have waited longest, which is precisely
+ * what the pills exist to surface, would be the invisible ones.
+ */
+function ageHolds(day, ageDays) {
+  const sql = bq.dayPredicate(day);
+  const js = sql
+    .replace(/DATEDIFF\('\d{4}-\d{2}-\d{2}', DATE\(j\.ticket_created_date_time\)\)/g,
+      ageDays === null ? 'null' : String(ageDays))
+    .replace(/ IS NULL/g, ' === null')
+    .replace(/\bOR\b/g, '||')
+    .replace(/(\d+|null) >= 3/g, (m, v) => String(v !== 'null' && Number(v) >= 3))
+    .replace(/(\d+|null) = (\d+)/g, (m, a, b) => String(a !== 'null' && Number(a) === Number(b)));
+  // eslint-disable-next-line no-new-func
+  return !!Function(`"use strict"; return (${js});`)();
+}
+
+test('every age lands in exactly one pill, and old orders land in 3+', () => {
+  for (const age of [0, 1, 2, 3, 4, 17, 150, null]) {
+    const hit = bq.DAY_BUCKETS.filter((d) => ageHolds(d, age));
+    assert.equal(hit.length, 1, `age ${age} matched ${hit.join(', ') || 'nothing'}`);
+  }
+  assert.ok(ageHolds('0', 0), 'raised today');
+  assert.ok(ageHolds('1', 1), 'yesterday');
+  assert.ok(ageHolds('2', 2));
+  assert.ok(ageHolds('3plus', 3), 'exactly three days is 3+, not a gap');
+  assert.ok(ageHolds('3plus', 150), 'April on a September book still has a pill');
+  assert.ok(ageHolds('3plus', null),
+    'a NULL ticket date would otherwise fall out of every pill and stop the sum');
+});
+
+test('a pill narrows its own tile — never selects from somewhere else', () => {
+  for (const b of bq.BUCKETS) {
+    const plain = bq.bucketPredicate(b);
+    for (const d of bq.DAY_BUCKETS) {
+      const withDay = bq.bucketPredicate(b, { day: d });
+      assert.ok(withDay.startsWith(plain), `${b} + Day ${d} must be the tile AND the age`);
+      assert.match(withDay, /DATEDIFF\('\d{4}-\d{2}-\d{2}'/,
+        "today's IST date is computed in JS and inlined — CURDATE() would resolve in MySQL's UTC session and be a day out all night");
+    }
+  }
+});
+
+test('a malformed date is refused rather than concatenated into SQL', () => {
+  assert.throws(() => bq.ageDaysSql('j', "2026-09-23'; DROP TABLE tbl_job; --"), /bad IST date/,
+    'the value is not input today, and the guard is what keeps it that way tomorrow');
+  assert.throws(() => bq.ageDaysSql('j', '23-09-2026'), /bad IST date/);
+});
+
+test('an unknown pill is empty, never unfiltered', () => {
+  assert.equal(bq.dayPredicate('7'), null);
+  assert.equal(bq.bucketPredicate('no_response', { day: 'yesterday' }), null,
+    'a filter the page cannot express must not quietly widen to the whole bucket');
+});
+
+test('each tile\'s four pills sum to the tile', async () => {
+  const row = { ...QA_ROW };
+  // No response: 134 = 1 + 2 + 3 + 128
+  Object.assign(row, {
+    d_no_response_0: 1, d_no_response_1: 2, d_no_response_2: 3, d_no_response_3plus: 128,
+    d_new_0: 0, d_new_1: 0, d_new_2: 0, d_new_3plus: 12,
+  });
+  const out = await bq.counts({ db: countsPool(row).pool });
+  const d = out.days.no_response;
+  assert.equal(d[0] + d[1] + d[2] + d['3plus'], out.open.no_response,
+    'an order past day 3 falling out of every pill is the failure this catches');
+  const n = out.days.new;
+  assert.equal(n[0] + n[1] + n[2] + n['3plus'], out.open.new);
+});
+
 /* ── 2. The period window, in IST ────────────────────────────────────────── */
 
 const IST = (s) => new Date(new Date(`${s}+05:30`).toISOString());

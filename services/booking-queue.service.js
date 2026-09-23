@@ -181,6 +181,67 @@ function responseKindSql(kind, { hasRequestTable = true } = {}) {
   }
 }
 
+/* ── How old the ticket is, in days ──────────────────────────────────────── */
+
+/*
+ * The Day 0 / 1 / 2 / 3+ pills inside each tile (ops, 2026-09-23).
+ *
+ * Day N = N IST calendar days since the TICKET came in — not since the link
+ * went out. Ops named the ticket date, and it is also the only date every
+ * bucket has: an order in "New" has no link yet, so a link-based age could not
+ * pill two of the five tiles at all. (In practice they differ by under an hour
+ * for most orders, because the cron sends within the hour.)
+ *
+ * ⚠ THE LAST PILL IS 3-OR-MORE, not 3. A plain "Day 3" is what the design
+ * sketch showed, and on the real book it would be a trap: the oldest open
+ * unconfirmed order on QA was raised in APRIL. Everything past day 3 would
+ * belong to no pill, the pills would stop summing to the tile above them, and
+ * the orders that have waited longest — the ones the pills exist to surface —
+ * would be the invisible ones.
+ *
+ * Calendar days, not 24-hour blocks: a ticket raised at 23:00 last night is
+ * "Day 1" this morning, which is how ops reads it off the row.
+ */
+const DAY_BUCKETS = ['0', '1', '2', '3plus'];
+
+/**
+ * The age expression, as IST calendar days.
+ *
+ * ⚠ NOT CURDATE(). The pool runs at +05:30 but MySQL's own session clock is
+ * UTC on these hosts, so CURDATE() is yesterday's date for the first five and a
+ * half hours of every IST day — a ticket raised at 01:00 would read as Day 1
+ * the moment it arrived, and every pill would be off by one all night. The
+ * repo's linter refuses SQL clock functions for exactly this reason.
+ *
+ * Today's IST date is therefore computed in JS and inlined. Inlined, not bound,
+ * because this fragment composes into the list's WHERE and into twenty SUM()
+ * columns with no parameter slots of its own — and it is safe to inline
+ * BECAUSE IT IS NOT INPUT: it comes from the clock, never from a request, and
+ * is re-checked against a strict YYYY-MM-DD shape before it is interpolated.
+ */
+function ageDaysSql(alias = 'j', today = istToday()) {
+  const ymd = String(today);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) throw new Error('booking-queue: bad IST date ' + ymd);
+  return `DATEDIFF('${ymd}', DATE(${alias}.ticket_created_date_time))`;
+}
+
+/**
+ * The WHERE fragment for one day pill. NULL-safe: a ticket with no date (none
+ * on QA, but the column is nullable) yields NULL from DATEDIFF, and a NULL
+ * predicate excludes the row from EVERY pill — so `3plus` claims it rather than
+ * letting it fall out of the tile it is counted in.
+ */
+function dayPredicate(day, alias = 'j', today = istToday()) {
+  const age = ageDaysSql(alias, today);
+  switch (String(day)) {
+    case '0': return `${age} = 0`;
+    case '1': return `${age} = 1`;
+    case '2': return `${age} = 2`;
+    case '3plus': return `(${age} >= 3 OR ${age} IS NULL)`;
+    default: return null;
+  }
+}
+
 const BUCKETS = ['new', 'no_link_needed', 'response_received', 'no_response', 'delivery_failed'];
 
 /*
@@ -212,7 +273,15 @@ const BUCKET_META = [
  * No bound parameters: every test is a column comparison or a correlated
  * EXISTS, so the fragment composes with any other filter the list applies.
  */
-function bucketPredicate(bucket, { hasRequestTable = true } = {}) {
+function bucketPredicate(bucket, { hasRequestTable = true, day } = {}) {
+  /*
+   * A day pill narrows its own tile, so the two compose here rather than each
+   * becoming its own query parameter to be combined by the caller — the grid
+   * sends bucket + ageDay and gets exactly the rows the pill counted.
+   */
+  const dayClause = day ? dayPredicate(day) : null;
+  if (day && !dayClause) return null;          // unknown pill: never unfiltered
+  const withDay = (sql) => (dayClause ? `${sql} AND (${dayClause})` : sql);
   const optedIn = optedInSql();
   const responded = respondedSql('j', hasRequestTable);
   const failed = failedSql();
@@ -224,20 +293,20 @@ function bucketPredicate(bucket, { hasRequestTable = true } = {}) {
     const kind = bucket.slice('response_'.length);
     if (!RESPONSE_KINDS.includes(kind)) return null;
     const sub = responseKindSql(kind, { hasRequestTable });
-    return `${optedIn} AND ${responded} AND (${sub})`;
+    return withDay(`${optedIn} AND ${responded} AND (${sub})`);
   }
 
   switch (bucket) {
     case 'no_link_needed':
-      return `NOT ${optedIn}`;
+      return withDay(`NOT ${optedIn}`);
     case 'response_received':
-      return `${optedIn} AND ${responded}`;
+      return withDay(`${optedIn} AND ${responded}`);
     case 'delivery_failed':
-      return `${optedIn} AND NOT ${responded} AND ${failed}`;
+      return withDay(`${optedIn} AND NOT ${responded} AND ${failed}`);
     case 'no_response':
-      return `${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sent}`;
+      return withDay(`${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sent}`);
     case 'new':
-      return `${optedIn} AND NOT ${responded} AND NOT ${failed} AND NOT ${sent}`;
+      return withDay(`${optedIn} AND NOT ${responded} AND NOT ${failed} AND NOT ${sent}`);
     default:
       return null;
   }
@@ -375,13 +444,39 @@ async function counts({
         SUM(${isNew} AND ${ticketYmd} <> ?)       AS new_old,
         SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
         SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
-        SUM(${sentP})                             AS links_sent
+        SUM(${sentP})                             AS links_sent,
+        SUM((${isNew}) AND (${dayPredicate('0', 'j', today)})) AS d_new_0,
+        SUM((${isNew}) AND (${dayPredicate('1', 'j', today)})) AS d_new_1,
+        SUM((${isNew}) AND (${dayPredicate('2', 'j', today)})) AS d_new_2,
+        SUM((${isNew}) AND (${dayPredicate('3plus', 'j', today)})) AS d_new_3plus,
+        SUM((NOT ${optedIn}) AND (${dayPredicate('0', 'j', today)})) AS d_no_link_0,
+        SUM((NOT ${optedIn}) AND (${dayPredicate('1', 'j', today)})) AS d_no_link_1,
+        SUM((NOT ${optedIn}) AND (${dayPredicate('2', 'j', today)})) AS d_no_link_2,
+        SUM((NOT ${optedIn}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_link_3plus,
+        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('0', 'j', today)})) AS d_responded_0,
+        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('1', 'j', today)})) AS d_responded_1,
+        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('2', 'j', today)})) AS d_responded_2,
+        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('3plus', 'j', today)})) AS d_responded_3plus,
+        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('0', 'j', today)})) AS d_failed_0,
+        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('1', 'j', today)})) AS d_failed_1,
+        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('2', 'j', today)})) AS d_failed_2,
+        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('3plus', 'j', today)})) AS d_failed_3plus,
+        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('0', 'j', today)})) AS d_no_response_0,
+        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('1', 'j', today)})) AS d_no_response_1,
+        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('2', 'j', today)})) AS d_no_response_2,
+        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_response_3plus
        FROM tbl_job j${joins}
       WHERE j.job_status = 9${scope}`,
     [today, today, today, today, ...whereParams],
   );
 
   const n = (v) => Number(v || 0);
+  const dayMap = (r, key) => ({
+    0: n(r && r[`d_${key}_0`]),
+    1: n(r && r[`d_${key}_1`]),
+    2: n(r && r[`d_${key}_2`]),
+    '3plus': n(r && r[`d_${key}_3plus`]),
+  });
   return {
     period,
     period_start: start,
@@ -412,6 +507,19 @@ async function counts({
     },
     /* How many of these orders have had a link go out. Context, not a bucket. */
     links_sent: n(row && row.links_sent),
+    /*
+     * How old the waiting orders are, per tile. Each bucket's four pills sum to
+     * its own count — that is the check that catches an order past day 3
+     * falling out of every pill, which is exactly what a plain "Day 3" would
+     * have done to a book whose oldest order is five months old.
+     */
+    days: {
+      new: dayMap(row, 'new'),
+      no_link_needed: dayMap(row, 'no_link'),
+      response_received: dayMap(row, 'responded'),
+      no_response: dayMap(row, 'no_response'),
+      delivery_failed: dayMap(row, 'failed'),
+    },
     meta: BUCKET_META,
   };
 }
@@ -419,6 +527,7 @@ async function counts({
 module.exports = {
   BUCKETS, BUCKET_META, PERIODS,
   RESPONSE_KINDS, RESPONSE_SUB_BUCKETS, ALL_BUCKET_FILTERS, responseKindSql,
+  DAY_BUCKETS, dayPredicate, ageDaysSql,
   optedInSql, respondedSql, failedSql, sentSql,
   bucketPredicate, periodRange, istToday, counts,
 };

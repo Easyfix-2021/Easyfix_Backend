@@ -2922,6 +2922,7 @@ async function list({
   sectionIds,                // {cancel,retry} action_taken_reason ids, resolved by the caller
   bucket,                    // enum — My Orders -> Booking queue tile (booking-queue.service.js)
   bucketHasRequestTable,     // bool — probed by the caller (see customerRequestTableExists)
+  ageDay,                    // enum — Booking-queue day pill: '0' | '1' | '2' | '3plus'
   customerRescheduled,       // bool — the Booking-queue "Rescheduled by customer" flag
   requestedBefore,           // 'now' or ISO date — Running Late tile
   /*
@@ -3438,9 +3439,22 @@ async function list({
    * correlated EXISTS.
    */
   if (bucket) {
-    const sql = bookingQueue.bucketPredicate(bucket, { hasRequestTable: bucketHasRequestTable !== false });
+    /*
+     * `ageDay` composes INSIDE the bucket predicate rather than as a clause of
+     * its own, so the grid gets exactly the rows the day pill counted — one
+     * definition of "Day 2 of No response", not a bucket filter and an age
+     * filter that each look right separately.
+     */
+    const sql = bookingQueue.bucketPredicate(bucket, {
+      hasRequestTable: bucketHasRequestTable !== false,
+      day: ageDay || undefined,
+    });
     if (sql) clauses.push(`(${sql})`);
-    else clauses.push('1=0');       // unknown bucket: empty, never unfiltered
+    else clauses.push('1=0');       // unknown bucket or pill: empty, never unfiltered
+  } else if (ageDay) {
+    // A pill without a bucket is not a thing the page can send, and answering
+    // it as "the whole board" would be a quietly wrong list.
+    clauses.push('1=0');
   }
 
   /*

@@ -543,6 +543,7 @@ const SAMPLE = {
   // FILTER_COVERAGE): dropping them yields a superset of the tile, never
   // another tile's rows.
   bucket: 'no_response',
+  ageDay: '3plus',
   customerRescheduled: 'true',
   sortBy: 'job_id',
   sortDir: 'asc',

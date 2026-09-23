@@ -736,6 +736,7 @@ const FILTER_COVERAGE = Object.freeze({
    * the route logs the drop.
    */
   bucket:              ['ignored',  'needs the customer-request probe + a J-alias bind where() cannot do'],
+  ageDay:              ['ignored',  'rides inside the bucket predicate — see bucket'],
   customerRescheduled: ['ignored',  'same probe, same alias — see bucket'],
   /*
    * Keyset pagination requires the sort key to BE the cursor, and the cursor
