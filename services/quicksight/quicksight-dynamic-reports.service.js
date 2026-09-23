@@ -665,6 +665,14 @@ async function list(access) {
           hasChart: !!r.chart_json,
           restricted: roles.get(Number(r.id)).length > 0,
           shareEnabled: !!r.share_token,
+          /*
+           * The TOKEN only for someone who may edit the report — the same
+           * rule detail() applies. It is the secret in the public URL, so a
+           * viewer who merely sees the row gets `shareEnabled` (the chip)
+           * but nothing to hand on. With it, the list can offer Copy Link
+           * without a round trip.
+           */
+          shareToken: canEdit(r, access) ? (r.share_token || null) : null,
           current: uploadDto(cur, cur && cur.id),
           canEdit: canEdit(r, access),
           canTransferOwner: canTransferOwner(r, access),

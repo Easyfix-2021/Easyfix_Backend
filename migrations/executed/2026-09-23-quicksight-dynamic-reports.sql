@@ -28,7 +28,9 @@
 -- EXISTS (re-runs are no-ops); section 4 is NOT EXISTS-guarded. After applying,
 -- permissions are cached up to 60s (PERMISSIONS_CACHE_TTL_MS); hard-refresh the CRM.
 -- Other roles get the keys via Manage Role → Home.
--- Leave this file in migrations/ (pending) — do not move it into executed/.
+-- APPLIED: QA 2026-09-23, Production 2026-09-23 (user-confirmed) — hence executed/.
+-- Re-runs are still safe (CREATE TABLE IF NOT EXISTS + NOT EXISTS guards), but do
+-- not re-run it as a matter of course; this directory is frozen.
 -- ============================================================================
 
 -- ─── 1. Report definitions ──────────────────────────────────────────────────

@@ -20,7 +20,10 @@
 -- HOW TO APPLY: statement by statement. NOT EXISTS-guarded, so a re-run is a
 -- no-op and will NOT overwrite a list edited on the server. To change the list
 -- later, UPDATE it (section 2) rather than re-running the INSERT.
--- Leave this file in migrations/ (pending) — do not move it into executed/.
+-- APPLIED: QA 2026-09-23, Production 2026-09-23 (user-confirmed) — hence executed/.
+-- To CHANGE the allowlist later, run the UPDATE in section 2 against the target
+-- DB; do not edit-and-re-run this file (the INSERT is NOT EXISTS-guarded and
+-- would be a no-op anyway). This directory is frozen.
 -- ============================================================================
 
 -- ─── 1. Seed (idempotent; skipped when the key already exists) ──────────────
