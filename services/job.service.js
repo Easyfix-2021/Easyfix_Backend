@@ -665,7 +665,24 @@ const LIST_COLUMNS = `
    */
   ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name, ad.address, ad.gps_location,
+  /*
+   * locality + pin_code on the LIST (V3 2.7, 2026-09-23).
+   *
+   * Both were already selected by getByIdCore for the DETAIL payload, and both
+   * come off the tbl_address join two lines below, which this projection has
+   * always carried for address and gps_location. So this is two more
+   * columns off a row already being read: no new join, no new index, no extra
+   * query, on any consumer.
+   *
+   * The technician app's list showed only a city, so "Koramangala" and a job
+   * 40 km away both read as "Bengaluru". The CRM gets the same two columns,
+   * which it can use or ignore.
+   *
+   * NOT distance — that needs the technician's own position and belongs with
+   * plan 3.10c, which is what puts a recent position on an in-progress job in
+   * the first place.
+   */
+  j.fk_address_id, ci.city_name, ad.address, ad.locality, ad.pin_code, ad.gps_location,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -4273,6 +4290,56 @@ async function resolveSelfie(selfieId, jobId) {
   }
   if (!url && doc.url) url = String(doc.url).replace(/^http:\/\//i, 'https://');
   return { url, recordedAt: doc.created_on || null };
+}
+
+/*
+ * The CUSTOMER'S OWN VIDEO of the fault (V3 plan 2.15, 2026-09-23).
+ *
+ * Nothing new is captured here. Customers have been uploading these for months
+ * — the public booking page (routes/public/job-completion.js) and the WhatsApp
+ * conversation flow both write them to tbl_job_media with category
+ * 'BookingVideo' — and until now the only way to watch one was the CRM's
+ * /api/admin/jobs/videos/:mediaId/file redirect. The person who most needs to
+ * see the fault before choosing what to put in the van could not.
+ *
+ * PRESIGNED ON THE PAYLOAD, not a redirect. The CRM serves a 302 because a
+ * browser <video> tag follows it; the app reads URLs off the job like it
+ * already does for images[].image_url and selfie_url, and a redirect would
+ * need a bearer the media element cannot send.
+ *
+ * COSTS ONE INDEXED SELECT, AND NOTHING ELSE, ON A JOB WITH NO VIDEO. The
+ * presign only happens for rows that exist — the same rule resolveSelfie
+ * follows above, for the same reason: most jobs have none.
+ *
+ * A row whose S3 object has gone is DROPPED rather than returned with a null
+ * url. A video tile that cannot play is worse than no tile.
+ */
+async function resolveJobMedia(jobId) {
+  const s3Storage = require('../utils/s3-storage');
+  const [rows] = await pool.query(
+    `SELECT media_id, s3_key, content_type
+       FROM tbl_job_media
+      WHERE job_id = ?
+      ORDER BY media_id`,
+    [jobId],
+  );
+  if (!rows.length || !s3Storage.isEnabled()) return [];
+  const out = [];
+  for (const r of rows) {
+    const key = String(r.s3_key || '').trim();
+    if (!key) continue;
+    try {
+      if (!(await s3Storage.exists(key))) continue;
+      out.push({
+        mediaId: Number(r.media_id),
+        url: await s3Storage.getPresignedUrl(key),
+        contentType: r.content_type || null,
+      });
+    } catch (e) {
+      logger.warn('Job media presign failed · jobId=' + jobId + ' · mediaId=' + r.media_id + ' · ' + e.message);
+    }
+  }
+  return out;
 }
 
 /*
@@ -8631,7 +8698,7 @@ module.exports = {
   // The tbl_job_services audit-column probe create() stamps with — exported so
   // the one-list services editor stamps new rows the same way.
   jobServicesCreatedByColumn,
-  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, resolveJobMedia, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   /*
    * The job's inherited Project Manager / Zonal Manager display names. Exported
    * because they are DERIVED, not columns — every surface that shows either one

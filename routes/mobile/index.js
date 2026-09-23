@@ -26,6 +26,8 @@ const { modernOk, modernError, otpGuessCapError } = require('../../utils/respons
 const { rateLimit } = require('../../middleware/rate-limit');
 const { checkoutPin: checkoutPinAttempts, sharedRateLimit, techMobileRateKey } = require('../../services/attempt-window.service');
 const { stripCustomerMobiles } = require('../../utils/mask-mobile');
+const { technicianSharesForJobs } = require('../../services/job-ledger.service');
+const incentives = require('../../services/job-incentive.service');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
@@ -433,6 +435,100 @@ router.get(
 );
 
 // Jobs assigned to me
+/*
+ * ── "₹X yours" (2026-09-23, V3 plan 2.1 + 2.8) ───────────────────────────
+ *
+ * Every money figure the technician app has ever shown is what the CLIENT is
+ * billed: tbl_job_services.total_charge, and the order total derived from it.
+ * The technician's own cut existed — job-ledger.service splits each priced line
+ * into { client, easyfix, easyfixer } — but it reached the device nowhere
+ * except the PHE monthly screen, so the job screen's big number was somebody
+ * else's money.
+ *
+ * `technician_share` is that cut. `technician_share_estimated` says whether it
+ * is the POSTED ledger figure or what a completion would post today; the app
+ * must render those differently, because one is a promise and the other is an
+ * arithmetic prediction off a rate card that can still move.
+ *
+ * ABSENT MEANS UNKNOWN. A job with no priced line and no material row gets
+ * NEITHER field — not `0`. There is no answer, and "₹0" is an answer.
+ *
+ * DECORATED HERE, NOT IN jobService.list. That service is also the CRM's list
+ * and the export's, so a join added inside it would put this cost on every
+ * operator's screen and every XLSX row to buy nothing — the CRM has its own
+ * Billing tab. One backend serves all three products against one MySQL; the
+ * cheapest place to add work is the narrowest one that needs it.
+ *
+ * COST: one indexed SELECT when every job is complete, three otherwise, for the
+ * whole page — never per row. See technicianSharesForJobs.
+ */
+/*
+ * ── ESCALATION, ON THE TECHNICIAN'S OWN LIST AND DETAIL (V3 plan 2.9) ────
+ *
+ * An escalated job is the one a technician most needs to recognise before he
+ * walks in, and it reached him on exactly one screen: the PHE monthly review,
+ * after the fact. The flag lives on tbl_easyfixer_rating_by_customer and
+ * job.service.js resolves it through `esc.table_id = (SELECT MAX(...))` — a
+ * CORRELATED SUBQUERY, evaluated per row, and switched on only for the CRM's
+ * Manage view or an escalated-only filter.
+ *
+ * DECORATED HERE RATHER THAN BY TURNING THAT JOIN ON, and that is the whole
+ * point of this function. Flipping `wantsEscalation` for the mobile list would
+ * put a per-row correlated subquery on the app's hottest read; it would also
+ * have to be flipped inside the SHARED list builder, so every CRM list and
+ * every XLSX export would pay it too. One backend, one MySQL, three products —
+ * the cost lands on all of them.
+ *
+ * Instead: one grouped query over the page's job ids, which reads the same rows
+ * the subquery would and answers all of them at once. MAX(table_id) per job is
+ * the same "latest rating row wins" rule escalationJoin encodes; it is repeated
+ * here because the join itself is not reusable from outside that SQL builder,
+ * and a DIFFERENT rule would make the app and the CRM disagree about which jobs
+ * are escalated.
+ *
+ * tinyint/bit: compared with `== 1` after Number(), never read as a raw Buffer
+ * — the trap job.service.js:1575 records for this exact column.
+ */
+async function decorateEscalation(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const ids = [...new Set(list.map((r) => Number(r.job_id)).filter(Number.isSafeInteger))];
+  if (!ids.length) return list;
+  let flagged = new Set();
+  try {
+    const [hits] = await pool.query(
+      `SELECT e.job_id, e.is_escalated
+         FROM tbl_easyfixer_rating_by_customer e
+         JOIN (SELECT job_id, MAX(table_id) AS table_id
+                 FROM tbl_easyfixer_rating_by_customer
+                WHERE job_id IN (?)
+                GROUP BY job_id) latest
+           ON latest.table_id = e.table_id`,
+      [ids],
+    );
+    flagged = new Set(hits.filter((h) => Number(h.is_escalated) === 1).map((h) => Number(h.job_id)));
+  } catch (err) {
+    // The rating table is not guaranteed on every instance, and a missing
+    // escalation chip must never take a technician's job list down with it.
+    logger.warn('Escalation decoration skipped · ' + err.message);
+    return list;
+  }
+  for (const row of list) row.is_escalated = flagged.has(Number(row.job_id)) ? 1 : 0;
+  return list;
+}
+
+async function decorateTechnicianShare(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return list;
+  const shares = await technicianSharesForJobs(pool, list.map((r) => r.job_id));
+  for (const row of list) {
+    const share = shares.get(Number(row.job_id));
+    if (!share) continue;
+    row.technician_share = share.amount;
+    row.technician_share_estimated = !share.posted;
+  }
+  return list;
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'active') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
@@ -463,7 +559,8 @@ router.get('/jobs', async (req, res, next) => {
     logger.info('Found ' + rows.length + ' jobs · total=' + total);
     // jobService.list is the CRM's list too, so it carries customer_mob_no.
     // Not to the device — same rule as GET /jobs/:id below.
-    modernOk(res, { items: stripCustomerMobiles(rows), total });
+    await decorateEscalation(rows);
+    modernOk(res, { items: stripCustomerMobiles(await decorateTechnicianShare(rows)), total });
   } catch (e) { next(e); }
 });
 
@@ -527,6 +624,17 @@ router.get('/jobs/offered', async (req, res, next) => {
     logger.info('List open job offers extended to me');
     const result = await jobService.listOfferedForTech(req.tech.efr_id);
     logger.info('Found ' + ((result && result.items ? result.items.length : 0)) + ' open offers');
+    /*
+     * The share is shown BEFORE acceptance, deliberately: what the job pays is
+     * the single most useful thing about an offer, and withholding it until the
+     * technician commits is how an offer becomes a guess. Always the ESTIMATE
+     * here — an offered job has no ledger row by definition — so the app renders
+     * it with the estimate's own wording.
+     */
+    if (result && Array.isArray(result.items)) {
+      await decorateEscalation(result.items);
+      await decorateTechnicianShare(result.items);
+    }
     // An OFFERED technician has not even accepted the job — the customer's
     // number is not his to hold. Same list projection as GET /jobs.
     modernOk(res, stripCustomerMobiles(result));
@@ -589,6 +697,35 @@ router.get('/jobs/:id', async (req, res, next) => {
     // When it was recorded (document.created_on, IST wall clock), so a stale
     // selfie from an earlier visit is distinguishable from today's. Same owner rule.
     job.selfie_recorded_at = selfie?.recordedAt ?? null;
+    /*
+     * What HE earns, beside what the client pays (2.1). The service lines keep
+     * their client prices — the technician quotes from them in the estimate
+     * flow, so removing them would break that — but the job screen's headline
+     * figure is now this one. See decorateTechnicianShare above for why absent
+     * is not zero.
+     */
+    await decorateEscalation([job]);
+    await decorateTechnicianShare([job]);
+    /*
+     * The customer's own video of the fault (V3 2.15).
+     *
+     * OWNER ONLY, on the same rule as the selfie two blocks up: `canView` also
+     * admits a technician holding an open OFFER or a pending delegation, and a
+     * customer's video of the inside of their home is not something to hand to
+     * every technician a job was broadcast to. One who has ACCEPTED is doing
+     * the work; one who is deciding whether to accept does not need it.
+     *
+     * Best-effort. S3 being unreachable must not 500 a job screen whose other
+     * twenty fields are fine — the section simply does not render.
+     */
+    job.media = [];
+    if (job.fk_easyfixter_id === req.tech.efr_id) {
+      try {
+        job.media = await jobService.resolveJobMedia(job.job_id);
+      } catch (me) {
+        logger.warn('Job media lookup failed · id=' + job.job_id + ' · ' + me.message);
+      }
+    }
     modernOk(res, stripCustomerMobiles(job));
   } catch (e) { next(e); }
 });
@@ -965,7 +1102,37 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
       { user_id: req.tech.efr_id, efr_id: req.tech.efr_id },
     );
     logger.info('Checked in · id=' + job.job_id + ' · status->IN_PROGRESS');
-    modernOk(res, { checkedIn: true, pinMatched });
+
+    /*
+     * ── THE ON-TIME START BONUS (V3 2.3) ─────────────────────────────────
+     *
+     * Owner's definition: on-time is "within the same slot of appointment",
+     * and the PIN is what makes the arrival real. So both, or nothing —
+     * see job-incentive.service.
+     *
+     * AFTER setStatus, NEVER BEFORE, and never inside it. setStatus fires the
+     * TechStart webhook and is the only 1->2 transition the CRM sees; a bonus
+     * that threw would otherwise take the check-in down with it and strand the
+     * technician at the door. This is money, and money is allowed to be
+     * retried — the award is idempotent and the late-PIN route below re-runs
+     * it — but a check-in is not allowed to fail for it.
+     *
+     * `extras.checkin_date_time` is the instant we just stamped, which is the
+     * arrival being scored. Reading it back off `job` would give the PREVIOUS
+     * check-in's time on a revisit, because that column is write-once.
+     */
+    let incentive = null;
+    if (pinMatched === true) {
+      try {
+        incentive = await incentives.awardOnTimeStart(
+          { ...job, job_id: job.job_id },
+          { checkinAt: extras.checkin_date_time, actorId: req.tech.user_id || req.tech.efr_id },
+        );
+      } catch (err) {
+        logger.warn('On-time bonus not awarded · id=' + job.job_id + ' · ' + err.message);
+      }
+    }
+    modernOk(res, { checkedIn: true, pinMatched, incentive });
   } catch (e) {
     if (e.status) {
       logger.warn('Check in failed · id=' + req.params.id + ' · ' + e.message);
@@ -973,6 +1140,84 @@ router.post('/jobs/:id/checkin', validate(Joi.object({
     }
     next(e);
   }
+});
+
+/*
+ * ── THE LATE PIN (V3 2.4) ────────────────────────────────────────────────
+ *
+ * "Late PIN restores the ₹50 and waives the signature." A technician who
+ * reached the door on time but could not get the PIN there — the customer had
+ * lost the SMS, or was not the one who booked — must not lose a bonus he
+ * earned by ARRIVING on time. He enters it later and it is restored.
+ *
+ * WHY IT IS ITS OWN ROUTE rather than a second POST to /checkin. Check-in
+ * fires the TechStart webhook through setStatus, stamps the arrival clock and
+ * moves the job to IN_PROGRESS. Replaying all of that to re-check a four-digit
+ * number would re-notify the CRM about a job that started hours ago. This route
+ * writes no job columns and fires no webhook; it verifies, and it awards.
+ *
+ * THE SLOT IS SCORED AGAINST THE ARRIVAL, NOT AGAINST NOW. `checkin_date_time`
+ * is the instant being attested to. Scoring "now" would refuse every late PIN
+ * by construction, which is the exact opposite of what this route is for.
+ *
+ * SAME GUESS BUDGET as check-in and checkout (5 per 30 min per job, shared
+ * key), so this cannot be used as an oracle to find a PIN that will later close
+ * the job.
+ */
+router.post('/jobs/:id/verify-pin', validate(Joi.object({
+  otp: Joi.string().max(10).required(),
+})), async (req, res, next) => {
+  try {
+    const job = await jobService.getById(Number(req.params.id));
+    if (!job || job.fk_easyfixter_id !== req.tech.efr_id) return modernError(res, 404, 'job not found');
+    const jobPin = normalisePin(job.otp);
+    if (!jobPin) return modernError(res, 422, 'This job has no customer PIN');
+    if (!job.checkin_date_time) return modernError(res, 409, 'Check in first');
+
+    /*
+     * THE OPERAND NAMES ARE LOAD-BEARING, and so is the `===`.
+     *
+     * tests/otp-attempt-cap.test.js parses this file and recognises a PIN
+     * verify structurally — `jobPin === submittedPin`, two identifiers by those
+     * names — then asserts that every claim/clear in the repo sits inside one.
+     * Written any other way (`jobPin !== normalisePin(req.body.otp)`, which is
+     * what this was first), the guard does not see a verify here, and the claim
+     * below reads as a stray reset of somebody's attempt counter. That guard
+     * exists because a Resend that cleared the count made the cap meaningless,
+     * so the fix is to BE a recognisable verify, never to widen the matcher.
+     *
+     * Claimed BEFORE the compare, exactly as check-in and checkout do: the
+     * claim is what makes the budget atomic, and spending it first is what
+     * stops this route becoming an unlimited oracle for a PIN that will later
+     * close the job.
+     */
+    const submittedPin = normalisePin(req.body.otp);
+    const pinKey = 'job:' + job.job_id;
+    if ((await checkoutPinAttempts.claim(pinKey)).locked) {
+      return otpGuessCapError(res, 'Too many PIN attempts. Try again later.');
+    }
+    const pinMatched = jobPin === submittedPin;
+    if (!pinMatched) {
+      logger.warn('Late PIN mismatch · id=' + job.job_id);
+      return modernError(res, 409, 'That PIN does not match');
+    }
+    await checkoutPinAttempts.clear(pinKey);
+    logger.info('Late PIN verified · id=' + job.job_id);
+
+    let incentive = null;
+    try {
+      incentive = await incentives.awardOnTimeStart(job, {
+        checkinAt: job.checkin_date_time,
+        actorId: req.tech.user_id || req.tech.efr_id,
+      });
+    } catch (err) {
+      logger.warn('On-time bonus not awarded on late PIN · id=' + job.job_id + ' · ' + err.message);
+    }
+    // signatureWaived is the OTHER half of 2.4: a verified PIN is the customer
+    // acknowledging the visit, so the signature fallback (2.5) is not also asked
+    // for. The app reads this rather than re-deriving the rule.
+    modernOk(res, { pinMatched: true, signatureWaived: true, incentive });
+  } catch (e) { next(e); }
 });
 
 // Checkout — completion with the full problem / cash / revisit capture.
@@ -1124,10 +1369,44 @@ router.post('/jobs/:id/checkout',
       }
     }
 
+    /*
+     * ── THE WASTED-VISIT CHARGE (V3 2.6) ─────────────────────────────────
+     *
+     * The technician attended and could not do the work through no fault of
+     * his own. ₹250, and it BILLS THE CLIENT (owner's decision, 2026-09-23):
+     * tx and client both carry it, so he is paid for the trip and the client
+     * pays for it. EasyFix's share is unchanged.
+     *
+     * THE TRIGGER IS `haveProblemWithJob`, NOT `isNextVisit`, and the
+     * difference matters. isNextVisit only says "I am coming back", which is
+     * also true of a perfectly normal two-visit installation nobody wasted.
+     * haveProblemWithJob with a problemReasonId is the technician REPORTING
+     * that something stopped him — which is the thing being compensated. Paying
+     * on isNextVisit would bill the client ₹250 for every planned second visit.
+     *
+     * BEST-EFFORT, AFTER THE TRANSITION, like the delegation close and the
+     * remark comment above it: the checkout has already committed, and a
+     * bookkeeping failure must never turn a closed job into an error the
+     * technician sees. Idempotent, so a retry cannot pay twice — which matters
+     * more here than anywhere else in this file, because job_material has no
+     * unique index to fall back on.
+     */
+    let visitCharge = null;
+    if (b.haveProblemWithJob === true) {
+      try {
+        visitCharge = await incentives.awardVisitCharge(job.job_id, {
+          actorId: req.tech.user_id || req.tech.efr_id,
+        });
+      } catch (ve) {
+        logger.warn('Visit charge not awarded · id=' + job.job_id + ' · ' + ve.message);
+      }
+    }
+
     modernOk(res, {
       jobId: job.job_id,
       completedAt: extras.app_checkout_date_time,
       collectedAmount: extras.material_charge,
+      visitCharge,
     });
   } catch (e) {
     if (e.status) {
