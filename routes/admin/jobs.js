@@ -12,6 +12,7 @@ const jobNotes = require('../../services/job-notes.service');
 // The one-list services editor (Uplifted tab): catalog read + complete-set PUT.
 const servicesEditor = require('../../services/job-services-editor.service');
 const clientRequest = require('../../services/client-request.service');
+const bookingQueue = require('../../services/booking-queue.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
@@ -448,6 +449,15 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       const { pool } = require('../../db');
       req.query.sectionIds = await clientRequest.reasonIds(pool);
     }
+    /*
+     * The Booking-queue bucket's "has the customer answered" test reads
+     * tbl_job_customer_request, which does not exist on every deploy. Probe
+     * ONCE here (memoised in job.service) and hand the answer down, so the
+     * predicate degrades to customer_submitted_at instead of 500ing the list.
+     */
+    if (req.query.bucket || req.query.customerRescheduled) {
+      req.query.bucketHasRequestTable = await job.customerRequestTableExists();
+    }
     // Row-level RBAC + reporting hierarchy: row-filter the list by the
     // UNION of (caller's own manage_* scope) ∪ (every direct/indirect
     // report's manage_* scope). Admin/Finance bypass via the bypass
@@ -716,6 +726,56 @@ router.get('/unconfirmed-sections', async (req, res, next) => {
     const todayYmd = new Date(Date.now() + (5.5 * 60 * 60 * 1000)).toISOString().slice(0, 10);
     const sections = await clientRequest.sectionsFor(pool, ids, todayYmd);
     modernOk(res, { sections, meta: clientRequest.SECTION_META, today: todayYmd });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/booking-queue?period=today|yesterday|last7&ownerId=
+ *
+ * Every number on the Booking-queue tile strip (My Orders -> Unconfirmed, the
+ * new tab), in two queries.
+ *
+ * Two shapes of number come back, and the FE renders them as one tile each:
+ *   links.*   what happened to the links SENT in the period — a fact about the
+ *             day that never goes down. links.sent = the other three, always.
+ *   open.*    how many of those are still waiting for the team. Goes down as
+ *             orders are booked or cancelled, and matches the grid's row count.
+ *   waiting.* the two tiles with no link outcome (New / No link needed), split
+ *             Today vs Old by the ticket's creation date.
+ *
+ * The bucket definitions are NOT duplicated here: the same module supplies the
+ * counts and the `bucket=` filter the grid below sends to GET /admin/jobs, so
+ * a tile and its rows cannot describe different populations. Same reason the
+ * RBAC row filter is job.jobScopeFragment rather than a second copy.
+ */
+router.get('/booking-queue', async (req, res, next) => {
+  try {
+    const period = bookingQueue.PERIODS.includes(String(req.query.period))
+      ? String(req.query.period) : 'today';
+    const ownerId = Number(req.query.ownerId);
+    logger.info('Booking-queue counts · period=' + period
+      + ' ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
+
+    // Required inside the handler, as the sibling handlers in this file do.
+    const { pool } = require('../../db');
+    const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+    const scope = await buildRequestScopeWithHierarchy(req, pool);
+    const hasVerticalCol = await job.hasClientVerticalIdColumn();
+    const frag = job.jobScopeFragment(
+      { scope, allowedStages: req.allowedStages, hasVerticalCol }, 'j',
+    );
+
+    const counts = await bookingQueue.counts({
+      period,
+      ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
+      scopeSql: frag.clauses.join(' AND '),
+      scopeParams: frag.params,
+      scopeJoins: frag.joins,
+      // Same probe the list route runs, so the tiles and the rows agree on
+      // what "the customer answered" means.
+      hasRequestTable: await job.customerRequestTableExists(),
+    });
+    modernOk(res, counts);
   } catch (e) { next(e); }
 });
 

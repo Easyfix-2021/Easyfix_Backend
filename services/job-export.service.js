@@ -720,6 +720,24 @@ const FILTER_COVERAGE = Object.freeze({
    */
   section:          ['ignored',  'needs reason ids from a DB read where() cannot do'],
   /*
+   * The Booking-queue tiles, ignored for the same two reasons as the pair
+   * above and with the same safe failure mode.
+   *
+   * bucketPredicate() is synchronous and would fit here, but it needs the
+   * tbl_job_customer_request probe (an async DB read this module cannot make)
+   * to decide whether "the customer answered" may read that table, and its
+   * fragment is j-aliased while the export runs under J — the exact bind
+   * offerState above cannot do either. Assuming the table is present where it
+   * is not would 500 the export; assuming it absent would under-count answers
+   * and hand an operator a sheet that disagrees with the tile they clicked.
+   *
+   * Dropped, both of them, the sheet is every unconfirmed job matching the
+   * other filters — a SUPERSET of the tile, never somebody else's rows — and
+   * the route logs the drop.
+   */
+  bucket:              ['ignored',  'needs the customer-request probe + a J-alias bind where() cannot do'],
+  customerRescheduled: ['ignored',  'same probe, same alias — see bucket'],
+  /*
    * Keyset pagination requires the sort key to BE the cursor, and the cursor
    * is J.job_id DESC (see fetchExportChunk). An arbitrary ORDER BY would skip
    * and duplicate rows across chunks — silently, which is worse than

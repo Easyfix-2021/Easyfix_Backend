@@ -262,6 +262,16 @@ const listQuery = Joi.object({
    */
   section: Joi.string().valid(...require('../services/client-request.service').SECTIONS).optional(),
   /*
+   * `bucket` — one of the five My Orders -> Booking queue tiles. Valid values
+   * come from booking-queue.service.js for the same reason `section` reads its
+   * list from client-request.service.js: this schema must not be a second,
+   * drifting copy of the bucket names.
+   */
+  bucket: Joi.string().valid(...require('../services/booking-queue.service').BUCKETS).optional(),
+  // The Booking-queue "Rescheduled by customer" flag chip. Distinct from
+  // auto_rescheduled (our own after-3pm shift) — this is the customer's ask.
+  customerRescheduled: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
+  /*
    * `requestedBefore` — drives the AttentionSummary's Running Late tile.
    *   'now' → j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()
    * Other ISO timestamps allowed for future surfaces (e.g. "before
