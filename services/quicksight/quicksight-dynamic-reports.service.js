@@ -31,7 +31,11 @@
  * ACCESS (three action keys, see KEYS):
  *   VIEW   — see reports whose audience is empty (everyone) or includes my role
  *   MANAGE — create; edit / upload / share / delete uploads of reports I OWN
- *   ADMIN  — owner-equivalent on every report, sees all, transfers ownership
+ *   ADMIN  — owner-equivalent on every report, sees all. NOT transfer.
+ * TRANSFERRING OWNERSHIP is the one capability outside RBAC: the report's
+ * OWNER, or an email on the FEATURES.canTransferReportOwner allowlist. It has
+ * to outlive a role change, because the case it exists for is an owner who
+ * lost access — see canTransferOwner() and the route.
  * loadReport() is the one gate every per-report read and write goes through;
  * a report you may not see is a 404, never a 403, so its existence does not leak.
  * A public share link bypasses the audience on purpose — the owner published it.
@@ -53,6 +57,7 @@ const { pool } = require('../../db');
 const s3 = require('../../utils/s3-storage');
 const { buildStyledWorkbook } = require('../../utils/xlsx-styled-export');
 const { withMysqlNamedLock } = require('../mysql-named-lock.service');
+const { FEATURES, emailAllowed } = require('../feature-access.service');
 const { fileStamp } = require('./_shared');
 const logger = require('../../logger');
 
@@ -96,10 +101,22 @@ function accessOf(user) {
     roleId: Number(user && user.user_role),
     isAdmin: perms.includes(KEYS.ADMIN),
     canManage: perms.includes(KEYS.MANAGE),
+    // Email allowlist, NOT a role — see FEATURES.canTransferReportOwner.
+    onOwnerAllowlist: emailAllowed(FEATURES.canTransferReportOwner, user && user.official_email),
   };
 }
 
 const isOwner = (report, access) => Number(report.created_by) === access.userId;
+
+/*
+ * Who may hand a report to a new owner: its OWNER, or a named operator on the
+ * email allowlist. Deliberately NOT the Admin key — an admin can read, edit,
+ * upload to and archive every report, but re-pointing ownership follows a
+ * person, so it survives the role reshuffle that created the problem.
+ * The list and detail payloads carry this as `canTransferOwner` so the CRM
+ * shows the action to exactly the people the BE would accept it from.
+ */
+const canTransferOwner = (report, access) => access.onOwnerAllowlist || isOwner(report, access);
 
 function canSee(report, roleIds, access) {
   if (access.isAdmin || isOwner(report, access)) return true;
@@ -650,6 +667,7 @@ async function list(access) {
           shareEnabled: !!r.share_token,
           current: uploadDto(cur, cur && cur.id),
           canEdit: canEdit(r, access),
+          canTransferOwner: canTransferOwner(r, access),
           updatedAt: r.updated_at,
         };
       }),
@@ -675,6 +693,7 @@ async function detail(access, id) {
     ownerName: report.owner_name || null,
     shareToken: edit ? report.share_token : (report.share_token ? '' : null),
     canEdit: edit,
+    canTransferOwner: canTransferOwner(report, access),
     isAdmin: access.isAdmin,
     columnsChanged: !!current && !sameColumns(JSON.parse(current.columns_json), columns),
     current: uploadDto(current, current && current.id),
@@ -762,9 +781,25 @@ async function archive(access, id) {
   return { archived: true };
 }
 
+/*
+ * Re-point a report at a new owner.
+ *
+ * AUTHORISATION LIVES ON THE ROUTE (requirePropertyAllowlist on the email
+ * allowlist FEATURES.canTransferReportOwner) — not here, and deliberately NOT
+ * the Admin key. This function must therefore NOT run the audience check the
+ * other per-report calls run: the whole point is to rescue a report whose
+ * owner lost access, and the operator doing the rescue may not be in that
+ * report's audience, which loadReport() would answer with a 404. It still
+ * refuses an archived or missing report, and a user id that does not exist.
+ */
 async function transferOwner(access, id, userId) {
-  if (!access.isAdmin) throw httpError(403, 'Only a Custom Reports administrator can transfer ownership');
-  const { report } = await loadReport(access, id);
+  const [[report]] = await pool.query(
+    'SELECT id, created_by FROM tbl_qs_dynamic_report WHERE id = ? AND is_active = 1', [id],
+  );
+  if (!report) throw httpError(404, 'Report not found');
+  if (!canTransferOwner(report, access)) {
+    throw httpError(403, 'Only this report\'s owner, or an operator on the Custom Reports owner list, can transfer it');
+  }
   const [[user]] = await pool.query('SELECT user_id FROM tbl_user WHERE user_id = ?', [userId]);
   if (!user) throw httpError(400, 'That user does not exist');
   await pool.query(
@@ -772,7 +807,13 @@ async function transferOwner(access, id, userId) {
     [userId, access.userId, new Date(), report.id],
   );
   logger.info('Custom report ownership transferred', { reportId: report.id, from: report.created_by, to: userId, by: access.userId });
-  return detail(access, id);
+  /*
+   * A CONFIRMATION, not detail(). detail() re-applies the audience check, so
+   * returning it here would 404 an allowlisted operator who is not in the
+   * report's audience — AFTER their transfer had already been written, which
+   * reads as a failure that actually succeeded. Callers re-fetch the list.
+   */
+  return { transferred: true, ownerId: Number(userId) };
 }
 
 /*
@@ -993,6 +1034,6 @@ module.exports = {
   // Pure helpers, exported for tests.
   _internal: {
     normalizeColumns, normalizeChart, parseUpload, pageRows, chartData, purgeQuery,
-    canSee, canEdit, sameColumns, coerce, templateWorkbook, reportWorkbook,
+    canSee, canEdit, canTransferOwner, sameColumns, coerce, templateWorkbook, reportWorkbook,
   },
 };

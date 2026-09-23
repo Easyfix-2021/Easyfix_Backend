@@ -2,7 +2,8 @@
  * QuickSight sub-router — Custom (dynamic) Reports.
  *   view key   : isQuickSightDynamicReportView   (+ family ef-QuickSight), router-wide
  *   manage key : isQuickSightDynamicReportManage (create; change reports you own)
- *   admin key  : isQuickSightDynamicReportAdmin  (change any report; transfer owner)
+ *   admin key  : isQuickSightDynamicReportAdmin  (change any report; NOT transfer)
+ *   transfer   : owner OR access.dynamicreport.owner.emails (no role grants it)
  *   service    : services/quicksight/quicksight-dynamic-reports.service.js
  *
  *   GET    /                        → { canCreate, isAdmin, reports[] }
@@ -10,7 +11,7 @@
  *   GET    /:id                     → detail (definition, audience, uploads ≤30 days + current)
  *   PUT    /:id                     → detail      body: as POST
  *   DELETE /:id                     → { archived }
- *   PUT    /:id/owner               → detail      body: { userId }
+ *   PUT    /:id/owner               → { transferred, ownerId }  body: { userId }
  *   GET    /:id/template?format=xlsx|csv
  *   POST   /:id/upload              → detail      multipart: file (.xlsx/.csv), mode=replace|append
  *   DELETE /:id/uploads/:uploadId   → detail
@@ -120,6 +121,15 @@ router.put('/:id', validate(idParams, 'params'), validate(reportBody), handle(as
 router.delete('/:id', validate(idParams, 'params'), handle(async (req, res, access) =>
   modernOk(res, await service.archive(access, req.params.id), 'Report archived')));
 
+/*
+ * Transfer ownership — the report's OWNER, or an email on the
+ * FEATURES.canTransferReportOwner allowlist. Never a role: the Custom Reports
+ * administrator key does not grant it.
+ *
+ * The check is NOT middleware here, unlike every other property-gated
+ * capability: "or the owner" is a fact about THIS report, so only the service
+ * (which has the row) can decide. It answers 403 there instead.
+ */
 router.put('/:id/owner', validate(idParams, 'params'),
   validate(Joi.object({ userId: Joi.number().integer().positive().required() })),
   handle(async (req, res, access) =>
