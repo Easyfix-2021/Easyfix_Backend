@@ -20,6 +20,7 @@ const {
   listQuery, createBody, updateBody, statusBody, assignBody, offerBody, ownerBody, rescheduleBody, idParam,
   appRequestRejectBody, candidatesQuery, candidatesSearchQuery, slotRecommendationsQuery,
   pendingSchedulingCountsQuery, pendingStartCountsQuery,
+  dashboardCountsQuery, dashboardAttentionQuery, DASHBOARD_FILTERS,
 } = require('../../validators/job.validator');
 const { assertEntityInScope } = require('../../lib/scope');
 const requireStageForTransition = require('../../middleware/require-stage');
@@ -663,6 +664,13 @@ router.get('/export.xlsx', validate(listQuery, 'query'), async (req, res, next) 
  * missing ownerId falls through to org-wide counts — same response shape,
  * different WHERE clause. Frontend passes `ownerId = currentUser.user_id`
  * when it detects `?scope=mine` on the URL.
+ *
+ * Also accepts the dashboard filter bar's four params — clientId, cityId,
+ * projectManagerId, zonalManagerId, each an id or a CSV of ids — validated by
+ * keys EXTRACTED from listQuery and applied with the very same SQL list() uses,
+ * so a card's number and the grid the operator opens next agree. Sending none
+ * of them leaves the response byte-identical to before, which is what keeps the
+ * Navbar's unfiltered call sharing the dashboard's cache entry.
  */
 /*
  * GET /api/admin/jobs/unconfirmed-sections?ids=1,2,3
@@ -719,17 +727,38 @@ router.get('/unconfirmed-sections', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/counts', async (req, res, next) => {
+/*
+ * The dashboard filter bar's four params, lifted off an ALREADY-VALIDATED query
+ * in one place so /counts and /attention-summary cannot come to disagree about
+ * which filters the dashboard has. DASHBOARD_FILTERS is the validator's own key
+ * list, so a fifth filter added there reaches both endpoints at once — and a
+ * key that is not in it has already been stripped by validate() before we get
+ * here, so this can only ever pass through what the schema accepted.
+ */
+function dashboardFilters(query) {
+  const out = {};
+  for (const key of DASHBOARD_FILTERS) {
+    if (query[key] != null && query[key] !== '') out[key] = query[key];
+  }
+  return out;
+}
+
+router.get('/counts', validate(dashboardCountsQuery, 'query'), async (req, res, next) => {
   try {
     const ownerId = req.query.ownerId ? Number(req.query.ownerId) : undefined;
-    logger.info('Fetch job status counts · ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
+    const filters = dashboardFilters(req.query);
+    logger.info('Fetch job status counts · ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-')
+      + ' · dashFilters=' + (Object.keys(filters).length ? Object.keys(filters).join('+') : '-'));
     // Dashboard cards must respect the caller's RBAC scope (hierarchy-
     // unioned). req.scope is attached by the global admin middleware
     // (routes/admin/index.js). Admin/Finance get undefined → no row filter.
+    // `filters` is the operator's own narrowing on top of that — it can only
+    // subtract from what scope already allows, never add to it.
     const counts = await job.getStatusCounts({
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scope: req.scope,
       allowedStages: req.allowedStages,
+      filters,
     });
     modernOk(res, counts);
   } catch (e) { next(e); }
@@ -842,11 +871,26 @@ router.get('/pending-start/counts', validate(pendingStartCountsQuery, 'query'), 
  * the failed metric + logging a warn) so a missing column doesn't
  * blank-out the whole card. Each tile on the FE deep-links to the
  * corresponding /jobs filter.
+ *
+ * Takes the dashboard filter bar's four params (clientId / cityId /
+ * projectManagerId / zonalManagerId) on the same terms as /counts. The bar
+ * drives BOTH dashboard rows, so every tile here narrows with the funnel cards
+ * above it; a bar that filtered the cards while this card kept reporting
+ * org-wide numbers would mislead on exactly the row operators act on.
  */
-router.get('/attention-summary', async (req, res, next) => {
+router.get('/attention-summary', validate(dashboardAttentionQuery, 'query'), async (req, res, next) => {
   try {
-    logger.info('Fetch attention summary');
-    const data = await job.getAttentionSummary({ scope: req.scope, allowedStages: req.allowedStages });
+    // Takes the SAME four filters as /counts (see dashboardFilters above): the
+    // bar drives both rows of the dashboard, so the tiles and the funnel cards
+    // above them always describe the same slice.
+    const filters = dashboardFilters(req.query);
+    logger.info('Fetch attention summary · dashFilters='
+      + (Object.keys(filters).length ? Object.keys(filters).join('+') : '-'));
+    const data = await job.getAttentionSummary({
+      scope: req.scope,
+      allowedStages: req.allowedStages,
+      filters,
+    });
     modernOk(res, data);
   } catch (e) { next(e); }
 });

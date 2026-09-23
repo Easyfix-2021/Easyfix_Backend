@@ -2718,6 +2718,84 @@ function toIdArray(v) {
 }
 
 /*
+ * ── THE DASHBOARD FILTER BAR (2026-09-23) ─────────────────────────────────
+ *
+ * The four filters on /dashboard — Client, City, Project Manager, Zonal
+ * Manager — as WHERE fragments the two dashboard aggregates splice into their
+ * own queries. Every predicate here is the SAME SQL list() already applies for
+ * the identically-named query param (see the clientId / cityId / PM EXISTS /
+ * ZM clauses in list()), so a card's number and the Manage Jobs grid the
+ * operator opens next describe ONE population. Re-deriving the predicate at the
+ * second call site is exactly how those two come to disagree.
+ *
+ * These NARROW, never widen. The caller appends them to its own scope clauses
+ * (manage_clients × manage_cities × manage_states × manage_verticals), so a PM
+ * who picks a client outside their RBAC scope gets 0 — not a peek over the
+ * fence. Order matters only in that clauses and params are pushed together;
+ * the caller concatenates both in the same sequence.
+ *
+ * Aliases are parameters, not literals: list() joins tbl_city as `ci`, the two
+ * aggregates as `ct`. `needsAddress` / `needsCity` tell the caller which LEFT
+ * JOINs to add — the aggregates join only what they filter on, and a City or
+ * Zonal Manager filter is the only reason those tables would be there at all.
+ */
+function buildDashboardFilters(filters, { jobAlias = 'j', addressAlias = 'ad', cityAlias = 'ct' } = {}) {
+  const clauses = [];
+  const params = [];
+  let needsAddress = false;
+  let needsCity = false;
+  if (!filters) return { clauses, params, needsAddress, needsCity };
+
+  const clientIds = toIdArray(filters.clientId);
+  if (clientIds.length) {
+    clauses.push(`${jobAlias}.fk_client_id IN (${clientIds.map(() => '?').join(',')})`);
+    params.push(...clientIds);
+  }
+
+  const cityIds = toIdArray(filters.cityId);
+  if (cityIds.length) {
+    clauses.push(`${addressAlias}.city_id IN (${cityIds.map(() => '?').join(',')})`);
+    params.push(...cityIds);
+    needsAddress = true;
+  }
+
+  /*
+   * Project Manager — the user mapped to the job's client in
+   * tbl_vertical_mapping with user_type = 1, i.e. the client's PRIMARY SPOC.
+   * The same lookup job_primary_spoc is stamped from. EXISTS rather than a
+   * JOIN for the reason list() gives: a client maps to several verticals, so
+   * joining the mapping table would multiply the row and inflate every COUNT
+   * on the page. Self-contained — references only vm and the job alias, so it
+   * introduces no new outer alias.
+   */
+  const pmIds = toIdArray(filters.projectManagerId);
+  if (pmIds.length) {
+    clauses.push(
+      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm`
+      + ` WHERE vm.client_id = ${jobAlias}.fk_client_id`
+      + ` AND vm.user_type = 1`
+      + ` AND vm.user_id IN (${pmIds.map(() => '?').join(',')}))`
+    );
+    params.push(...pmIds);
+  }
+
+  /*
+   * Zonal Manager — the tbl_user who owns the job's CITY (tbl_city.state_user),
+   * reached through the job's address. NOT `zonalId`, which the jobs list reads
+   * as a tbl_zone_master zone; see ZONAL_ID_COLLISION in job-export.service.js.
+   */
+  const zmIds = toIdArray(filters.zonalManagerId);
+  if (zmIds.length) {
+    clauses.push(`${cityAlias}.state_user IN (${zmIds.map(() => '?').join(',')})`);
+    params.push(...zmIds);
+    needsAddress = true;
+    needsCity = true;
+  }
+
+  return { clauses, params, needsAddress, needsCity };
+}
+
+/*
  * jobIdOrRefPredicate — Manage Jobs' "Job Id" box as SQL (2026-09-11, per ops).
  * Each comma-separated token is a job id OR a job booking reference, matched
  * EXACTLY: a reference is an identifier, and exact is also the only form an
@@ -4317,8 +4395,9 @@ async function getJobMeta(jobId) {
  * side sum — we use client-side sum because MySQL 5.7's WITH ROLLUP syntax is
  * fussy and the row count is always tiny (≤ 10 status codes).
  */
-async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = {}) {
-  logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-'));
+async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages, filters } = {}) {
+  logger.info('Compute job status counts · ownerId=' + (ownerId ?? '-') + ' · easyfixerId=' + (easyfixerId ?? '-')
+    + ' · dashFilters=' + (filters && Object.keys(filters).length ? Object.keys(filters).join('+') : '-'));
   /*
    * Two queries run in parallel:
    *   1. GROUP BY job_status — the raw count per code.
@@ -4389,6 +4468,17 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = 
     }
   }
 
+  /*
+   * The dashboard filter bar's four filters, AND-ed onto the scope above —
+   * they narrow what the operator may already see, they never replace it. See
+   * buildDashboardFilters for the predicates and why each one is shaped the
+   * way it is. Pushed BEFORE the stage clause so clauses and params keep the
+   * same sequence; both arrays are concatenated in push order below.
+   */
+  const dash = buildDashboardFilters(filters, { jobAlias: 'j', addressAlias: 'ad', cityAlias: 'ct' });
+  clauses.push(...dash.clauses);
+  params.push(...dash.params);
+
   // Job Stage Access — same intersection as list() so tab counts respect the
   // caller's visible stages. Added to the shared `clauses`, so it flows into
   // BOTH the GROUP BY status query and the BOOKED-split query (a user who can't
@@ -4407,8 +4497,11 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = 
   // tbl_address is needed whenever cities OR states is restricted (states
   // joins through city → tbl_city). tbl_city is needed only for states.
   // tbl_client is needed only for verticals.
-  const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
-  const needsCt = scope?.states?.mode === 'allow';
+  // The dashboard bar adds its own join needs: a City filter reads ad.city_id,
+  // a Zonal Manager filter reads ct.state_user through it. Client and Project
+  // Manager need neither (fk on the job, and a self-contained EXISTS).
+  const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow' || dash.needsAddress;
+  const needsCt = scope?.states?.mode === 'allow' || dash.needsCity;
   const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
   const joins = [
     needsAd ? 'LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id' : '',
@@ -4487,7 +4580,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = 
  * (Admin/Finance) see the full count; scoped users see only their
  * hierarchy-unioned slice.
  */
-async function getAttentionSummary({ scope, allowedStages } = {}) {
+async function getAttentionSummary({ scope, allowedStages, filters } = {}) {
   const hasVerticalCol = await hasClientVerticalIdColumn();
   // OFFER MODEL: when tbl_job_offer exists, "pending tech accept" keys off an
   // OPEN offer EXISTS rather than the fk (a pool-offered job keeps fk NULL).
@@ -4528,6 +4621,16 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
         params.push(...v.ids);
       }
     }
+    /*
+     * The dashboard filter bar — the SAME four filters getStatusCounts applies,
+     * from the same builder. The tiles have to narrow with the cards above
+     * them: a bar that visibly filtered the eight funnel cards while this card
+     * kept reporting org-wide numbers would be worse than no bar at all, since
+     * this is the row an operator actually acts on.
+     */
+    const dash = buildDashboardFilters(filters, { jobAlias, addressAlias: 'ad', cityAlias: 'ct' });
+    clauses.push(...dash.clauses);
+    params.push(...dash.params);
     // Job Stage Access — intersect every tile's own status predicate with the
     // caller's visible-status union so the tiles respect the same restriction
     // as the list + counts. References only the job alias → no extra join.
@@ -4544,8 +4647,8 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
     // whenever cities OR states filter is on; tbl_city only for states;
     // tbl_client only for verticals. Each is LEFT JOIN so missing FKs
     // don't drop the row from the count.
-    const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
-    const needsCt = scope?.states?.mode === 'allow';
+    const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow' || dash.needsAddress;
+    const needsCt = scope?.states?.mode === 'allow' || dash.needsCity;
     const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
     const joins = [
       needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
@@ -4562,7 +4665,8 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
   // module top doesn't import the logger; each call-site requires it
   // locally to keep the dependency surface explicit per-feature).
   const logger = require('../logger');
-  logger.info('Compute attention summary · scoped=' + (scope ? 'yes' : 'no'));
+  logger.info('Compute attention summary · scoped=' + (scope ? 'yes' : 'no')
+    + ' · dashFilters=' + (filters && Object.keys(filters).length ? Object.keys(filters).join('+') : '-'));
   async function safeCount(label, sql, params) {
     try {
       const [[row]] = await pool.query(sql, params);
