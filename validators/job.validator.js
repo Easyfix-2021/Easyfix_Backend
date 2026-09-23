@@ -274,7 +274,7 @@ const listQuery = Joi.object({
    * list from client-request.service.js: this schema must not be a second,
    * drifting copy of the bucket names.
    */
-  bucket: Joi.string().valid(...require('../services/booking-queue.service').BUCKETS).optional(),
+  bucket: Joi.string().valid(...require('../services/booking-queue.service').ALL_BUCKET_FILTERS).optional(),
   // The Booking-queue "Rescheduled by customer" flag chip. Distinct from
   // auto_rescheduled (our own after-3pm shift) — this is the customer's ask.
   customerRescheduled: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),

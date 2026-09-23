@@ -132,7 +132,65 @@ function sentSql(alias = 'j') {
   return `${alias}.magic_link_sent_at IS NOT NULL`;
 }
 
+/*
+ * WHAT the customer answered, when they answered.
+ *
+ * tbl_job_customer_request carries the two asks a link can produce — 'cancel'
+ * and 'reschedule' — and a request_status of 'pending' until ops actions it.
+ * The LATEST PENDING row is the live ask: an actioned one has already been
+ * dealt with, and counting it would keep an order in "wants to cancel" after
+ * somebody cancelled it.
+ *
+ * Read exactly as job.service.js's pending_request_type projection reads it
+ * (latest pending, created_at DESC) so the tile and the row's own "Customer
+ * Request" column can never disagree about what the customer asked for.
+ */
+function pendingRequestSql(alias = 'j', type) {
+  return `(SELECT cr_k.request_type FROM tbl_job_customer_request cr_k
+            WHERE cr_k.job_id = ${alias}.job_id AND cr_k.request_status = 'pending'
+            ORDER BY cr_k.created_at DESC LIMIT 1) = '${type}'`;
+}
+
+/*
+ * The three kinds of answer, as ops reads them off the tile:
+ *
+ *   cancel      the customer asked to cancel        — a decision, not a booking
+ *   reschedule  the customer asked for another slot — re-book it
+ *   ready       everything else that answered       — attach an SKU and book
+ *
+ * A PENDING ask wins over a completed form: if a customer filled the link and
+ * then asked to move the date, the ask is the newer fact and the one ops must
+ * act on. `ready` is therefore the remainder, which also means a job can never
+ * fall outside the three — the split always sums to the tile.
+ */
+const RESPONSE_KINDS = ['ready', 'reschedule', 'cancel'];
+
+function responseKindSql(kind, { hasRequestTable = true } = {}) {
+  if (!hasRequestTable) {
+    // No request table on this deploy: nobody can have asked for anything, so
+    // every answer is a completed form. Conservative, and never wrong-headed.
+    return kind === 'ready' ? '1=1' : '1=0';
+  }
+  const cancel = pendingRequestSql('j', 'cancel');
+  const reschedule = pendingRequestSql('j', 'reschedule');
+  switch (kind) {
+    case 'cancel': return `(${cancel})`;
+    case 'reschedule': return `(NOT (${cancel}) OR (${cancel}) IS NULL) AND (${reschedule})`;
+    case 'ready': return `COALESCE(${cancel}, FALSE) = FALSE AND COALESCE(${reschedule}, FALSE) = FALSE`;
+    default: return null;
+  }
+}
+
 const BUCKETS = ['new', 'no_link_needed', 'response_received', 'no_response', 'delivery_failed'];
+
+/*
+ * The three Response-received pills are ALSO grid filters, so clicking one
+ * narrows the rows beneath. They are not tiles, so they live outside BUCKETS
+ * (which the tile list is checked against) but are accepted by the same
+ * `bucket=` parameter — one mechanism, not two.
+ */
+const RESPONSE_SUB_BUCKETS = RESPONSE_KINDS.map((k) => `response_${k}`);
+const ALL_BUCKET_FILTERS = [...BUCKETS, ...RESPONSE_SUB_BUCKETS];
 
 /** Tile order and labels. The CRM may relabel; these are the defaults. */
 const BUCKET_META = [
@@ -159,6 +217,15 @@ function bucketPredicate(bucket, { hasRequestTable = true } = {}) {
   const responded = respondedSql('j', hasRequestTable);
   const failed = failedSql();
   const sent = sentSql();
+
+  // A Response-received sub-filter: the tile's own predicate, narrowed to what
+  // the customer actually asked for.
+  if (typeof bucket === 'string' && bucket.startsWith('response_') && bucket !== 'response_received') {
+    const kind = bucket.slice('response_'.length);
+    if (!RESPONSE_KINDS.includes(kind)) return null;
+    const sub = responseKindSql(kind, { hasRequestTable });
+    return `${optedIn} AND ${responded} AND (${sub})`;
+  }
 
   switch (bucket) {
     case 'no_link_needed':
@@ -305,6 +372,9 @@ async function counts({
         SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
         SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
         SUM(${optedIn} AND ${responded})                                  AS open_responded,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable })}))      AS open_resp_ready,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable })})) AS open_resp_reschedule,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable })}))     AS open_resp_cancel,
         SUM(${optedIn} AND NOT ${responded} AND ${failed})                AS open_failed,
         SUM(${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS open_no_response
        FROM tbl_job j${joins}
@@ -336,6 +406,16 @@ async function counts({
       delivery_failed: n(waitRow && waitRow.open_failed),
     },
     /*
+     * WHAT the customers who answered actually asked for. Sums to
+     * open.response_received, because `ready` is the remainder rather than a
+     * third test — a job cannot answer and match none of the three.
+     */
+    response_breakdown: {
+      ready: n(waitRow && waitRow.open_resp_ready),
+      reschedule: n(waitRow && waitRow.open_resp_reschedule),
+      cancel: n(waitRow && waitRow.open_resp_cancel),
+    },
+    /*
      * The same three, narrowed to the period's links. Only "closed by team"
      * reads this: links.x - period_open.x = how many of TODAY'S links have
      * already been dealt with. Kept separate from `open` above because mixing
@@ -357,6 +437,7 @@ async function counts({
 
 module.exports = {
   BUCKETS, BUCKET_META, PERIODS,
+  RESPONSE_KINDS, RESPONSE_SUB_BUCKETS, ALL_BUCKET_FILTERS, responseKindSql,
   optedInSql, respondedSql, failedSql, sentSql,
   bucketPredicate, periodRange, istToday, counts,
 };

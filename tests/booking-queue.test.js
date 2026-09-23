@@ -166,6 +166,77 @@ test('without tbl_job_customer_request the answer test degrades, it does not bre
   assert.match(sql, /customer_submitted_at IS NOT NULL/, 'the form answer still counts');
 });
 
+/* ── 1b. What the customer answered ──────────────────────────────────────── */
+
+/*
+ * "Response received" is not one thing. "Book me an SKU", "move my date" and
+ * "cancel it" need different work from different people, so the tile splits
+ * three ways — and the split must SUM to the tile, or a customer's answer has
+ * gone missing between the number and the rows.
+ *
+ * `ready` is deliberately the REMAINDER rather than a third positive test: an
+ * order that answered can then never match none of the three.
+ */
+function kindHolds(kind, job) {
+  const sql = bq.responseKindSql(kind);
+  // The pending-request subquery resolves to 'cancel', 'reschedule', or NULL
+  // when the customer asked for nothing. SQL comparisons against NULL are NULL,
+  // which is why the predicates COALESCE — reproduce that here.
+  const pending = job.pending ?? null;
+  const js = sql
+    .replace(/COALESCE\(\(SELECT[\s\S]*?'cancel'\), FALSE\)/g, String(pending === 'cancel'))
+    .replace(/COALESCE\(\(SELECT[\s\S]*?'reschedule'\), FALSE\)/g, String(pending === 'reschedule'))
+    .replace(/\(SELECT[\s\S]*?LIMIT 1\) = 'cancel'/g, pending === null ? 'null' : String(pending === 'cancel'))
+    .replace(/\(SELECT[\s\S]*?LIMIT 1\) = 'reschedule'/g, pending === null ? 'null' : String(pending === 'reschedule'))
+    .replace(/ IS NULL/g, ' === null')
+    .replace(/\bNOT\b/g, '!')
+    .replace(/\bAND\b/g, '&&')
+    .replace(/\bOR\b/g, '||')
+    .replace(/COALESCE\(([^,]+), FALSE\) = FALSE/g, '!($1)')
+    .replace(/1=1/g, 'true').replace(/1=0/g, 'false');
+  // eslint-disable-next-line no-new-func
+  return !!Function(`"use strict"; return (${js});`)();
+}
+
+test('an answer is exactly one of ready / reschedule / cancel', () => {
+  for (const pending of [null, 'cancel', 'reschedule']) {
+    const hit = bq.RESPONSE_KINDS.filter((k) => kindHolds(k, { pending }));
+    assert.equal(hit.length, 1, `pending=${pending} matched ${hit.join(', ') || 'nothing'}`);
+  }
+  assert.ok(kindHolds('ready', { pending: null }), 'no live ask → attach an SKU and book');
+  assert.ok(kindHolds('cancel', { pending: 'cancel' }));
+  assert.ok(kindHolds('reschedule', { pending: 'reschedule' }));
+});
+
+test('each pill is also a grid filter, over the same jobs the tile counts', () => {
+  for (const k of bq.RESPONSE_KINDS) {
+    const sub = bq.bucketPredicate(`response_${k}`);
+    const tile = bq.bucketPredicate('response_received');
+    assert.ok(sub, `response_${k} must be a usable filter`);
+    assert.ok(sub.startsWith(tile), 'a pill narrows the tile — it never selects from somewhere else');
+  }
+  assert.equal(bq.bucketPredicate('response_nonsense'), null, 'an unknown kind is never "unfiltered"');
+});
+
+test('without the request table every answer counts as ready, never as lost', () => {
+  const sub = bq.bucketPredicate('response_ready', { hasRequestTable: false });
+  assert.match(sub, /1=1/, 'all answers fall to ready');
+  for (const k of ['reschedule', 'cancel']) {
+    assert.match(bq.bucketPredicate(`response_${k}`, { hasRequestTable: false }), /1=0/,
+      'nobody can have asked for anything, so these are empty rather than wrong');
+  }
+});
+
+test('the breakdown sums to the Response-received tile', async () => {
+  const board = { ...WAIT_ROW, open_responded: 3, open_resp_ready: 0,
+    open_resp_reschedule: 2, open_resp_cancel: 1 };
+  const out = await bq.counts({ db: countsPool({ sent: 0 }, board).pool });
+  const b = out.response_breakdown;
+  assert.deepEqual(b, { ready: 0, reschedule: 2, cancel: 1 }, 'measured on QA');
+  assert.equal(b.ready + b.reschedule + b.cancel, out.open.response_received,
+    'an answer that belongs to no pill has gone missing between the tile and the rows');
+});
+
 /* ── 2. The period window, in IST ────────────────────────────────────────── */
 
 const IST = (s) => new Date(new Date(`${s}+05:30`).toISOString());
