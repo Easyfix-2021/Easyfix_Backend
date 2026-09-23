@@ -2792,6 +2792,26 @@ function buildDashboardFilters(filters, { jobAlias = 'j', addressAlias = 'ad', c
   }
 
   /*
+   * Vertical — the job's client is mapped to this vertical in
+   * tbl_vertical_mapping. Same EXISTS shape as list()'s verticalId filter, and
+   * the same reason it is an EXISTS: a client maps to several verticals, so a
+   * JOIN would multiply the row and inflate every count on the page.
+   *
+   * Note this deliberately does NOT constrain user_type — a client is in a
+   * vertical regardless of who the SPOC is. That is what separates it from the
+   * Project Manager predicate above, which pins user_type = 1.
+   */
+  const verticalIds = toIdArray(filters.verticalId);
+  if (verticalIds.length) {
+    clauses.push(
+      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm`
+      + ` WHERE vm.client_id = ${jobAlias}.fk_client_id`
+      + ` AND vm.vertical_id IN (${verticalIds.map(() => '?').join(',')}))`
+    );
+    params.push(...verticalIds);
+  }
+
+  /*
    * Zonal Manager — the tbl_user who owns the job's CITY (tbl_city.state_user),
    * reached through the job's address. NOT `zonalId`, which the jobs list reads
    * as a tbl_zone_master zone; see ZONAL_ID_COLLISION in job-export.service.js.
@@ -3286,9 +3306,15 @@ async function list({
   // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
   // JOIN because it short-circuits on first match per row and avoids
   // row multiplication when a client maps to multiple verticals.
-  if (verticalId != null) {
-    clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
-    params.push(verticalId);
+  /*
+   * `verticalId` widened to a CSV on 2026-09-23 (was a lone id) so the dashboard
+   * bar's Verticals multi-select can send what its three siblings already send.
+   * toIdArray keeps a single id valid, so every pre-existing caller is unchanged.
+   */
+  const verticalIdList = toIdArray(verticalId);
+  if (verticalIdList.length) {
+    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id IN (${verticalIdList.map(() => '?').join(',')}))`);
+    params.push(...verticalIdList);
   }
   // Project Manager — the PM is the user mapped to the job's client in
   // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId

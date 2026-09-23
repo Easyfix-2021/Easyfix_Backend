@@ -655,7 +655,7 @@ const FILTER_COVERAGE = Object.freeze({
   pin:              ['filter',   'A.pin_code LIKE %v%'],
   stateId:          ['filter',   'city.state_id = ? (shared name)'],
   categoryId:       ['filter',   'J.fk_service_catg_id = ?'],
-  verticalId:       ['filter',   'EXISTS tbl_vertical_mapping — independent of the verticals SCOPE'],
+  verticalId:       ['filter',   'EXISTS tbl_vertical_mapping, id OR CSV — independent of the verticals SCOPE'],
   sourceType:       ['filter',   'J.source_type = ?'],
   rating:           ['filter',   'TERBC.customer_rating (shared name; legacy predicate)'],
   reopen:           ['filter',   'J.job_reopen_flag'],
@@ -1181,8 +1181,24 @@ function buildClauses(filters = {}) {
    * written against the V join can never both hold for different ids, and the
    * sheet comes back empty with nothing to explain it.
    */
-  if (Number(verticalId) > 0) {
-    push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.vertical_id = ?)', Number(verticalId));
+  /*
+   * CSV-aware since 2026-09-23, when listQuery's verticalId was widened from a
+   * lone id to csvIds for the dashboard bar's Verticals multi-select.
+   *
+   * The old gate was `Number(verticalId) > 0`, and Number('3,7') is NaN, so a
+   * two-vertical selection made this predicate VANISH — the sheet came back
+   * with every vertical in it and nothing said so, because verticalId is
+   * ledgered 'filter' in FILTER_COVERAGE and therefore never appears in the
+   * route's "cannot apply these filters" warning. That is verbatim the failure
+   * toIdArray's own docblock above describes for clientId. One toIdArray call
+   * is the whole fix, and it keeps a lone id working exactly as before.
+   */
+  const verticalIdList = toIdArray(verticalId);
+  if (verticalIdList.length) {
+    push(
+      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.vertical_id IN (${verticalIdList.map(() => '?').join(', ')}))`,
+      ...verticalIdList,
+    );
   }
   // Project Manager — the user mapped to the job's client with user_type = 1.
   // Self-contained EXISTS, same shape as list().

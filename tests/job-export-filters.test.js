@@ -192,8 +192,34 @@ test('the verticalId FILTER stays independent of the verticals SCOPE', () => {
    * EMPTY with nothing in it to explain why.
    */
   const w = where({ scope: SCOPE, verticalId: 3 });
-  assert.match(w, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id = \?\)/);
+  assert.match(w, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id IN \(\?\)\)/);
   assert.match(w, /CL\.vertical_id IN \(\?\)/);
+});
+
+/*
+ * THE RECORDED BUG (2026-09-23). listQuery's verticalId was widened from a lone
+ * id to csvIds for the dashboard bar's Verticals multi-select. This predicate
+ * was gated on `Number(verticalId) > 0`, and Number('3,7') is NaN — so a
+ * two-vertical selection made the clause VANISH and the sheet came back with
+ * every vertical in it.
+ *
+ * It was silent from every direction: validation passed (a CSV is legal now),
+ * the grid on screen was filtered correctly, and the route's "cannot apply
+ * these filters" warning stayed quiet because verticalId is ledgered 'filter'
+ * in FILTER_COVERAGE and so is never in UNAPPLIED_FILTERS. The only symptom was
+ * an export that did not match the table it was exported from.
+ *
+ * The fixture above and at the coverage table both use a SINGLE id, which is
+ * why the suite would not have caught it. This is the multi case.
+ */
+test('THE RECORDED BUG: a CSV verticalId still emits its clause, with every id bound', () => {
+  const w = where({ verticalId: '3,7' });
+  assert.match(
+    w,
+    /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id IN \(\?, \?\)\)/,
+    'a two-vertical selection must not silently drop the filter: ' + w,
+  );
+  assert.equal((w.match(/tbl_vertical_mapping/g) || []).length, 1, 'one EXISTS, not two');
 });
 
 test('cityId and the cities scope filter the SAME column', () => {
