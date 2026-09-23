@@ -16,7 +16,7 @@ const service = require('../services/quicksight/quicksight-dynamic-reports.servi
 
 const {
   normalizeColumns, normalizeChart, parseUpload, pageRows, chartData, purgeQuery,
-  canSee, canEdit, sameColumns, reportWorkbook,
+  canSee, canEdit, canTransferOwner, sameColumns, reportWorkbook,
 } = service._internal;
 
 const COLUMNS = [
@@ -153,4 +153,30 @@ test('audience and ownership', () => {
   assert.equal(canEdit(report, owner), true);
   assert.equal(canEdit(report, { ...owner, canManage: false }), false);   // owner without the key
   assert.equal(canEdit(report, admin), true);
+});
+
+test('transferring ownership follows the OWNER and the email allowlist, never a role', () => {
+  /*
+   * The case this exists for is an owner who LOST QuickSight access, so the
+   * rescue must not sit behind a role grant that the same reorganisation can
+   * revoke. Hence: the Admin KEY does NOT grant it, even though an admin can
+   * otherwise edit, upload to and archive every report.
+   */
+  const report = { created_by: 7 };
+  const owner    = { userId: 7, roleId: 9, isAdmin: false, canManage: true,  onOwnerAllowlist: false };
+  const admin    = { userId: 2, roleId: 2, isAdmin: true,  canManage: true,  onOwnerAllowlist: false };
+  const listed   = { userId: 4, roleId: 5, isAdmin: false, canManage: false, onOwnerAllowlist: true };
+  const stranger = { userId: 9, roleId: 5, isAdmin: false, canManage: true,  onOwnerAllowlist: false };
+
+  assert.equal(canTransferOwner(report, owner), true, 'the owner may hand over their own report');
+  assert.equal(canTransferOwner(report, listed), true, 'a named operator may rescue any report');
+  assert.equal(canTransferOwner(report, admin), false, 'the Admin key must NOT grant transfer');
+  assert.equal(canTransferOwner(report, stranger), false);
+
+  // The Admin key keeps every OTHER power over the same report.
+  assert.equal(canEdit(report, admin), true);
+  assert.equal(canSee(report, [3], admin), true);
+  // An allowlisted rescuer outside the audience still cannot browse it — that
+  // is why transferOwner() must not run the audience check.
+  assert.equal(canSee(report, [3], listed), false);
 });
