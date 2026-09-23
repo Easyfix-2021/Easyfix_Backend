@@ -71,7 +71,9 @@
  * 'legacy'   exact build_data.py: employee.team is the EARLIEST month's team,
  *            D.teamMembers comes from the LATEST month's team, a member
  *            inherits the lead of their earliest-month team for the whole
- *            window. Kept for the golden parity test.
+ *            window. Kept for the golden parity test — including that script's
+ *            six-key daily row, so the closed-job split columns below
+ *            (CLOSED_SPLIT_FIELD) are perMonth's, not legacy's.
  * 'perMonth' (default; owner decision 5) every date uses THAT month's roster:
  *            - a team's lead in month M is the primary SPOC on M's roster in
  *              that team with the largest Target Amount for M (ties: name);
@@ -441,28 +443,71 @@ function bucket(z, ag) {
   else z.a9 += 1;
 }
 
+/*
+ * ─── THE CLOSED-JOB SPLIT (daily rows: compOem / compRet / compRel) ─────────
+ *
+ * The current MIS dashboard's Daily Revenue table counts a day's closed jobs in
+ * three columns beside the revenue — "Closed Jobs — OEM (Furniture, Sports)",
+ * "Closed Jobs — Retail Maintenance", "Closed Jobs — Relocation" — so each
+ * daily row carries them next to `completed`.
+ *
+ * MATCHING. The vertical is compared exactly as every other vertical in this
+ * file is (the Unattributed buckets, zmBreakdown, the zonal rows): the string
+ * the row already carries, which reaches compose() trimmed on both paths —
+ * sval() strips it out of the workbook, sources.service.js trims the live job's
+ * Vertical Name. There is deliberately no second, looser rule here (no
+ * lower-casing, no fuzzy match): a vertical spelled differently upstream is a
+ * data problem to fix upstream, not one to paper over in two places.
+ *
+ * THE THREE DO NOT PARTITION `completed`. A closed job in any other vertical
+ * (Easyfix, Amazon, Admin, IT, HR, oprations …) counts in `completed` and in
+ * none of the three, so completed >= compOem + compRet + compRel, and the gap
+ * is real work, not a rounding artefact. That is the dashboard's own behaviour;
+ * anything reading these columns must not treat them as a breakdown of a total.
+ */
+const CLOSED_SPLIT_FIELD = new Map([
+  ['Furniture', 'compOem'],
+  ['Sports', 'compOem'],
+  ['Retail Maintenance', 'compRet'],
+  ['Relocation', 'compRel'],
+]);
+// Key order is the dashboard's column order, and the daily row's.
+const newSplit = () => ({ compOem: 0, compRet: 0, compRel: 0 });
+const ZERO_SPLIT = Object.freeze(newSplit());
+
 /**
  * build_data.py order_block() over explicit row sets. `c`/`o` are the closed
  * and open rows of the block in feed order, `targetFor(date)` the daily target,
- * `pmoc` the name written on openRows.
+ * `pmoc` the name written on openRows. `opts.zonal` adds the zonal/margin/zms
+ * keys a top-level block carries; `opts.splits` adds the three closed-job
+ * columns of the current dashboard to every daily row (see CLOSED_SPLIT_FIELD).
  */
-function buildBlock(c, o, targetFor, pmoc, dates, withZonal) {
+function buildBlock(c, o, targetFor, pmoc, dates, opts) {
+  const withZonal = opts.zonal;
+  const withSplits = opts.splits;
   const b = {};
   b.revenue = npSum(c.map((r) => r.charge));
   b.completed = c.length;
   b.open = o.length;
 
   const revByDate = new Map();
+  const splitByDate = new Map();
   for (const r of c) {
     if (r.date === null) continue;
     kahanAdd(mapGetOrSet(revByDate, r.date, kahanNew), r.charge);
+    if (!withSplits) continue;
+    const field = CLOSED_SPLIT_FIELD.get(r.vertical);
+    if (field !== undefined) mapGetOrSet(splitByDate, r.date, newSplit)[field] += 1;
   }
   b.daily = dates.map((d) => {
     const t = targetFor(d);
     const agg = revByDate.get(d);
     const rv = agg ? agg.sum : 0;
-    return { date: d, target: t, revenue: rv, pct: pctOrZero(rv, t), due: Math.max(t - rv, 0),
+    const row = { date: d, target: t, revenue: rv, pct: pctOrZero(rv, t), due: Math.max(t - rv, 0),
       completed: agg ? agg.n : 0 };
+    if (!withSplits) return row;
+    const s = splitByDate.get(d) || ZERO_SPLIT;
+    return { ...row, compOem: s.compOem, compRet: s.compRet, compRel: s.compRel };
   });
 
   const clients = new Map();
@@ -787,6 +832,16 @@ function buildLegacy(ctx, rosterRows) {
     const byMonth = T.daily.get(name);
     return (d) => (byMonth && byMonth.has(d.slice(0, 7)) ? byMonth.get(d.slice(0, 7)) : 0);
   };
+  /*
+   * splits: false throughout legacy mode. This mode exists for ONE reason — to
+   * reproduce, byte for byte, the build_data.py the golden fixture was made
+   * with (tests/quicksight-ep-compose.test.js), and THAT script's daily row had
+   * six keys, not nine. Emitting compOem/compRet/compRel here would not make
+   * the port more faithful, it would make it less. The live pipeline is
+   * perMonth (live.service.js), and that is where the columns are built.
+   * When the fixture is regenerated from the MIS script that writes these
+   * columns, turn them on here in the same commit as the new fixture.
+   */
   const orderBlock = (name, zm, withZonal) => {
     let c = ctx.closedBySpoc.get(name) || [];
     let o = ctx.openBySpoc.get(name) || [];
@@ -794,10 +849,10 @@ function buildLegacy(ctx, rosterRows) {
       c = c.filter((r) => r.zm === zm);
       o = o.filter((r) => r.zm === zm);
     }
-    return buildBlock(c, o, dailyFor(name), name, dates, withZonal);
+    return buildBlock(c, o, dailyFor(name), name, dates, { zonal: withZonal, splits: false });
   };
 
-  const emptyBlock = buildBlock([], [], () => 0, '', dates, false);
+  const emptyBlock = buildBlock([], [], () => 0, '', dates, { zonal: false, splits: false });
   const spocBlocks = new Map(primarySpocs.map((n) => [n, orderBlock(n, null, true)]));
   const totalOf = (n) => (T.total.has(n) ? T.total.get(n) : 0);
   const leadOfTeam = new Map();
@@ -936,16 +991,21 @@ function buildPerMonth(ctx, rosterRows) {
       return lead ? monthVal(T.daily, lead, monthOf(d)) : 0;
     };
     const pmoc = src.openLead || '';
-    const block = buildBlock(c, o, targetFor, pmoc, dates, true);
+    const block = buildBlock(c, o, targetFor, pmoc, dates, { zonal: true, splits: true });
+    // The byZm slices carry the splits too: with a Zonal Manager selected the
+    // dashboard reads this block's `daily` instead of the unsliced one, and
+    // three columns of zeros there would be a lie, not a filter.
     const byZm = {};
     for (const zm of block.zms) {
       setOwn(byZm, zm, pickByZm(buildBlock(c.filter((r) => r.zm === zm), o.filter((r) => r.zm === zm),
-        targetFor, pmoc, dates, false)));
+        targetFor, pmoc, dates, { zonal: false, splits: true })));
     }
     return { block, byZm };
   });
 
-  const emptyBlock = buildBlock([], [], () => 0, '', dates, false);
+  // Every perMonth daily row has the same nine keys, this one included, so a
+  // table never meets an undefined column on the one employee with no source.
+  const emptyBlock = buildBlock([], [], () => 0, '', dates, { zonal: false, splits: true });
   const employees = new Map();
   for (const key of included) {
     const e = meta.get(key);
@@ -1004,11 +1064,14 @@ function buildPerMonth(ctx, rosterRows) {
       const key = unattributedKey(vertical);
       const c = unClosed.filter((r) => r.vertical === vertical);
       const o = unOpen.filter((r) => r.vertical === vertical);
-      const blk = buildBlock(c, o, () => 0, UNATTRIBUTED, dates, true);
+      // A bucket's jobs are the company's jobs: they count in the three closed
+      // columns exactly as a person's do, or a day's OEM total would drop the
+      // moment a SPOC stopped being on the roster.
+      const blk = buildBlock(c, o, () => 0, UNATTRIBUTED, dates, { zonal: true, splits: true });
       const byZm = {};
       for (const zm of blk.zms) {
         setOwn(byZm, zm, pickByZm(buildBlock(c.filter((r) => r.zm === zm), o.filter((r) => r.zm === zm),
-          () => 0, UNATTRIBUTED, dates, false)));
+          () => 0, UNATTRIBUTED, dates, { zonal: false, splits: true })));
       }
       bucketKeys.push(key);
       bucketOpen.set(key, o);

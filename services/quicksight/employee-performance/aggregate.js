@@ -59,6 +59,13 @@
  *     member detail leave them out. The string never occurs in the MIS data
  *     the parity fixture is built from, so excluding it by key cannot move a
  *     single parity number.
+ *   - The daily rows carry the current dashboard's three closed-job columns
+ *     (compOem / compRet / compRel — see compose.js CLOSED_SPLIT_FIELD)
+ *     alongside `completed`, summed across the selected SPOCs the same way.
+ *     They are ADDED keys: the parity oracle in assets/ is the dashboard
+ *     revision whose Daily Revenue table still shows Closed Jobs / % Achieved /
+ *     Due, and it reads none of them, so no parity number moves. Over a D
+ *     without them (legacy compose, an older cached snapshot) they read 0.
  *   - Current TX Performance groups a technician by (TX name, TX ID) only. The
  *     page grouped by (SPOC, TX name, TX ID), which listed one technician
  *     twice — same TX ID, same name, no SPOC column to tell the rows apart —
@@ -190,9 +197,17 @@ function aggregate(D, nf, ns, ds) {
     a.open += e.open || 0;
     list(e.daily).forEach((x) => {
       if (!ds.has(x.date)) return;
-      if (!a.daily[x.date]) a.daily[x.date] = { date: x.date, target: 0, revenue: 0, completed: 0 };
+      // compOem/compRet/compRel are the page's three closed-job columns (see
+      // compose.js CLOSED_SPLIT_FIELD), summed across the selected SPOCs the
+      // way `completed` is. `|| 0` is the page's own guard, and is what a D
+      // whose daily rows stop at `completed` (legacy compose, an older cached
+      // snapshot) falls through on: the columns read 0 there, never NaN.
+      if (!a.daily[x.date]) {
+        a.daily[x.date] = { date: x.date, target: 0, revenue: 0, completed: 0, compOem: 0, compRet: 0, compRel: 0 };
+      }
       const z = a.daily[x.date];
       z.target += x.target || 0; z.revenue += x.revenue || 0; z.completed += x.completed || 0;
+      z.compOem += x.compOem || 0; z.compRet += x.compRet || 0; z.compRel += x.compRel || 0;
     });
     list(e.clients).forEach((x) => {
       if (!hasOwn(a.clients, x.client)) a.clients[x.client] = { client: x.client, total: 0, completed: 0, open: 0, a02: 0, a35: 0, a68: 0, a9: 0, age: 0, n: 0 };
@@ -487,8 +502,13 @@ function buildSummary(D, filters) {
       teamSize,
     },
     team,
+    // The Daily Revenue table. `completed` is the day's closed jobs whatever
+    // their vertical; compOem/compRet/compRel are the three columns the page
+    // shows beside the revenue, and they do NOT add up to `completed` — a
+    // closed job in any other vertical is in neither of the three.
     daily: d.daily.map((x) => ({
       date: x.date, target: x.target, revenue: x.revenue, completed: x.completed,
+      compOem: x.compOem, compRet: x.compRet, compRel: x.compRel,
       pct: x.target ? x.revenue / x.target * 100 : 0,
       due: Math.max(x.target - x.revenue, 0),
     })),
