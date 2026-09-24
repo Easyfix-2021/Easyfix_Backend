@@ -15,7 +15,7 @@ const loginOtpRequest = Joi.object({
 const verifyOtpRequest = Joi.object({
   identifier: identifierSchema.required(),
   otp: Joi.alternatives().try(
-    Joi.number().integer().min(1000).max(9999),
+    Joi.number().integer().min(0).max(9999),
     Joi.string().pattern(/^[0-9]{4}$/)
   ).required(),
 });

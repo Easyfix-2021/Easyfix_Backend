@@ -47,7 +47,7 @@ router.post('/auth/login-otp', validate(Joi.object({ identifier: identifier.requ
 
 router.post('/auth/verify-otp', validate(Joi.object({
   identifier: identifier.required(),
-  otp: Joi.number().integer().min(1000).max(9999).required(),
+  otp: Joi.number().integer().min(0).max(9999).required(),
 })), async (req, res, next) => {
   try {
     logger.info('SPOC verify-OTP attempt');
