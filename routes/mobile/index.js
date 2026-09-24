@@ -149,7 +149,7 @@ router.post('/auth/login-otp', loginOtpIpRateLimit, loginOtpMobileRateLimit, val
 // Our modern envelope wraps the same fields under { success, data }.
 router.post('/auth/verify-otp', verifyOtpIpRateLimit, verifyOtpMobileRateLimit, validate(Joi.object({
   mobile:        mobile.required(),
-  otp:           Joi.number().integer().min(1000).max(9999).required(),
+  otp:           Joi.number().integer().min(0).max(9999).required(),
   // Optional device fields — when present, the device is registered for push
   // notifications inside this same call. fireBaseToken is the legacy name;
   // fcmToken is the new one. Accept either, prefer the explicit fcmToken.

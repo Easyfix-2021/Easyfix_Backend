@@ -155,3 +155,13 @@ test('with tbl_attempt_window all four limiters count SHARED, each with its own 
     ]);
   } finally { S.table = false; store._resetProbeCache(); }
 });
+
+test('verify-otp accepts leading-zero OTPs (QA last-4 of …0019) and still rejects 5 digits', () => {
+  const { schema } = verifyMiddlewares()[2]._openapi;
+  for (const otp of ['0019', 19, '0000', 9999]) {
+    assert.equal(schema.validate({ mobile: '8826730019', otp }).error, undefined, `otp ${otp} must pass`);
+  }
+  assert.ok(schema.validate({ mobile: '8826730019', otp: 10000 }).error, '5-digit OTP must fail');
+  const { verifyOtpRequest } = require('../validators/auth.validator');
+  assert.equal(verifyOtpRequest.validate({ identifier: '8826730019', otp: 19 }).error, undefined);
+});
