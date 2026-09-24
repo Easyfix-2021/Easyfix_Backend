@@ -407,6 +407,11 @@ async function tryEmail({ email, otp, contextLabel = 'login' }) {
  *                    failing the request.
  */
 async function deliverOtp({ identifier, email, mobile, name, otp, contextLabel = 'login' }) {
+  // otp_details.otp is INT, so a leading zero is lost at the source: on QA the
+  // deterministic OTP for …0019 is the number 19. Always send the 4 digits the
+  // app's 4-box input (and the Android SMS Retriever) expect. Verify compares
+  // Number(row.otp) === Number(typed), so "0019" still matches.
+  otp = String(otp).padStart(4, '0');
   const identifierIsEmail = /@/.test(String(identifier || ''));
   // A valid app hash means the Android build is ready to auto-read only an SMS.
   // Force the technician MOBILE flow into bounded two-channel delivery so an

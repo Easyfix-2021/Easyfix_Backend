@@ -161,3 +161,11 @@ test('unset Retriever hash preserves the historical admin-selected fallback path
   assert.deepEqual(result.attempts.map((attempt) => attempt.channel), ['whatsapp']);
   assert.equal(sentSms.length, 0);
 });
+
+test('a leading-zero OTP (QA last-4 of …0019 = INT 19) is sent as 4 digits', async () => {
+  await deliverOtp({
+    identifier: '8826730019', mobile: '8826730019', email: null,
+    name: 'Staff', otp: 19, contextLabel: 'staff',
+  });
+  assert.equal(sentSms[0].message, 'Dear Customer, Your OTP is 0019 - Team EasyFix');
+});
