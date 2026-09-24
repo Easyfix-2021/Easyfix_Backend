@@ -1220,9 +1220,17 @@ function buildClauses(filters = {}) {
      * not the master name alone — same reason list() does: otherwise typing
      * the name visible on screen returns nothing for every job that overrides
      * it.
+     *
+     * A phone-shaped term takes list()'s prefix set lookup (2026-09-24), so the
+     * sheet holds exactly the rows the grid showed for the same search.
      */
-    const v = `%${String(customerQ).trim()}%`;
-    push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR C.customer_mob_no LIKE ?)`, v, v);
+    const mobileTerm = String(customerQ).replace(/[\s+-]/g, '');
+    if (/^\d+$/.test(mobileTerm) && mobileTerm.length >= MOBILE_MIN_DIGITS) {
+      push('J.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)', `${mobileTerm}%`);
+    } else {
+      const v = `%${String(customerQ).trim()}%`;
+      push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR C.customer_mob_no LIKE ?)`, v, v);
+    }
   }
 
   if (notEmpty(sourceType)) push('J.source_type = ?', String(sourceType));

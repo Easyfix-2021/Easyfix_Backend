@@ -194,7 +194,9 @@ const listQuery = Joi.object({
   customerId: intId.optional(),
   // Legacy "Filter Job" panel parity (2026-05-19). Each one is
   // narrow + cheap (single column LIKE or FK eq). See service.list().
-  customerQ:  Joi.string().min(1).max(100).optional(),
+  // customerQ min 3 (2026-09-24): a 1-2 char name term full-scans tbl_job for
+  // near-every row; the CRM withholds it below 3, this guards other callers.
+  customerQ:  Joi.string().trim().min(3).max(100).optional(),
   clientRef:  Joi.string().min(1).max(100).optional(),
   efrMobile:  Joi.string().min(1).max(20).optional(),
   pin:        Joi.string().min(1).max(10).optional(),
