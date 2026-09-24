@@ -196,6 +196,38 @@ test('txRows without their dates copy count as spanning D.dates', () => {
   }
 });
 
+/*
+ * The Current TX Performance grouping key is feed-dependent, and the parity
+ * fixture cannot see it: build_data.py never emits an Unattributed bucket, so
+ * the dashboard comparison only ever exercises the snapshot branch.
+ */
+test('technicians: the snapshot feed keeps the page\'s (spoc, tx, txid) grouping', () => {
+  const d = syntheticD();
+  // One technician, same TX ID and name, working under two different SPOCs.
+  const base = d.txRows[0];
+  d.txRows = [
+    { ...base, spoc: 'Asha', total: 3, closed: 1, open: 2, ageSum: 9 },
+    { ...base, spoc: 'Bharat', total: 5, closed: 2, open: 3, ageSum: 12 },
+  ];
+  const rows = agg.listTechnicians(d, {}, {});
+  assert.equal(rows.length, 2, 'no Unattributed bucket: the page splits them, so we must too');
+  assert.deepEqual(rows.map((r) => [r.spoc, r.total]), [['Asha', 3], ['Bharat', 5]]);
+});
+
+test('technicians: the live feed merges a technician across SPOCs, because the bucket splits them', () => {
+  const d = syntheticD();
+  // compose.js puts the bucket in primarySpocs; that is what marks the feed.
+  d.primarySpocs = [...d.primarySpocs, 'Unattributed — Furniture'];
+  const base = d.txRows[0];
+  d.txRows = [
+    { ...base, spoc: 'Asha', total: 3, closed: 1, open: 2, ageSum: 9 },
+    { ...base, spoc: 'Unattributed — Furniture', total: 5, closed: 2, open: 3, ageSum: 12 },
+  ];
+  const rows = agg.listTechnicians(d, {}, {});
+  assert.equal(rows.length, 1, 'one technician, one row — not two rows with the same TX ID and name');
+  assert.deepEqual([rows[0].txId, rows[0].total, rows[0].closed, rows[0].open], [base.txid, 8, 3, 5]);
+});
+
 test('member detail: unknown and prototype names are null; only month and dates apply', () => {
   for (const name of ['Hari', 'Nobody', '__proto__', 'constructor', 'toString', undefined, 42]) {
     assert.equal(agg.memberDetail(D, {}, name), null, String(name));
@@ -241,6 +273,75 @@ test('an empty or partial D yields zeros, not a throw', () => {
     assert.equal(agg.memberDetail(empty, {}, 'X'), null);
     assert.deepEqual(agg.buildOptions(empty).employees, []);
   }
+});
+
+/* ── the closed-job split columns ─────────────────────────────────────────── */
+
+/*
+ * compose.js puts compOem / compRet / compRel on every daily row: the current
+ * dashboard's three Closed Jobs columns (OEM = Furniture + Sports, Retail
+ * Maintenance, Relocation). The parity fixture and the page in assets/ are the
+ * revision BEFORE those columns, so the tests here are the only ones that see
+ * them. What has to hold: they are summed across the selected SPOCs exactly as
+ * `completed` is, a Zonal Manager reads them off that SPOC's slice, and a D
+ * without them reads 0 rather than NaN.
+ */
+function withSplits() {
+  const d = syntheticD();
+  const put = (e, oem, ret, rel) => e.daily.forEach((x, i) => {
+    x.compOem = oem[i]; x.compRet = ret[i]; x.compRel = rel[i];
+  });
+  // Per day, the three never exceed that row's `completed` — the leftover is
+  // the day's closed jobs in some other vertical (Easyfix, Admin, …).
+  put(d.employees.Asha, [1, 2, 0, 2, 0], [0, 1, 1, 0, 0], [0, 0, 0, 1, 0]);    // completed [1,3,1,4,0]
+  put(d.employees.Bharat, [1, 0, 0, 0, 1], [0, 0, 1, 0, 0], [1, 0, 0, 0, 0]);  // completed [2,0,1,0,1]
+  put(d.employees.Chitra, [0, 0, 1, 0, 1], [0, 0, 1, 0, 0], [0, 0, 0, 1, 0]);  // completed [0,0,2,1,1]
+  return d;
+}
+
+const splitsOf = (s) => s.daily.map((x) => [x.completed, x.compOem, x.compRet, x.compRel]);
+
+test('the three closed-job columns sum across the selected SPOCs, like completed', () => {
+  const d = withSplits();
+
+  assert.deepEqual(splitsOf(agg.buildSummary(d, {})), [
+    [3, 2, 0, 1], [3, 2, 1, 0], [4, 1, 3, 0], [5, 2, 0, 2], [2, 2, 0, 0],
+  ], 'Asha + Bharat + Chitra (Dev has no employee row)');
+
+  // A vertical narrows the SPOCs, so it narrows the columns with them.
+  assert.deepEqual(splitsOf(agg.buildSummary(d, { verticals: ['Furniture'] })), [
+    [1, 1, 0, 0], [3, 2, 1, 0], [3, 1, 2, 0], [5, 2, 0, 2], [1, 1, 0, 0],
+  ], 'Asha + Chitra');
+
+  // …and a date range drops whole rows, never re-splits the ones it keeps.
+  assert.deepEqual(splitsOf(agg.buildSummary(d, { from: '2026-09-01', to: '2026-09-02' })), [
+    [4, 1, 3, 0], [5, 2, 0, 2],
+  ]);
+
+  // The columns are counts of the SAME closed jobs `completed` counts, so they
+  // can never exceed it — but they do not have to add up to it either.
+  const rows = agg.buildSummary(d, {}).daily;
+  assert.ok(rows.every((x) => x.compOem + x.compRet + x.compRel <= x.completed));
+  assert.ok(rows.some((x) => x.compOem + x.compRet + x.compRel < x.completed), 'a day with jobs in another vertical');
+});
+
+test('a Zonal Manager reads the three columns off that SPOC\'s slice', () => {
+  const d = withSplits();
+  // Asha's Zed slice is a subset of her day — one of her two 09-02 OEM jobs
+  // was Yan's — and Bharat has no Zed block at all, so the page's fallback
+  // contributes an empty daily list and no columns.
+  d.employees.Asha.byZm.Zed.daily.forEach((x, i) => {
+    x.compOem = [1, 2, 0, 1, 0][i]; x.compRet = [0, 1, 0, 0, 0][i]; x.compRel = [0, 0, 0, 1, 0][i];
+  });
+  assert.deepEqual(splitsOf(agg.buildSummary(d, { zm: 'Zed', employees: ['Asha'] })), [
+    [1, 1, 0, 0], [3, 2, 1, 0], [0, 0, 0, 0], [4, 1, 0, 1], [0, 0, 0, 0],
+  ], 'the slice, not the unsliced block');
+});
+
+test('a D whose daily rows stop at completed reads the three columns as 0', () => {
+  // An older cached snapshot, or a legacy-composed D. The page's own `||0`.
+  const rows = agg.buildSummary(syntheticD(), {}).daily;
+  assert.deepEqual(rows.map((x) => [x.compOem, x.compRet, x.compRel]), rows.map(() => [0, 0, 0]));
 });
 
 /* ── month-aware rosters (owner decision: each month uses that month's team) ── */

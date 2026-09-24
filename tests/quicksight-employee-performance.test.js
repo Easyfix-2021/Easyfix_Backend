@@ -134,3 +134,8 @@ test('round trip: upload → meta → the stored D, script-safe', async () => {
   assert.deepEqual(JSON.parse(stored), hostile, 'D is stored unchanged');
   assert.deepEqual(await service.getSnapshotD(), hostile);
 });
+
+// Dropped in this merge: 'the shipped template has the line the data is injected
+// into' and 'the page signals the CRM when it is drawn' — dashboardTemplate,
+// getDashboardHtml and READY_MESSAGE were retired with /dashboard on Production,
+// so there is no composed page left for either to assert against.

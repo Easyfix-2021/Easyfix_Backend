@@ -21,7 +21,9 @@
  * dashboard's own aggregation, parity-tested); these routes only parse the
  * query, load the cached snapshot and call it. All are Cache-Control no-store
  * and 404 'No Employee Performance data has been uploaded yet' (details.code
- * NO_SNAPSHOT) until something is uploaded.
+ * NO_SNAPSHOT) until something is uploaded. These replaced /dashboard — the
+ * composed ~6.5 MB page and its postMessage "drawn" signal — which is retired
+ * and must not come back: dashboard.html now lives only as the parity fixture.
  *
  *   GET /options                                   → aggregate.buildOptions(D)
  *   GET /summary?<filters>                         → aggregate.buildSummary(D, filters)

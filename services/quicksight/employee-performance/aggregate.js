@@ -59,6 +59,13 @@
  *     member detail leave them out. The string never occurs in the MIS data
  *     the parity fixture is built from, so excluding it by key cannot move a
  *     single parity number.
+ *   - The daily rows carry the current dashboard's three closed-job columns
+ *     (compOem / compRet / compRel — see compose.js CLOSED_SPLIT_FIELD)
+ *     alongside `completed`, summed across the selected SPOCs the same way.
+ *     They are ADDED keys: the parity oracle in assets/ is the dashboard
+ *     revision whose Daily Revenue table still shows Closed Jobs / % Achieved /
+ *     Due, and it reads none of them, so no parity number moves. Over a D
+ *     without them (legacy compose, an older cached snapshot) they read 0.
  *   - Current TX Performance groups a technician by (TX name, TX ID) only. The
  *     page grouped by (SPOC, TX name, TX ID), which listed one technician
  *     twice — same TX ID, same name, no SPOC column to tell the rows apart —
@@ -190,9 +197,17 @@ function aggregate(D, nf, ns, ds) {
     a.open += e.open || 0;
     list(e.daily).forEach((x) => {
       if (!ds.has(x.date)) return;
-      if (!a.daily[x.date]) a.daily[x.date] = { date: x.date, target: 0, revenue: 0, completed: 0 };
+      // compOem/compRet/compRel are the page's three closed-job columns (see
+      // compose.js CLOSED_SPLIT_FIELD), summed across the selected SPOCs the
+      // way `completed` is. `|| 0` is the page's own guard, and is what a D
+      // whose daily rows stop at `completed` (legacy compose, an older cached
+      // snapshot) falls through on: the columns read 0 there, never NaN.
+      if (!a.daily[x.date]) {
+        a.daily[x.date] = { date: x.date, target: 0, revenue: 0, completed: 0, compOem: 0, compRet: 0, compRel: 0 };
+      }
       const z = a.daily[x.date];
       z.target += x.target || 0; z.revenue += x.revenue || 0; z.completed += x.completed || 0;
+      z.compOem += x.compOem || 0; z.compRet += x.compRet || 0; z.compRel += x.compRel || 0;
     });
     list(e.clients).forEach((x) => {
       if (!hasOwn(a.clients, x.client)) a.clients[x.client] = { client: x.client, total: 0, completed: 0, open: 0, a02: 0, a35: 0, a68: 0, a9: 0, age: 0, n: 0 };
@@ -487,8 +502,13 @@ function buildSummary(D, filters) {
       teamSize,
     },
     team,
+    // The Daily Revenue table. `completed` is the day's closed jobs whatever
+    // their vertical; compOem/compRet/compRel are the three columns the page
+    // shows beside the revenue, and they do NOT add up to `completed` — a
+    // closed job in any other vertical is in neither of the three.
     daily: d.daily.map((x) => ({
       date: x.date, target: x.target, revenue: x.revenue, completed: x.completed,
+      compOem: x.compOem, compRet: x.compRet, compRel: x.compRel,
       pct: x.target ? x.revenue / x.target * 100 : 0,
       due: Math.max(x.target - x.revenue, 0),
     })),
@@ -535,26 +555,37 @@ function pageOpenJobs(D, filters, paging) {
 
 /*
  * Current TX Performance: rows filtered on their own vertical/spoc/zm and on
- * having any selected date, re-grouped by (tx, txid) in first-seen order.
+ * having any selected date, grouped in first-seen order.
  *
- * The page grouped by (spoc, tx, txid), which split ONE technician into two
- * rows — identical TX ID, identical name, and no SPOC column to tell them
- * apart — whenever their jobs sat under two SPOCs. The Unattributed bucket
- * makes that the normal case (half a technician's jobs attributed, half not),
- * so the group is the technician. `spoc` is kept on the row for callers that
- * key on it; when a technician's jobs span several SPOCs it is the first one
- * seen, which is why nothing renders it as "the" SPOC.
+ * The grouping KEY depends on the feed, because the two differ:
+ *
+ *   LIVE (compose.js) — (tx, txid), so the group is the technician. The
+ *     Unattributed bucket routinely splits one technician's jobs across two
+ *     SPOCs (half attributed, half not), and keying on the SPOC would print
+ *     them as two rows with an identical TX ID and name and no SPOC column
+ *     to tell them apart.
+ *   SNAPSHOT (build_data.py) — (spoc, tx, txid), the page's own key. That
+ *     feed never emits an Unattributed bucket, and this endpoint is
+ *     parity-tested against the MIS dashboard, which groups by SPOC.
+ *     Merging here would make the tab and the dashboard disagree for any
+ *     technician who worked under two SPOCs.
+ *
+ * The bucket's presence in D.primarySpocs is what tells them apart, so
+ * neither caller has to pass a flag. `spoc` is kept on the row for callers
+ * that key on it; in the live case it is the first SPOC seen, which is why
+ * nothing renders it as "the" SPOC.
  */
 function technicianGroups(D, filters) {
   const nf = normaliseFilters(D, filters);
   const ds = new Set(selectedDateList(D, nf));
   const allDates = list(D.dates);
   const groups = new Map();
+  const mergeAcrossSpocs = list(D.primarySpocs).some(isUnattributedKey);
   list(D.txRows)
     .filter((x) => verticalOk(nf, x.vertical) && employeeOk(nf, x.spoc) && (nf.zm === ALL || x.zm === nf.zm))
     .filter((x) => (Array.isArray(x.dates) ? x.dates : allDates).some((z) => ds.has(z)))
     .forEach((x) => {
-      const k = x.tx + '|' + x.txid;
+      const k = mergeAcrossSpocs ? x.tx + '|' + x.txid : x.spoc + '|' + x.tx + '|' + x.txid;
       if (!groups.has(k)) groups.set(k, { spoc: x.spoc, tx: x.tx, txid: x.txid, vertical: x.vertical, total: 0, closed: 0, open: 0, ageSum: 0 });
       const g = groups.get(k);
       g.total += x.total || 0; g.closed += x.closed || 0; g.open += x.open || 0; g.ageSum += x.ageSum || 0;

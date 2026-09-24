@@ -15,7 +15,34 @@
  * CLOSED JOBS  job_status IN (3,5) with checkout_date_time inside the window,
  *              the whole end day included, IST (Manage Jobs: Bucket Closed +
  *              Job Status Completed + Date Type Completed + Date Range).
- * BOTH are read THROUGH the Manage Jobs export (services/job-export.service.js):
+ * CANCELLED JOBS  job_status = 6 with cancel_date_time inside the window, the
+ *              whole end day included, IST — the SAME SHAPE as the closed set,
+ *              on the cancel date (Manage Jobs: Job Status Cancelled + Date
+ *              Type Cancelled + Date Range). This is the MIS workbook's
+ *              "Cancelled" sheet, which is keyed on "Cancel Date". Added for
+ *              the MTD report (services/quicksight/mtd.service.js); Employee
+ *              Performance does not read it.
+ * TICKET-CREATED JOBS  every job whose ticket_created_date_time is inside the
+ *              window, at ANY status — the MIS "ticket created" sheet, which is
+ *              a Manage Jobs export with no bucket pinned at all. Naming a
+ *              lifecycle date axis is ALREADY a statement about status (see the
+ *              long note on UI_DATE_TYPE_COLUMN in job-export.service.js), so
+ *              adding a status list here would narrow the count the owner
+ *              asked for — "how many tickets did this book of business open"
+ *              counts the ones that were cancelled the same week too.
+ * IN PROGRESS  NOT a read of its own. Statuses 2 and its on-app sibling 20
+ *              (JOB_STATUS.ON_APP_IN_PROGRESS) filtered out of the OPEN rows,
+ *              which is what makes "a subset of Open" structurally true rather
+ *              than two reads that can disagree by a status change landing
+ *              between them. Open rows carry `status` so that filter is free.
+ * VERTICAL /   every loader takes the same optional verticalId /
+ * ZONAL        zonalManagerId the other QuickSight reports expose, applied as
+ *              the EXPORT's own predicates (the many-to-many vertical mapping;
+ *              tbl_city.state_user — the city's zonal owner). 0, blank or
+ *              omitted is no restriction, the "0 = All" sentinel
+ *              processFloorFilters uses. Employee Performance passes neither,
+ *              so its own reads are byte-identical to before.
+ * ALL FOUR are read THROUGH the Manage Jobs export (services/job-export.service.js):
  *              its filter builder, fetchExportChunk (keyset chunks, RBAC-free
  *              here — the report is global like the uploaded snapshot) and
  *              mapExportRow, so Aging, TAT, SDA, Margin, Pending Due To /
@@ -89,6 +116,17 @@ const OPEN_STATUSES = Object.freeze([...jobService.ALL_STATUS_VALUES]
   .filter((s) => !JOB_STATUS.TERMINAL_EXCLUSION.includes(s))
   .sort((a, b) => a - b));
 const CLOSED_STATUSES = Object.freeze([...JOB_STATUS.COMPLETED]);
+// job_status = 6 — the MIS "Cancelled" sheet's bucket, read on its cancel date.
+const CANCELLED_STATUSES = Object.freeze([JOB_STATUS.CANCELLED]);
+/*
+ * In Progress: status 2 AND its on-app sibling 20 — see the "GOTCHA: status 20"
+ * note in _shared.js. Legacy pairs them everywhere, and dropping the 20 loses
+ * every job a technician started from the app. Both are members of
+ * OPEN_STATUSES, which is what lets In Progress be a filter over the open rows
+ * instead of a second read; tests/quicksight-mtd.test.js pins that containment
+ * so a status model change cannot quietly make In Progress bigger than Open.
+ */
+const IN_PROGRESS_STATUSES = Object.freeze([...JOB_STATUS.ON_APP_IN_PROGRESS].sort((a, b) => a - b));
 
 const EXPORT_CHUNK_SIZE = 2000;     // the Manage Jobs export route's own chunk
 const CAPTURE_CHUNK_SIZE = 5000;    // ids only — the export's MAX_CHUNK_SIZE
@@ -177,6 +215,27 @@ function exportFilters(filters) {
   return filters;
 }
 
+/*
+ * The two dimension filters every QuickSight report offers, as Manage Jobs
+ * export keys — so they are the EXPORT's own predicates (verticalId → an EXISTS
+ * on the many-to-many tbl_vertical_mapping, zonalManagerId → the city's
+ * state_user), never a second reading of either rule written here.
+ *
+ * 0, '', null and undefined all mean NO restriction: that is the "0 = All"
+ * sentinel processFloorFilters maps for the Floor Discipline reports, and the
+ * Performance tabs' pickers send 0 for "All". Returning an EMPTY object rather
+ * than `{ verticalId: 0 }` matters — the builder's own guards are
+ * `Number(x) > 0`, so a 0 would emit nothing either way, but an absent key
+ * keeps the filter object identical to the one Employee Performance has always
+ * passed, which is what keeps its reads provably unchanged.
+ */
+function scopeFilters({ verticalId, zonalManagerId } = {}) {
+  const out = {};
+  if (Number(verticalId) > 0) out.verticalId = Number(verticalId);
+  if (Number(zonalManagerId) > 0) out.zonalManagerId = Number(zonalManagerId);
+  return out;
+}
+
 /** Keyset-walk the export (newest job first), handing each raw chunk to onChunk. */
 async function forEachExportChunk(filters, onChunk) {
   let afterJobId = null;
@@ -207,6 +266,13 @@ function jobFields(m, raw) {
   return {
     jobId: m.jobId,
     clientId: toId(raw.fk_client_id),
+    /*
+     * The job's CURRENT status code, straight off J.job_status. Carried so a
+     * SUBSET of a bucket (MTD's In Progress inside the Open bucket) is a filter
+     * over the same read rather than a second query that can disagree with it.
+     * Number() rather than toId(): 0 is BOOKED, a perfectly real status.
+     */
+    status: raw.job_status === null || raw.job_status === undefined ? null : Number(raw.job_status),
     vertical: trimmed(m.verticalName),
     state: trimmed(m.state),
     city: trimmed(m.city),
@@ -297,14 +363,17 @@ async function readFrozenSpocs(jobIds, db = pool) {
 /**
  * Every currently open job, newest first, as compose() openRows plus ids.
  * `now` is the instant Aging is measured to (default: the clock).
+ * verticalId / zonalManagerId narrow the read (0 or omitted = every job).
  *
- * Row: { jobId, clientId, vertical, state, city, client, zm, tx, txid, aging,
- *        dueTo, reason, spoc: null, spocUserId, spocName, spocInternal,
+ * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
+ *        aging, dueTo, reason, spoc: null, spocUserId, spocName, spocInternal,
  *        spocSource: 'mapping' }  — resolvePeople() fills `spoc`.
  */
-async function loadOpenJobs({ now = new Date() } = {}) {
+async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {}) {
   const started = Date.now();
-  const filters = exportFilters({ statuses: OPEN_STATUSES.join(','), statusSnapshot: true });
+  const filters = exportFilters({
+    statuses: OPEN_STATUSES.join(','), statusSnapshot: true, ...scopeFilters({ verticalId, zonalManagerId }),
+  });
   const rows = [];
   await forEachExportChunk(filters, (chunk) => {
     for (const raw of chunk) {
@@ -347,11 +416,12 @@ async function loadOpenJobs({ now = new Date() } = {}) {
  *        spocSource: 'frozen'|'mapping', charge, margin, client, tat, sda, zm,
  *        vertical, tx, txid, aco: null, acoUserId, acoName, acoInternal }
  */
-async function loadClosedJobs({ from, to, now = new Date() } = {}) {
+async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalManagerId } = {}) {
   const started = Date.now();
   const window = checkWindow({ from, to }, now);
   const filters = exportFilters({
     statuses: CLOSED_STATUSES.join(','), dateType: 'completed', startDate: window.from, endDate: window.to,
+    ...scopeFilters({ verticalId, zonalManagerId }),
   });
 
   const entries = [];
@@ -430,7 +500,122 @@ async function loadClosedJobs({ from, to, now = new Date() } = {}) {
   return rows;
 }
 
-/* ═══ 3. CRM data ═══════════════════════════════════════════════════════════ */
+/* ═══ 3. Cancelled / ticket-created jobs ════════════════════════════════════ */
+
+/*
+ * The shape the two windowed COUNT sets share: one Manage Jobs read on one
+ * lifecycle date column, every row carrying the client's CURRENT Primary SPOC.
+ *
+ * Written once rather than twice because the only things that differ are the
+ * status pin, the date axis and which raw column the row's day comes from —
+ * and a second copy of "walk the export, resolve the SPOC, look the users up"
+ * is exactly the kind of near-duplicate that drifts. loadClosedJobs is NOT
+ * folded in here: it also reads the freeze table, carries A & CO and margin,
+ * and is ordered checkout-DESC for compose()'s first-seen tables. Those are
+ * real differences, not incidental ones.
+ *
+ * Rows arrive in the export's own order — job_id DESC, newest first. There is
+ * no re-sort because these sets are COUNTED, never rendered as a first-seen
+ * table; if one ever is, sort it at the call site the way loadClosedJobs does.
+ *
+ * `statuses` null means NO status clause at all (see the ticket-created note in
+ * the header): an empty array would be a different thing entirely, so the
+ * absence is spelt with null and the key is omitted rather than sent empty.
+ *
+ * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
+ *        date, charge, spoc: null, spocUserId, spocName, spocInternal,
+ *        spocSource: 'mapping' }
+ */
+async function loadWindowedJobs({
+  label, statuses, dateType, dateOf, from, to, now = new Date(), verticalId, zonalManagerId,
+}) {
+  const started = Date.now();
+  const window = checkWindow({ from, to }, now);
+  const filters = exportFilters({
+    ...(statuses === null ? {} : { statuses: statuses.join(',') }),
+    dateType,
+    startDate: window.from,
+    endDate: window.to,
+    ...scopeFilters({ verticalId, zonalManagerId }),
+  });
+
+  const rows = [];
+  await forEachExportChunk(filters, (chunk) => {
+    for (const raw of chunk) {
+      const m = jobExport.mapExportRow(raw, rows.length + 1, { now });
+      rows.push({
+        ...jobFields(m, raw),
+        date: dateOf(raw),
+        charge: m.totalCharge,
+        spoc: null,
+        spocUserId: null,
+        spocName: null,
+        spocInternal: false,
+        spocSource: 'mapping',
+      });
+    }
+  });
+
+  const spocByClient = await currentSpocByClient(rows.map((r) => r.clientId));
+  const users = await loadUsers([...spocByClient.values()]);
+  for (const r of rows) {
+    r.spocUserId = r.clientId === null ? null : spocByClient.get(r.clientId) ?? null;
+    const p = personOf(r.spocUserId, users);
+    r.spocName = p.name;
+    r.spocInternal = p.internal;
+  }
+  logger.info(`QuickSight ${label} jobs · ${window.from}..${window.to} · rows=${rows.length}`
+    + ` · clients=${spocByClient.size} · ${Date.now() - started}ms`);
+  return rows;
+}
+
+/**
+ * Jobs CANCELLED in [from, to] (IST days, both inclusive; default the current
+ * IST month): job_status = 6 on cancel_date_time — the MIS "Cancelled" sheet.
+ *
+ * There is no freeze here, deliberately. tbl_qs_ep_job_spoc freezes the SPOC of
+ * a CLOSED job because Employee Performance pays people on it; a cancelled job
+ * carries no revenue and the MTD report asks "whose book of business is this
+ * today", so the CURRENT mapping is the right — and the only — answer.
+ */
+async function loadCancelledJobs({ from, to, now = new Date(), verticalId, zonalManagerId } = {}) {
+  return loadWindowedJobs({
+    label: 'cancelled',
+    statuses: CANCELLED_STATUSES,
+    dateType: 'cancelled',
+    dateOf: (raw) => jobExport.datePart(raw.cancel_date_time),
+    from,
+    to,
+    now,
+    verticalId,
+    zonalManagerId,
+  });
+}
+
+/**
+ * Jobs whose TICKET was created in [from, to] (IST days, both inclusive;
+ * default the current IST month), at any status — the MIS "ticket created"
+ * sheet. "Ticket Created Date" in that workbook is J.ticket_created_date_time,
+ * which is the export's `ticket` date axis (prep.py FIELDS: created →
+ * "Ticket Created Date"). NOT created_date_time, which the sheet calls
+ * "Booking Date" and which is a different day for any job booked after the
+ * ticket was raised.
+ */
+async function loadTicketCreatedJobs({ from, to, now = new Date(), verticalId, zonalManagerId } = {}) {
+  return loadWindowedJobs({
+    label: 'ticket-created',
+    statuses: null,
+    dateType: 'ticket',
+    dateOf: (raw) => jobExport.datePart(raw.ticket_created_date_time),
+    from,
+    to,
+    now,
+    verticalId,
+    zonalManagerId,
+  });
+}
+
+/* ═══ 4. CRM data ═══════════════════════════════════════════════════════════ */
 
 /**
  * Booked / Scheduled / Audit / Closed / Cancelled per user per IST day in
@@ -464,7 +649,7 @@ async function loadCrmCounts({ from, to, userIds = null, now = new Date() } = {}
   });
 }
 
-/* ═══ 4. People → employee keys ═════════════════════════════════════════════ */
+/* ═══ 5. People → employee keys ═════════════════════════════════════════════ */
 
 function rosterList(rosterByMonth, month) {
   if (!rosterByMonth) return null;
@@ -698,7 +883,7 @@ function resolvePeople({ rows = {}, rosterByMonth = {}, window } = {}) {
   };
 }
 
-/* ═══ 5. The SPOC freeze (scheduled job — the only write here) ══════════════ */
+/* ═══ 6. The SPOC freeze (scheduled job — the only write here) ══════════════ */
 
 /**
  * Freeze the Primary SPOC of every closed job checked out since `since`
@@ -771,11 +956,24 @@ async function captureSpocFreeze({ since, db = pool, now = new Date() } = {}) {
 module.exports = {
   OPEN_STATUSES,
   CLOSED_STATUSES,
+  CANCELLED_STATUSES,
+  IN_PROGRESS_STATUSES,
   UNATTRIBUTED,
   FREEZE_TABLE,
   defaultWindow,
+  /*
+   * The ONE window rule these loaders apply — a real 'YYYY-MM-DD' pair, from on
+   * or before to, at most MAX_WINDOW_DAYS apart, defaulted to the current IST
+   * month — exported so a report that must validate the window BEFORE it reads
+   * (MTD, whose open set has no window at all and so could not discover a bad
+   * one from a loader) asks this rule rather than carrying a second copy that
+   * drifts. Throws a 400-tagged Error; returns the effective { from, to }.
+   */
+  checkWindow,
   loadOpenJobs,
   loadClosedJobs,
+  loadCancelledJobs,
+  loadTicketCreatedJobs,
   loadCrmCounts,
   resolvePeople,
   captureSpocFreeze,

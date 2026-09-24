@@ -28,7 +28,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 
-const { compose, fromWorkbookSheets, TEAM_MODES, _internals: I } =
+const { compose, fromWorkbookSheets, TEAM_MODES, unattributedKey, _internals: I } =
   require('../services/quicksight/employee-performance/compose');
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'qs-ep');
@@ -414,6 +414,112 @@ test('perMonth: a team lead is the largest target that month, ties by name', () 
   // August: AA and B tie at 260 -> 'AA' sorts first. September: AA's 9999 wins.
   assert.deepEqual(D.employees.M.daily.map((d) => d.target), [100, 100, 2, 2]);
   assert.deepEqual(D.teamMembers.Bravo, ['B', 'M', 'AA']);
+});
+
+// ─── The closed-job split: compOem / compRet / compRel ──────────────────────
+
+/*
+ * The dashboard's Daily Revenue table counts a day's closed jobs in three
+ * columns beside the revenue — "Closed Jobs — OEM (Furniture, Sports)",
+ * "Closed Jobs — Retail Maintenance", "Closed Jobs — Relocation" — so every
+ * perMonth daily row carries them next to `completed`.
+ *
+ * The rows below are A's (a Furniture SPOC, on the Alpha roster both months) so
+ * that the column a job lands in is visibly the JOB's vertical, never the
+ * person's.
+ */
+const closedJob = (date, vertical, extra = {}) => ({
+  spoc: 'A', charge: 100, margin: 10, date, client: 'CA', tat: 1, sda: 1, zm: 'Z1', vertical, aco: 'A', ...extra,
+});
+
+test('perMonth: a day\'s closed jobs split into OEM / Retail Maintenance / Relocation', () => {
+  const D = plain(compose(perMonthInputs({
+    closedRows: [
+      closedJob('2026-08-30', 'Retail Maintenance'),
+      // One mixed day: both OEM verticals, one of each of the other two, and a
+      // vertical that belongs to none of the three columns.
+      closedJob('2026-09-01', 'Furniture'),
+      closedJob('2026-09-01', 'Sports'),
+      closedJob('2026-09-01', 'Retail Maintenance'),
+      closedJob('2026-09-01', 'Relocation'),
+      closedJob('2026-09-01', 'Easyfix'),
+      // No checkout date: on no day at all, exactly as `completed` treats it.
+      closedJob(null, 'Furniture'),
+    ],
+  }), { teamMode: 'perMonth' }));
+
+  const rows = D.employees.A.daily;
+  assert.deepEqual(rows.map((r) => r.date), ['2026-08-30', '2026-08-31', '2026-09-01', '2026-09-02']);
+  assert.deepEqual(rows.map((r) => [r.completed, r.compOem, r.compRet, r.compRel]), [
+    [1, 0, 1, 0],       // Retail Maintenance, on a Furniture SPOC's block
+    [0, 0, 0, 0],
+    [5, 2, 1, 1],       // Furniture and Sports share a column, Easyfix has none
+    [0, 0, 0, 0],
+  ]);
+  assert.equal(D.employees.A.completed, 7, 'the undated job still counts in the block total');
+
+  // The three do NOT partition `completed`: a closed job in any other vertical
+  // is in the day's total and in none of the columns, so nothing downstream may
+  // treat them as a breakdown that has to add up.
+  const mixed = rows[2];
+  assert.equal(mixed.compOem + mixed.compRet + mixed.compRel + 1, mixed.completed, 'the leftover is the Easyfix job');
+
+  assert.deepEqual(Object.keys(rows[0]),
+    ['date', 'target', 'revenue', 'pct', 'due', 'completed', 'compOem', 'compRet', 'compRel']);
+});
+
+test('perMonth: the split reaches the byZm slices and the Unattributed buckets', () => {
+  const D = plain(compose(perMonthInputs({
+    closedRows: [
+      closedJob('2026-09-01', 'Furniture', { zm: 'Z1' }),
+      closedJob('2026-09-01', 'Relocation', { zm: 'Z2' }),
+      // Nobody's job. Its vertical still has to be counted somewhere, or a
+      // day's Retail Maintenance total would drop the moment the SPOC who
+      // closed it stopped being on a roster.
+      closedJob('2026-09-01', 'Retail Maintenance', { spoc: 'Unattributed' }),
+    ],
+  }), { teamMode: 'perMonth' }));
+
+  const day = (rows) => rows.find((r) => r.date === '2026-09-01');
+  assert.deepEqual(day(D.employees.A.daily), { date: '2026-09-01', target: 200, revenue: 200, pct: 100, due: 0,
+    completed: 2, compOem: 1, compRet: 0, compRel: 1 });
+  // With a Zonal Manager selected the dashboard reads the SLICE's daily rows.
+  assert.equal(day(D.employees.A.byZm.Z1.daily).compOem, 1);
+  assert.equal(day(D.employees.A.byZm.Z1.daily).compRel, 0, 'Z2\'s Relocation job is not in Z1\'s slice');
+  assert.equal(day(D.employees.A.byZm.Z2.daily).compRel, 1);
+
+  const bucket = D.employees[unattributedKey('Retail Maintenance')];
+  assert.deepEqual(day(bucket.daily), { date: '2026-09-01', target: 0, revenue: 100, pct: 0, due: 0,
+    completed: 1, compOem: 0, compRet: 1, compRel: 0 });
+  assert.equal(day(bucket.byZm.Z1.daily).compRet, 1);
+});
+
+test('the split matches the vertical the pipeline already carries, and nothing looser', () => {
+  // Both feeds hand compose() a trimmed Vertical Name (sval() strips it out of
+  // the workbook, sources.service.js trims the live job's), so this is the
+  // exact comparison every other vertical in compose.js gets. A vertical
+  // spelled some other way is a data problem to fix in the master, not one to
+  // guess at in a second place: it counts in `completed` and in no column.
+  const D = plain(compose(perMonthInputs({
+    closedRows: [
+      closedJob('2026-09-01', 'furniture'),
+      closedJob('2026-09-01', 'RELOCATION'),
+      closedJob('2026-09-01', 'Retail  Maintenance'),
+    ],
+  }), { teamMode: 'perMonth' }));
+  const row = D.employees.A.daily.find((r) => r.date === '2026-09-01');
+  assert.deepEqual([row.completed, row.compOem, row.compRet, row.compRel], [3, 0, 0, 0]);
+});
+
+test('legacy keeps build_data.py\'s six-key daily row, the split columns included', () => {
+  // The golden fixture at the top of this file was written by the MIS script
+  // that had no such columns, and legacy mode exists to reproduce THAT script.
+  // Turning the columns on here would make the port less faithful, not more:
+  // it is a change to make in the same commit as a regenerated fixture.
+  const L = plain(compose(perMonthInputs({
+    closedRows: [closedJob('2026-09-01', 'Furniture')],
+  }), { teamMode: 'legacy' }));
+  assert.deepEqual(Object.keys(L.employees.A.daily[0]), ['date', 'target', 'revenue', 'pct', 'due', 'completed']);
 });
 
 // ─── The workbook adapter ────────────────────────────────────────────────────
