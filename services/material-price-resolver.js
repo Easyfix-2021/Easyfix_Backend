@@ -21,12 +21,34 @@ const { pool } = require('../db');
  *   - A client group with no state entry for stateId falls to step 2 (client_
  *     group), NEVER to master_state: once a client has a price for a brand,
  *     the master's state variation no longer applies to them.
+ *
+ * Tx Share (2026-09-24, docs/superpowers/specs/2026-09-18-client-material-
+ * rates-design.md "2026-09-24 — Tx Share"): the technician's charge on top
+ * of the price, returned per unit alongside `price`. Client tables carry
+ * their own `tx_share` column (NULL legacy rows read as 20% of that row's
+ * price); the master tables carry no such column at all — a master hit
+ * always computes 20% of the price on the fly. `tx_share` is null only
+ * when `source` is 'none'. Callers that respond to the technician app MUST
+ * strip this field — the technician only ever sees the price.
  */
+
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
+// Default Tx Share = 20% of the price, rounded to 2dp.
+function defaultTxShare(price) {
+  return round2(Number(price) * 0.2);
+}
+
+function txShareOrDefault(storedTxShare, price) {
+  return (storedTxShare === null || storedTxShare === undefined) ? defaultTxShare(price) : Number(storedTxShare);
+}
 
 async function findClientGroup(clientId, materialId, brandId) {
   if (brandId) {
     const [rows] = await pool.query(
-      `SELECT g.group_id, g.price
+      `SELECT g.group_id, g.price, g.tx_share
          FROM tbl_client_material_price_group_brand gb
          JOIN tbl_client_material_price_group g ON g.group_id = gb.group_id
         WHERE gb.client_id = ? AND gb.material_id = ? AND gb.brand_id = ? AND g.status = 1
@@ -37,7 +59,7 @@ async function findClientGroup(clientId, materialId, brandId) {
   }
   // No Brand mode — the sole client group carrying zero brand rows.
   const [rows] = await pool.query(
-    `SELECT g.group_id, g.price
+    `SELECT g.group_id, g.price, g.tx_share
        FROM tbl_client_material_price_group g
       WHERE g.client_id = ? AND g.material_id = ? AND g.status = 1
         AND NOT EXISTS (SELECT 1 FROM tbl_client_material_price_group_brand gb WHERE gb.group_id = g.group_id)
@@ -49,14 +71,14 @@ async function findClientGroup(clientId, materialId, brandId) {
 
 async function findClientStatePrice(groupId, stateId) {
   const [rows] = await pool.query(
-    `SELECT sp.price
+    `SELECT sp.price, sp.tx_share
        FROM tbl_client_material_state_price sp
        JOIN tbl_client_material_state_price_state sps ON sps.state_price_id = sp.state_price_id
       WHERE sp.group_id = ? AND sps.state_id = ?
       LIMIT 1`,
     [groupId, stateId],
   );
-  return rows[0] ? rows[0].price : null;
+  return rows[0] || null;
 }
 
 async function findMasterGroup(materialId, brandId) {
@@ -105,24 +127,40 @@ async function resolveMaterialPrice({ clientId, materialId, brandId, stateId }) 
   if (clientGroup) {
     if (stateId) {
       const statePrice = await findClientStatePrice(clientGroup.group_id, stateId);
-      if (statePrice !== null) return { price: statePrice, source: 'client_state', groupId: clientGroup.group_id };
+      if (statePrice !== null) {
+        return {
+          price: statePrice.price, source: 'client_state', groupId: clientGroup.group_id,
+          tx_share: txShareOrDefault(statePrice.tx_share, statePrice.price),
+        };
+      }
     }
     // No client state match — client_group wins outright, never master_state.
-    return { price: clientGroup.price, source: 'client_group', groupId: clientGroup.group_id };
+    return {
+      price: clientGroup.price, source: 'client_group', groupId: clientGroup.group_id,
+      tx_share: txShareOrDefault(clientGroup.tx_share, clientGroup.price),
+    };
   }
 
   const masterGroup = await findMasterGroup(materialId, brandId);
   if (masterGroup) {
     if (stateId) {
       const statePrice = await findMasterStatePrice(masterGroup.group_id, stateId);
-      if (statePrice !== null) return { price: statePrice, source: 'master_state', groupId: masterGroup.group_id };
+      if (statePrice !== null) {
+        return {
+          price: statePrice, source: 'master_state', groupId: masterGroup.group_id,
+          tx_share: defaultTxShare(statePrice),
+        };
+      }
     }
     if (masterGroup.price !== null && masterGroup.price !== undefined) {
-      return { price: masterGroup.price, source: 'master_group', groupId: masterGroup.group_id };
+      return {
+        price: masterGroup.price, source: 'master_group', groupId: masterGroup.group_id,
+        tx_share: defaultTxShare(masterGroup.price),
+      };
     }
   }
 
-  return { price: null, source: 'none', groupId: null };
+  return { price: null, source: 'none', groupId: null, tx_share: null };
 }
 
-module.exports = { resolveMaterialPrice };
+module.exports = { resolveMaterialPrice, round2, defaultTxShare };

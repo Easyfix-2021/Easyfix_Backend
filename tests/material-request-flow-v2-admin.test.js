@@ -49,7 +49,7 @@ let materialRequestSent; // [] of jobIds sendMaterialClientRequest was called wi
 
 function qLine(over = {}) {
   return { id: null, job_id: JOB_ID, type: 'material', name: 'Pipe', unit: 1, unit_price: 100,
-    client_charge: 0, approved_charge: null, sent_on: null, action_on: null,
+    client_charge: 0, approved_charge: null, sent_on: null, action_on: null, tx_charge: 0,
     status: 1, client_status: null, client_action_on: null, ...over };
 }
 
@@ -104,13 +104,16 @@ const fake = installFakePool([
     () => [{ material_id: 10, material_name: 'Screw', status: 1 }]],
   [/FROM tbl_job j\s+LEFT JOIN tbl_address ad/i, () => [{ state_id: 9 }]],
   // CRM add-line's INSERT — params: name, quantity, unitPrice, clientCharge,
-  // approvedAmount, actionBy, sentBy, sentOn, actionOn, jobId, materialId.
+  // approvedAmount, actionBy, sentBy, sentOn, actionOn, jobId, materialId,
+  // txShare (tx_charge, 2026-09-24 — appended LAST in the column list so
+  // every index above stays put).
   [/^\s*INSERT INTO quotation_details\b/i, (sql, params) => {
     const id = (quotationRows.reduce((m, r) => Math.max(m, r.id || 0), 0)) + 1;
-    const [name, unit, unitPrice, clientCharge, approvedCharge, , , sentOn, actionOn, jobId, materialId] = params;
+    const [name, unit, unitPrice, clientCharge, approvedCharge, , , sentOn, actionOn, jobId, materialId, txShare] = params;
     quotationRows.push(qLine({
       id, job_id: jobId, name, unit, unit_price: unitPrice, client_charge: clientCharge,
       approved_charge: approvedCharge, sent_on: sentOn, action_on: actionOn, material_id: materialId,
+      tx_charge: txShare,
     }));
     return { insertId: id };
   }],
@@ -199,6 +202,20 @@ test('GET /admin/quotations?jobId= — each row carries `state`', async () => {
   assert.equal(byId[2], 'review_pending');
   assert.equal(byId[3], 'rejected');
   assert.equal(byId[4], 'client_approved');
+});
+
+test('GET /admin/quotations?jobId= — tx_share: a post-2026-09-24 row uses its own tx_charge; a legacy row (0/NULL) computes 20% of client_charge, else unit_price', async () => {
+  quotationRows = [
+    qLine({ id: 1, sent_on: null, tx_charge: 65 }), // own snapshot wins
+    qLine({ id: 2, sent_on: null, tx_charge: 0, client_charge: 400 }), // legacy → 20% of client_charge
+    qLine({ id: 3, sent_on: null, tx_charge: null, client_charge: null, unit_price: 250 }), // no client_charge → 20% of unit_price
+  ];
+  const res = await fetch(`${quotationsBaseUrl}/quotations?jobId=${JOB_ID}`);
+  const body = await res.json();
+  const byId = Object.fromEntries((body.data || body).map((r) => [r.id, r.tx_share]));
+  assert.equal(byId[1], 65);
+  assert.equal(byId[2], 80);
+  assert.equal(byId[3], 50);
 });
 
 test('PATCH /admin/quotations/:id/approve on a review_pending line succeeds', async () => {
@@ -290,6 +307,16 @@ test('CRM add line at 16 -> stays 16, NO client request (client has not been not
   assert.equal(res.status, 201, JSON.stringify(res.body));
   assert.equal(statusUpdates(fake.calls).length, 0);
   assert.deepEqual(materialRequestSent, [], 'must NOT fire at 16 — nothing has been sent to the client yet');
+});
+
+test('CRM add line: tx_charge defaults to 20% of the billed unit_price when the resolver has no price (source none)', async () => {
+  // No fixtures back the price-resolver tables in this file, so material 10
+  // (No Brand, no state) always resolves 'none' here — the fallback path.
+  jobFixture = makeJob({ job_status: 2 });
+  const res = await addLine({ materialId: 10, quantity: 1, approvedAmount: 500 });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  assert.equal(quotationRows[0].client_charge, null, 'sanity: resolver really returned source \'none\' here');
+  assert.equal(quotationRows[0].tx_charge, 100, '20% of the 500 billed unit_price');
 });
 
 test('CRM add line on a cancelled job (6) -> 409, nothing written', async () => {

@@ -333,7 +333,7 @@ const sensitiveBankBody = Joi.object({
   otp: Joi.alternatives()
     .try(
       Joi.string().trim().pattern(/^[0-9]{4}$/),
-      Joi.number().integer().min(1000).max(9999),
+      Joi.number().integer().min(0).max(9999),
     )
     .optional()
     .messages({ 'alternatives.match': 'OTP must be exactly 4 digits' }),

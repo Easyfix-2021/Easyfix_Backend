@@ -1,6 +1,9 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const materialSvc = require('./material.service');
+// Tx Share (2026-09-24) — the shared "20% of price, rounded to 2dp" default,
+// same rule the resolver falls back to when a client row has no tx_share.
+const { defaultTxShare } = require('./material-price-resolver');
 
 /*
  * Client Material Rates (Material Management phase 2, sub-project C) — see
@@ -26,6 +29,16 @@ function mkErr(status, message, extra) {
 
 // ─── Validation (phase-1 rules, adapted: price is always required > 0) ───
 
+// tx_share (2026-09-24, "Tx Share") is optional on every group/state entry —
+// omitted/null means "compute 20% of price at write time" (see replace()
+// below). When given it must be a number >= 0 with at most 2 decimal places.
+function invalidTxShare(v) {
+  if (v === null || v === undefined) return false;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return true;
+  return Math.abs(n - Math.round(n * 100) / 100) > 1e-9;
+}
+
 function validateClientGroupsPayload(groups) {
   const list = Array.isArray(groups) ? groups : [];
   if (list.length === 0) throw mkErr(422, 'At least one price group is required.');
@@ -39,6 +52,9 @@ function validateClientGroupsPayload(groups) {
 
     if (g.price === null || g.price === undefined || Number(g.price) <= 0) {
       throw mkErr(422, 'Each price group requires a price greater than 0.');
+    }
+    if (invalidTxShare(g.tx_share)) {
+      throw mkErr(422, 'tx_share must be a number >= 0 with at most 2 decimal places.');
     }
 
     const dedupe = new Set(brandIds);
@@ -55,6 +71,9 @@ function validateClientGroupsPayload(groups) {
       if (stateIds.length === 0) throw mkErr(422, 'A state-price override requires at least one state.');
       if (s.price === null || s.price === undefined || Number(s.price) <= 0) {
         throw mkErr(422, 'A state-price override requires a price greater than 0.');
+      }
+      if (invalidTxShare(s.tx_share)) {
+        throw mkErr(422, 'A state-price override tx_share must be a number >= 0 with at most 2 decimal places.');
       }
       for (const sid of stateIds) {
         if (seenStateInGroup.has(sid)) throw mkErr(422, 'A state cannot repeat within one price group.');
@@ -139,7 +158,7 @@ function reviewFlag(masterPriceSeen, masterPriceToday) {
 async function list(clientId) {
   clientId = Number(clientId);
   const [groupRows] = await pool.query(
-    `SELECT g.group_id, g.material_id, g.price, g.master_price_seen, CAST(g.status AS SIGNED) AS status
+    `SELECT g.group_id, g.material_id, g.price, g.tx_share, g.master_price_seen, CAST(g.status AS SIGNED) AS status
        FROM tbl_client_material_price_group g
       WHERE g.client_id = ? AND g.status = 1
       ORDER BY g.material_id ASC, g.group_id ASC`,
@@ -170,7 +189,7 @@ async function list(clientId) {
   }
 
   const [stateRows] = await pool.query(
-    `SELECT state_price_id, group_id, price FROM tbl_client_material_state_price WHERE group_id IN (?)`,
+    `SELECT state_price_id, group_id, price, tx_share FROM tbl_client_material_state_price WHERE group_id IN (?)`,
     [groupIds],
   );
   const statePriceIds = stateRows.map((s) => s.state_price_id);
@@ -192,6 +211,9 @@ async function list(clientId) {
     statesByGroup.get(sp.group_id).push({
       state_price_id: sp.state_price_id,
       price: sp.price,
+      // NULL legacy row (predates the 2026-09-24 migration's backfill, or a
+      // direct data fix) → computed 20% of that state's own price.
+      tx_share: (sp.tx_share === null || sp.tx_share === undefined) ? defaultTxShare(sp.price) : sp.tx_share,
       state_ids: statesByPriceId.get(sp.state_price_id) || [],
     });
   }
@@ -203,6 +225,7 @@ async function list(clientId) {
       group_id: g.group_id,
       material_id: g.material_id,
       price: g.price,
+      tx_share: (g.tx_share === null || g.tx_share === undefined) ? defaultTxShare(g.price) : g.tx_share,
       status: g.status,
       brands,
       states: statesByGroup.get(g.group_id) || [],
@@ -285,13 +308,15 @@ async function replace(clientId, materialId, input, actor = {}, { conn: external
 
     for (const g of groups) {
       const price = Number(g.price);
+      // tx_share: caller-given (already validated ≥0, ≤2dp), else 20% of price.
+      const txShare = (g.tx_share === null || g.tx_share === undefined) ? defaultTxShare(price) : Number(g.tx_share);
       const brandIds = Array.isArray(g.brand_ids) ? g.brand_ids.map(Number) : [];
       const masterPriceToday = await resolveMasterPriceForBrandSet(materialId, brandIds);
       const [gr] = await conn.query(
         `INSERT INTO tbl_client_material_price_group
-           (client_id, material_id, price, master_price_seen, status, created_by, created_at, updated_by, updated_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)`,
-        [clientId, materialId, price, masterPriceToday, actor.userId || null, new Date(), actor.userId || null, new Date()],
+           (client_id, material_id, price, tx_share, master_price_seen, status, created_by, created_at, updated_by, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+        [clientId, materialId, price, txShare, masterPriceToday, actor.userId || null, new Date(), actor.userId || null, new Date()],
       );
       const groupId = gr.insertId;
       for (const bid of brandIds) {
@@ -302,9 +327,11 @@ async function replace(clientId, materialId, input, actor = {}, { conn: external
       }
       const states = Array.isArray(g.states) ? g.states : [];
       for (const s of states) {
+        const statePrice = Number(s.price);
+        const stateTxShare = (s.tx_share === null || s.tx_share === undefined) ? defaultTxShare(statePrice) : Number(s.tx_share);
         const [sr] = await conn.query(
-          `INSERT INTO tbl_client_material_state_price (group_id, client_id, price) VALUES (?, ?, ?)`,
-          [groupId, clientId, Number(s.price)],
+          `INSERT INTO tbl_client_material_state_price (group_id, client_id, price, tx_share) VALUES (?, ?, ?, ?)`,
+          [groupId, clientId, statePrice, stateTxShare],
         );
         const statePriceId = sr.insertId;
         const stateIds = Array.isArray(s.state_ids) ? s.state_ids.map(Number) : [];

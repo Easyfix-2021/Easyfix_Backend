@@ -93,7 +93,7 @@ const saveBody = Joi.object({
   // (the handler enforces "present + valid" only when OTP is enabled, and the
   // FE learns the same flag via /prefill `otp_required`). When OTP is disabled
   // the body omits it entirely.
-  otp:                     Joi.number().integer().min(1000).max(9999).optional(),
+  otp:                     Joi.number().integer().min(0).max(9999).optional(),
   basic:                   basicSchema.optional(),
   // SINGLE-SUBMIT form (2026-06-30): the FE now saves Skills + Service Area in
   // ONE PUT via a single "Save Profile" button, and BOTH are mandatory — so
