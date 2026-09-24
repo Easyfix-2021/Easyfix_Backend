@@ -504,6 +504,13 @@ router.post('/status', async (req, res) => {
       }, pool);
       logger.info(`📡 Conference participant JOINED · conf=${conference.id} · participant=${p.id}`
         + ` · kind=${p.target_kind} · ${p.masked_number || '-'} · member=${memberId || p.member_id || '-'}`);
+      // The first REMOTE party answering is when the recording starts (see
+      // startRecordingOnAnswer) — not when the operator joined. Once per room;
+      // off the response path, and never able to fail this webhook.
+      if (p.target_kind !== 'operator') {
+        conf.startRecordingOnAnswer(conference, pool)
+          .catch((e) => logger.warn(`⚠ Conference recording start threw · conf=${conference.id} · ${e && e.message}`));
+      }
       return res.json({ ok: true, handled: true, event: kind });
     }
 
