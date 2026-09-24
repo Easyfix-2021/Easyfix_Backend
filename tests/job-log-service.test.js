@@ -518,6 +518,11 @@ test('every exported writer is fail-soft, not just the one we sampled', async ()
     () => jobLog.logJobVerified(42, {}, { user_id: 7 }),
     () => jobLog.logClientQc(42, { outcome: 'passed' }, {}),
     () => jobLog.logLedgerPosted(42, {}, {}),
+    // V3 Phase 4 — signature, tools, products at site, visit two.
+    () => jobLog.logSignatureTaken(42, {}, { efr_id: 9 }),
+    () => jobLog.logToolsSet(42, { count: 3 }, { user_id: 7 }),
+    () => jobLog.logSiteProductsChanged(42, { change: 'added' }, { user_id: 7 }),
+    () => jobLog.logVisitTwoScheduled(42, { visitNumber: 2 }, { user_id: 7 }),
   ];
   for (const w of writers) assert.equal(await w(), null);
   // Every exported writer, not just the ones this list remembered.

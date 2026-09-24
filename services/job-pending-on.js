@@ -38,6 +38,7 @@ const COMPLETED_STATUSES = new Set([3, 5, 10]);
 const CHECKED_IN_STATUSES = new Set([2, 20]);
 const NOT_STARTED_STATUSES = new Set([0, 1]);
 const PENDING_FOR_MATERIAL = 16;
+const REVISIT = 10;
 
 const verdict = (pendingOn, waitingFor, band, situation) => ({ pendingOn, waitingFor, band, situation });
 
@@ -46,7 +47,8 @@ const verdict = (pendingOn, waitingFor, band, situation) => ({ pendingOn, waitin
  * every branch is provable without a database.
  *
  *   job      { job_status }
- *   facts    { cancel_request, reschedule_request, site_access, verified_on, qc_status }
+ *   facts    { cancel_request, reschedule_request, site_access, verified_on, qc_status,
+ *              visit_number, revisit_reason_id, revisit_date }
  *   reports  in-flight tx_report rows for this job
  */
 function decide(job, facts = {}, reports = []) {
@@ -84,6 +86,18 @@ function decide(job, facts = {}, reports = []) {
   if (status === PENDING_FOR_MATERIAL) return verdict(PENDING_ON.EASYFIX, 'material_review', 'A', 'material_review');
   // 8. A gate pass / NOC the client has not answered.
   if (Number(facts.site_access) === 1) return verdict(PENDING_ON.CLIENT, 'site_access', 'B', 'site_access');
+  /*
+   * 8b. V3 Phase 4 (D7): a revisit waiting for the desk to book visit 2 — ahead
+   * of 9, because a 10 that is coming back is not "submitted for audit". Status
+   * 10 means both "revisit" and "under audit" on this platform, so it needs a
+   * revisit marker: the checkout's visit_number bump, a revisit reason/date, or
+   * an additional-work claim still in flight (an OPEN one was answered by 4).
+   * An APPROVED claim is not in `reports`; its checkout bumped visit_number.
+   */
+  if (status === REVISIT && (Number(facts.visit_number || 1) > 1 || facts.revisit_reason_id != null
+    || facts.revisit_date != null || extra)) {
+    return verdict(PENDING_ON.EASYFIX, 'schedule_visit2', 'A', 'visit_two_pending');
+  }
   if (COMPLETED_STATUSES.has(status)) {
     // 9. Submitted — EasyFix's audit comes first (sheet 14 order).
     if (!facts.verified_on) return verdict(PENDING_ON.EASYFIX, 'audit', 'C', 'submitted_for_audit');
@@ -135,7 +149,8 @@ async function pendingOnForJobs(conn, jobRows) {
             ${resched.sql} AS reschedule_request,
             EXISTS (SELECT 1 FROM tbl_job_permission_request p
                      WHERE p.job_id = j.job_id AND p.status = ?) AS site_access,
-            v.verified_on, v.qc_status
+            v.verified_on, v.qc_status,
+            j.visit_number, j.revisit_reason_id, j.revisit_date
        FROM tbl_job j
        LEFT JOIN tbl_job_verification v ON v.job_id = j.job_id
       WHERE j.job_id IN (?)`,

@@ -50,6 +50,8 @@ const fake = installFakePool([
   [/CAST\(collected_by AS SIGNED\)/, () => JOB_FACTS],
   [/service_charge_description/, (_s, ids) => LINES.filter((l) => ids.includes(l.job_id))],
   [/INSERT INTO tbl_job_logs/, () => ({ insertId: 1 })],
+  // V3 Phase 4 checkout gate (closeProof): the PIN was verified at arrival.
+  [/AS pin_verified/, () => [{ pin_verified: 1, signed: 0 }]],
 ]);
 
 for (const [mod, exports] of [

@@ -385,7 +385,9 @@ router.patch('/:token/reject', peekToken, tokenRateLimit, async (req, res, next)
           [reason, new Date(), jobId]
         );
         await stampApprovalPendingLines(conn, jobId, false);
-        await jobService.setStatus(jobId, { status: 2 }, { user_id: linkedUserId }, { conn });
+        // Same rule as the portal: see estimateRejectStatus.
+        const rejectTo = await require('../../services/job-estimate-approval').estimateRejectStatus(jobId, conn);
+        await jobService.setStatus(jobId, { status: rejectTo }, { user_id: linkedUserId }, { conn });
         await conn.commit();
       } catch (e) {
         try { await conn.rollback(); } catch { /* connection may already be gone */ }

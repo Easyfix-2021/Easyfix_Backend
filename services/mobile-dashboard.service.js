@@ -6,6 +6,8 @@ const performanceService = require('./performance.service');
 const alertFlags = require('./job-offer-alert-flags');
 const { OPEN_JOB_STATUSES } = require('./easyfixer-lifecycle.service');
 const { todayCutoffHour } = require('./mobile-attendance.service');
+const properties = require('./properties.service');
+const { technicianSharesForJobs } = require('./job-ledger.service');
 
 /*
  * Mobile dashboard orchestrator — composes shared services into the
@@ -178,6 +180,11 @@ async function getDashboard(efrId, opts = {}) {
     notices,
     noticesUnread,
     dateCounts,
+    techFacts,
+    skills,
+    homeJobs,
+    bestDay,
+    review,
   ] = await Promise.all([
     fetchIdentity(efrId),
     // "New Requests" — the technician's OPEN OFFERS under the offer-pool
@@ -232,6 +239,12 @@ async function getDashboard(efrId, opts = {}) {
       surface: 'technician', readerType: 'efr', readerId: efrId,
     }).catch(() => 0),
     fetchDateCounts(efrId),
+    // V3 Phase 4 (4.2) — the new Home. Each always resolves; see its function.
+    fetchTechFacts(efrId),
+    fetchSkills(efrId),
+    fetchHomeJobs(efrId),
+    fetchBestDay(efrId),
+    fetchLatestReview(efrId),
   ]);
 
   logger.info('Dashboard composed · newRequests=' + newRequests.count + ' · activeToday=' + dateCounts.activeToday + ' · allJobs=' + dateCounts.allJobs + ' · notices=' + (notices || []).length);
@@ -245,7 +258,16 @@ async function getDashboard(efrId, opts = {}) {
       ...shapeTechnician(ident),
       grade:  performance.grade,
       rating: performance.rating,
+      // V3 Phase 4 header tiles and chips (4.2).
+      earnedLifetime: techFacts.earnedLifetime,
+      points:         techFacts.points,
+      workArea:       techFacts.workArea,
+      skills,
     },
+    workingHours: workingHours(attendance.today),
+    escalation:   homeJobs.escalation,
+    home:         homeJobs.home,
+    yesterday:    { ...homeJobs.yesterday, bestDay, review },
     wallet: { balance: Number(ident?.current_balance ?? 0) },
     // `status` — TODAY's marked attendance. `tomorrow` — the NEXT day's
     // marked status, which seeds the home "Tomorrow" availability toggle
@@ -659,6 +681,297 @@ async function fetchDateCounts(efrId) {
   }
 }
 
+// ─── V3 Phase 4 — the new Home (4.2) ─────────────────────────────────
+/*
+ * QUERY BUDGET, fixed whatever the technician holds: techFacts 1 (+1 cities
+ * lookup when he has PINs) · skills 1 · home jobs 1 + technicianSharesForJobs
+ * 1-3 · best day 1 per technician per hour (cached) · review 1. Every piece
+ * resolves to an empty shape on failure — a missing tile must not take Home
+ * down — and every read is keyed on this technician's efr_id.
+ */
+const HOME_JOB_CAP = 500;
+const UPCOMING_DAYS = 7;
+const BEST_DAY_WINDOW_DAYS = 90;
+const BEST_DAY_TTL_MS = 60 * 60 * 1000;
+const BEST_DAY_CACHE_MAX = 10000;
+const WORKING_HOURS_PROP = 'technician.working_hours.default';
+const WORKING_HOURS_DEFAULT = '10:00-20:00';
+const DAY_MS = 86_400_000;
+
+const istDayAt = (ms) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(ms));
+
+/*
+ * The instant a DB DATETIME denotes. db.js hands DATETIMEs back as the IST
+ * wall-clock STRING (see istDayOf) — so it is read as +05:30, never as the
+ * server's local time. A Date is already an instant.
+ */
+function istInstantMs(value) {
+  if (value == null) return null;
+  if (value instanceof Date) return value.getTime();
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/.exec(String(value).trim());
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T${m[2].length === 5 ? m[2] + ':00' : m[2]}+05:30`);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/* JS mirror of NOT_STARTED_SQL — the Bookings Delayed chip's "not begun". */
+function notStarted(row) {
+  const s = Number(row.job_status);
+  if ([2, 10, 20].includes(s)) return false;
+  return !([15, 16].includes(s) && row.checkin_date_time != null);
+}
+
+/*
+ * Lifetime earned (the PHE overview's own figure: Σ tbl_job_transaction
+ * .efr_charge over his 3/5 jobs), reward points (Σ reward_points_ledger.delta,
+ * rewards balanceFor) and the PIN CSV, in ONE round trip; then the cities those
+ * PINs sit in, most-covered first, so the chip reads "<first> +N · <pins> PIN".
+ */
+async function fetchTechFacts(efrId) {
+  const empty = { earnedLifetime: null, points: null, workArea: { cities: [], pinCount: 0 } };
+  try {
+    const [[row]] = await pool.query(
+      `SELECT
+         (SELECT COALESCE(SUM(t.efr_charge), 0)
+            FROM tbl_job j JOIN tbl_job_transaction t ON t.fk_job_id = j.job_id
+           WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)) AS earned_lifetime,
+         (SELECT COALESCE(SUM(delta), 0) FROM reward_points_ledger WHERE easyfixer_id = ?) AS points,
+         (SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1) AS pincodes`,
+      [efrId, efrId, efrId],
+    );
+    // Same parse as getServiceablePincodes, so the chip and the PIN screen agree.
+    const pins = [...new Set(String(row?.pincodes || '').split(',').map((p) => p.trim())
+      .filter((p) => /^[0-9]{6}$/.test(p)))];
+    let cities = [];
+    if (pins.length) {
+      const [rows] = await pool.query(
+        `SELECT c.city_name, COUNT(*) AS n
+           FROM tbl_pincode p JOIN tbl_city c ON c.city_id = p.city_id
+          WHERE p.pincode IN (?)
+          GROUP BY c.city_id, c.city_name
+          ORDER BY n DESC, c.city_name
+          LIMIT 20`,
+        [pins],
+      );
+      cities = rows.map((r) => r.city_name).filter(Boolean);
+    }
+    return {
+      earnedLifetime: Math.round(Number(row?.earned_lifetime) || 0),
+      points: Math.trunc(Number(row?.points) || 0),
+      workArea: { cities, pinCount: pins.length },
+    };
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'fetchTechFacts failed; header tiles empty');
+    return empty;
+  }
+}
+
+/*
+ * The skills chip: the category holding most of his ACTIVE deep-skill picks
+ * (tbl_efr_deepskill_mapping, is_repairing = 1 — the table auto-assign matches
+ * on) and how many categories he has in all. The chip opens deep skills, so it
+ * reads the same rows.
+ */
+async function fetchSkills(efrId) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT sc.service_catg_name AS name, COUNT(*) AS n
+         FROM tbl_efr_deepskill_mapping m
+         JOIN tbl_service_catg sc ON sc.service_catg_id = m.category_id
+        WHERE m.easyfixer_id = ? AND m.is_repairing = 1
+        GROUP BY sc.service_catg_id, sc.service_catg_name
+        ORDER BY n DESC, sc.service_catg_name
+        LIMIT 50`,
+      [efrId],
+    );
+    return { primary: rows[0]?.name ?? null, count: rows.length };
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'fetchSkills failed');
+    return { primary: null, count: 0 };
+  }
+}
+
+/*
+ * D4: no per-technician window exists, so the COMPANY window from the property
+ * (a code default when the row is absent or malformed). workingToday is
+ * today's marked attendance — the same 'present' the attendance card shows.
+ */
+function workingHours(todayRow) {
+  const parse = (v) => /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/.exec(String(v ?? '').trim());
+  const m = parse(properties.getProperty(WORKING_HOURS_PROP)) || parse(WORKING_HOURS_DEFAULT);
+  return {
+    start: `${m[1]}:${m[2]}`,
+    end: `${m[3]}:${m[4]}`,
+    workingToday: attendanceStatus(todayRow) === 'present',
+  };
+}
+
+/*
+ * Critical · Today · Upcoming (D3), GO FIRST (D2), the escalation banner and
+ * yesterday's count and ₹ — from ONE read of his open jobs (bounded) plus
+ * yesterday's completions, then ONE technicianSharesForJobs over them. Sums are
+ * his share, never a client price.
+ *
+ *   critical  open, not started (NOT_STARTED_SQL's rule), and the appointment
+ *             has passed OR the job is escalated (latest rating row, the rule
+ *             decorateEscalation and the CRM use).
+ *   today     not critical, and its WORK DATE is today (appointment; check-in
+ *             for a started job — workDateOf, so Home and the Bookings chips
+ *             cannot disagree).
+ *   upcoming  not critical, work date in the next 7 days after today.
+ *   goFirstJobId  among not-started critical/today jobs: escalated first, then
+ *             the earliest appointment — which is both "most overdue" and
+ *             "earliest upcoming", one ascending order.
+ *   escalation    that job, when it is escalated; else null.
+ *   comingUpThisWeek  the upcoming count — the same 7-day window, named for
+ *             its own card so the app never re-derives it.
+ */
+async function fetchHomeJobs(efrId, now = Date.now()) {
+  const bucket = () => ({ count: 0, share: 0 });
+  const blank = () => ({
+    home: { critical: bucket(), today: bucket(), upcoming: bucket(), goFirstJobId: null, comingUpThisWeek: 0 },
+    escalation: null,
+    yesterday: { jobs: 0, earned: 0 },
+  });
+  try {
+    const today = istDayAt(now);
+    const yesterday = istDayAt(now - DAY_MS);
+    const lastUpcoming = istDayAt(now + UPCOMING_DAYS * DAY_MS);
+    const [rows] = await pool.query(
+      `SELECT j.job_id, j.job_status, j.requested_date_time, j.checkin_date_time, j.checkout_date_time,
+              COALESCE(st.service_type_name, sc.service_catg_name) AS title,
+              COALESCE(NULLIF(TRIM(ad.locality), ''), ci.city_name) AS area,
+              COALESCE(esc.is_escalated, 0) AS is_escalated
+         FROM tbl_job j
+         LEFT JOIN tbl_address ad ON ad.address_id = j.fk_address_id
+         LEFT JOIN tbl_city ci ON ci.city_id = ad.city_id
+         LEFT JOIN tbl_service_type st ON st.service_type_id = j.fk_service_type_id
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+         LEFT JOIN (SELECT r.job_id, MAX(r.table_id) AS table_id
+                      FROM tbl_easyfixer_rating_by_customer r
+                      JOIN tbl_job rj ON rj.job_id = r.job_id
+                     WHERE rj.fk_easyfixter_id = ? AND rj.job_status IN (${ACTIVE_STATUSES})
+                     GROUP BY r.job_id) latest ON latest.job_id = j.job_id
+         LEFT JOIN tbl_easyfixer_rating_by_customer esc ON esc.table_id = latest.table_id
+        WHERE j.fk_easyfixter_id = ?
+          AND (j.job_status IN (${ACTIVE_STATUSES})
+               OR (j.job_status IN (3, 5) AND j.checkout_date_time >= ? AND j.checkout_date_time < ?))
+        ORDER BY j.requested_date_time, j.job_id
+        LIMIT ${HOME_JOB_CAP}`,
+      [efrId, efrId, `${yesterday} 00:00:00`, `${today} 00:00:00`],
+    );
+    // ponytail: HOME_JOB_CAP open jobs; a technician holding more reads truncated sums.
+    const shares = rows.length ? await technicianSharesForJobs(pool, rows.map((r) => r.job_id)) : new Map();
+    const shareOf = (r) => Number(shares.get(Number(r.job_id))?.amount) || 0;
+    const out = blank();
+    const candidates = [];
+    for (const r of rows) {
+      const status = Number(r.job_status);
+      if (status === 3 || status === 5) {
+        out.yesterday.jobs += 1;
+        out.yesterday.earned += shareOf(r);
+        continue;
+      }
+      const escalated = Number(r.is_escalated) === 1;
+      const appointment = istInstantMs(r.requested_date_time);
+      const day = istDayOf(workDateOf(r));
+      let b = null;
+      if (notStarted(r) && ((appointment != null && appointment < now) || escalated)) b = 'critical';
+      else if (day === today) b = 'today';
+      else if (day && day > today && day <= lastUpcoming) b = 'upcoming';
+      if (!b) continue;
+      out.home[b].count += 1;
+      out.home[b].share += shareOf(r);
+      if (b !== 'upcoming' && notStarted(r)) candidates.push({ r, escalated, appointment });
+    }
+    candidates.sort((a, b) => (Number(b.escalated) - Number(a.escalated))
+      || ((a.appointment ?? Infinity) - (b.appointment ?? Infinity))
+      || (Number(a.r.job_id) - Number(b.r.job_id)));
+    const first = candidates[0];
+    out.home.goFirstJobId = first ? Number(first.r.job_id) : null;
+    out.escalation = first && first.escalated
+      ? { jobId: Number(first.r.job_id), title: first.r.title ?? null, area: first.r.area ?? null }
+      : null;
+    out.home.comingUpThisWeek = out.home.upcoming.count;
+    for (const k of ['critical', 'today', 'upcoming']) out.home[k].share = Math.round(out.home[k].share);
+    out.yesterday.earned = Math.round(out.yesterday.earned);
+    return out;
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'fetchHomeJobs failed; Home sections empty');
+    return blank();
+  }
+}
+
+/*
+ * "Your best day is N jobs" — the most jobs he completed (3/5, by checkout) on
+ * one IST day in the last 90. It moves at most once a day, so it is cached per
+ * technician for an hour: in-process, keyed by efr_id and never shared across
+ * technicians, same TTL shape as properties.service. A failure is not cached.
+ */
+const bestDayCache = new Map(); // efrId → { value, at }
+async function fetchBestDay(efrId, now = Date.now()) {
+  const key = Number(efrId);
+  const hit = bestDayCache.get(key);
+  if (hit && now - hit.at < BEST_DAY_TTL_MS) return hit.value;
+  try {
+    const [[row]] = await pool.query(
+      `SELECT MAX(t.n) AS best
+         FROM (SELECT COUNT(*) AS n FROM tbl_job
+                WHERE fk_easyfixter_id = ? AND job_status IN (3, 5) AND checkout_date_time >= ?
+                GROUP BY DATE(checkout_date_time)) t`,
+      [key, `${istDayAt(now - BEST_DAY_WINDOW_DAYS * DAY_MS)} 00:00:00`],
+    );
+    const value = Number(row?.best) || 0;
+    // ponytail: wholesale clear at the cap — bounded memory; an LRU if it ever matters.
+    if (bestDayCache.size >= BEST_DAY_CACHE_MAX) bestDayCache.clear();
+    bestDayCache.set(key, { value, at: now });
+    return value;
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'fetchBestDay failed');
+    return null;
+  }
+}
+
+/* "Anita Mehra" → "Anita M." — the card names the customer, not their surname. */
+function shortName(name) {
+  const parts = String(name ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+  return parts.length === 1 ? parts[0] : `${parts[0]} ${parts[parts.length - 1][0].toUpperCase()}.`;
+}
+
+/*
+ * His latest customer rating with words, who gave it and when. The reviewer is
+ * the name booked on that job (JOB_CUSTOMER_NAME_EXPR — the job's own name,
+ * master as fallback), shortened. The text is the customer's comment, else the
+ * review comment. table_id is the PK, so "latest" is the newest row.
+ */
+async function fetchLatestReview(efrId) {
+  try {
+    const [[row]] = await pool.query(
+      `SELECT r.customer_rating, r.comment, r.review_comment, r.insert_date_time,
+              ${jobService.JOB_CUSTOMER_NAME_EXPR} AS customer_name
+         FROM tbl_easyfixer_rating_by_customer r
+         LEFT JOIN tbl_job j ON j.job_id = r.job_id
+         LEFT JOIN tbl_customer cu ON cu.customer_id = j.fk_customer_id
+        WHERE r.easyfixer_id = ? AND r.customer_rating > 0
+        ORDER BY r.table_id DESC
+        LIMIT 1`,
+      [efrId],
+    );
+    if (!row) return null;
+    const text = [row.comment, row.review_comment].map((t) => String(t ?? '').trim()).find(Boolean) || null;
+    return {
+      rating: Number(row.customer_rating),
+      text,
+      reviewer: shortName(row.customer_name),
+      at: row.insert_date_time ?? null,
+    };
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'fetchLatestReview failed');
+    return null;
+  }
+}
+
 // ─── "New Requests" — offer-pool aware ───────────────────────────────
 /*
  * Resolves the home-screen "New Requests" section under THE OFFER MODEL.
@@ -788,5 +1101,10 @@ function mapJobForMobile(j) {
  */
 module.exports = {
   getDashboard, fetchIdentity,
-  _internals: { istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf, fetchDateCounts, ACTIVE_STATUSES },
+  _internals: {
+    istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf, fetchDateCounts, ACTIVE_STATUSES,
+    // V3 Phase 4 — asserted without a database in tests/v4-a-dashboard.test.js.
+    fetchTechFacts, fetchSkills, fetchHomeJobs, fetchBestDay, fetchLatestReview, workingHours,
+    istInstantMs, shortName, bestDayCache,
+  },
 };

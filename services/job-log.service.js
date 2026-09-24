@@ -214,6 +214,15 @@ const LOG_FOR = {
   JOB_VERIFIED: 'job verified',
   CLIENT_QC: 'client qc',
   LEDGER_POSTED: 'ledger posted',
+  /*
+   * V3 Phase 4 (2026-09-24) — the customer's signature (the PIN's fallback),
+   * the desk's per-job tools and products-at-site lists, and the desk booking
+   * visit 2 of a revisit. Same rule again: one fact, one value.
+   */
+  SIGNATURE_TAKEN: 'signature taken',
+  TOOLS_SET: 'tools set',
+  SITE_PRODUCTS_CHANGED: 'site products changed',
+  VISIT_TWO_SCHEDULED: 'visit two scheduled',
 };
 
 /*
@@ -243,6 +252,10 @@ const NEW_DATA_TOKEN = {
   [LOG_FOR.JOB_VERIFIED]: 'verified',
   [LOG_FOR.CLIENT_QC]: 'clientQc',
   [LOG_FOR.LEDGER_POSTED]: 'ledgerPosted',
+  [LOG_FOR.SIGNATURE_TAKEN]: 'signature',
+  [LOG_FOR.TOOLS_SET]: 'toolsSet',
+  [LOG_FOR.SITE_PRODUCTS_CHANGED]: 'siteProducts',
+  [LOG_FOR.VISIT_TWO_SCHEDULED]: 'visitTwo',
 };
 
 /*
@@ -282,6 +295,11 @@ const ETA_STATUS = {
   [LOG_FOR.JOB_VERIFIED]: null,
   [LOG_FOR.CLIENT_QC]: null,
   [LOG_FOR.LEDGER_POSTED]: null,
+  // V3 Phase 4: none is an ETA event either.
+  [LOG_FOR.SIGNATURE_TAKEN]: null,
+  [LOG_FOR.TOOLS_SET]: null,
+  [LOG_FOR.SITE_PRODUCTS_CHANGED]: null,
+  [LOG_FOR.VISIT_TWO_SCHEDULED]: null,
 };
 
 /*
@@ -843,6 +861,25 @@ const logClientQc = phase3Writer(LOG_FOR.CLIENT_QC,
 const logLedgerPosted = phase3Writer(LOG_FOR.LEDGER_POSTED, NO_DETAIL);
 
 /*
+ * V3 Phase 4 — same factory, same no-free-text rule. The signature's SVG is
+ * never logged (it is the customer's mark, and it lives in tbl_job_signature);
+ * the tools row carries only how many are now set (0 = cleared); the products
+ * row only which way the list moved; visit two only its visit number.
+ */
+const SITE_PRODUCT_CHANGES_LOGGED = ['added', 'removed'];
+const logSignatureTaken = phase3Writer(LOG_FOR.SIGNATURE_TAKEN, NO_DETAIL);
+const logToolsSet = phase3Writer(LOG_FOR.TOOLS_SET, ({ count }) => {
+  const n = intOrNull(count);
+  return n === null || n < 0 ? null : `Count: ${n}`;
+});
+const logSiteProductsChanged = phase3Writer(LOG_FOR.SITE_PRODUCTS_CHANGED,
+  ({ change }) => oneOf(SITE_PRODUCT_CHANGES_LOGGED, 'Change', change));
+const logVisitTwoScheduled = phase3Writer(LOG_FOR.VISIT_TWO_SCHEDULED, ({ visitNumber }) => {
+  const n = positiveIntOrNull(visitNumber);
+  return n === null ? null : `Visit: ${n}`;
+});
+
+/*
  * ── THE READ SIDE (V3 plan 3.1, 2026-09-23) ─────────────────────────────────
  *
  * Until now this module could only WRITE. tbl_job_logs has been accumulating
@@ -993,6 +1030,10 @@ module.exports = {
   logJobVerified,
   logClientQc,
   logLedgerPosted,
+  logSignatureTaken,
+  logToolsSet,
+  logSiteProductsChanged,
+  logVisitTwoScheduled,
   listForJob,
   ACTIVITY_LIMIT_MAX,
   sourceOf,

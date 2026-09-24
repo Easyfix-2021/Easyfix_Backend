@@ -6509,6 +6509,22 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     extras = rest;
   }
 
+  /*
+   * bump_visit_number (V3 Phase 4, D7) — the mobile checkout's revisit branch
+   * counts the visit in THIS UPDATE, as SQL arithmetic rather than a value read
+   * earlier, so two writers cannot both land the same number. Skipped when the
+   * job is already at 10: a retried revisit checkout is the same visit.
+   * COALESCE because legacy rows carry NULL for "the first visit".
+   */
+  if (extras && typeof extras === 'object' && 'bump_visit_number' in extras) {
+    if (extras.bump_visit_number === true && Number(existing.job_status) !== STATUS.REVISIT) {
+      sets.push('visit_number = COALESCE(visit_number, 1) + 1');
+    }
+    const rest = { ...extras };
+    delete rest.bump_visit_number;
+    extras = rest;
+  }
+
   // Tier-specific extras — caller passes a map of column→value pairs
   // for transition side-effects that don't generalise (mobile GPS
   // checkin, app_checkout_date_time, etc.). Whitelisted to prevent

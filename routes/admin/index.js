@@ -90,6 +90,9 @@ router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-mag
 // read is scope-only. Mounted under /jobs; both fall through from jobs.js.
 router.use('/jobs',          require('./job-charges'));
 router.use('/jobs',          require('./job-documents'));
+// V3 Phase 4 — /:id/{tools,site-products,signature,schedule-visit-two}. Two-segment
+// paths, disjoint from the routers above; each route carries its own gate.
+router.use('/jobs',          require('./jobs-phase4'));
 router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));

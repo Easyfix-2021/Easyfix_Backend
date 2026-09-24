@@ -415,8 +415,17 @@ async function loadReportInScope(reportId, req) {
  * this codebase clears those stamps. Pricing such a job would park it at 15 with
  * an estimate no client screen can act on, so it is a 409 the desk can read.
  */
-const PRICEABLE_STATUSES = new Set([1, 2, 15, 16, 20]);
-const ENTERS_ESTIMATE = new Set([1, 2, 20]);
+/*
+ * 10 is priceable (V3 Phase 4, 4.3). A checkout with additional work still
+ * pending closes as a REVISIT (10) — the technician has left. Without 10 here
+ * the claim sat at "pricing" forever: nothing could price it, so nothing could
+ * schedule visit 2. Priced from 10, the client's EXISTING approve flow asks for
+ * a visit slot and moves the job to 1 — which IS scheduling visit 2, exactly
+ * the design's "price it and get approval so visit 2 can be scheduled". A
+ * rejection returns it to 10 (estimateRejectStatus), never to "in progress".
+ */
+const PRICEABLE_STATUSES = new Set([1, 2, 10, 15, 16, 20]);
+const ENTERS_ESTIMATE = new Set([1, 2, 10, 20]);
 
 async function priceReport({ report, job: j }, { clientAmount, txAmount, note = null }, actor, { now = new Date() } = {}) {
   if (report.kind !== 'additional_work') throw httpError(400, 'Only additional work is priced');

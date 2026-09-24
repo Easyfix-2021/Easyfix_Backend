@@ -31,6 +31,7 @@ const incentives = require('../../services/job-incentive.service');
 const jobLog = require('../../services/job-log.service');
 const claims = require('../../services/mobile-job-claims.service');
 const { stripClientPrices } = require('./money-split');
+const { extrasForJobs } = require('../../services/job-extras.service');
 const {
   requireTechJobMutationCapability,
 } = require('../../middleware/require-tech-lifecycle-capability');
@@ -380,6 +381,8 @@ router.use('/jobs', require('./job-share'));
 // (/jobs/:id/{additional-work,cant-complete,cancel/undo,help,chat,money}).
 // Two-segment-plus paths like the routers above; same mount reason.
 router.use('/jobs', require('./jobs-phase3'));
+// V3 Phase 4 — the customer's signature (POST /jobs/:id/signature). Same mount reason.
+router.use('/jobs', require('./jobs-phase4'));
 
 router.get('/me', (req, res) => modernOk(res, { tech: req.tech }));
 
@@ -538,6 +541,77 @@ async function decorateTechnicianShare(rows) {
   return list;
 }
 
+/*
+ * ── HOME TAGS ON THE LIST (V3 Phase 4, 4.2) ─────────────────────────────
+ *
+ * The timeline card's tags, batched for the page like decorateEscalation and
+ * for the same reason done here, never in the shared jobService.list the CRM
+ * and the XLSX export read: ONE query for the whole page, whatever its size.
+ * Its correlated parts are all EXISTS/SUM on one job's own rows, bounded by
+ * the page cap (200).
+ *
+ *   approvedOn      tbl_job.approved_on_date_time (the client approved an
+ *                   estimate on this job) — the APPROVED tag.
+ *   travelCharge    Σ tx_charge of the job's 'Travel' job_material rows — HIS
+ *                   money (tx), never client_charge. Absent when none, not 0.
+ *   isNewCustomer   D5: the customer has no other COMPLETED (3/5) job. EXISTS
+ *                   stops at the first hit, so a bulk customer costs one probe.
+ *                   null when the job has no customer.
+ *   materialBought  D5: a revisit (visitNo ≥ 2, from decorateJobState — run it
+ *                   first) with a client-approved MATERIAL quotation line. The
+ *                   desk's additional-work price is also a 'material' line
+ *                   (ops-desk priceReport, name 'Additional work…'); it is
+ *                   excluded, or every approved extra would read as material.
+ */
+const quotationLineState = require('../../services/quotation-line-state');
+const CLIENT_APPROVED_LINE_SQL = quotationLineState.statePredicateSql('q', quotationLineState.STATE.CLIENT_APPROVED);
+async function decorateHomeTags(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const ids = [...new Set(list.map((r) => Number(r.job_id)).filter(Number.isSafeInteger))];
+  if (!ids.length) return list;
+  const [facts] = await pool.query(
+    `SELECT j.job_id, j.approved_on_date_time,
+            (SELECT SUM(m.tx_charge) FROM job_material m
+              WHERE m.job_id = j.job_id AND m.type = 'Travel') AS travel_charge,
+            CASE WHEN j.fk_customer_id IS NULL THEN NULL
+                 ELSE NOT EXISTS (SELECT 1 FROM tbl_job p
+                                   WHERE p.fk_customer_id = j.fk_customer_id
+                                     AND p.job_id <> j.job_id AND p.job_status IN (3, 5)) END AS new_customer,
+            EXISTS (SELECT 1 FROM quotation_details q
+                     WHERE q.job_id = j.job_id AND q.type = 'material'
+                       AND ${CLIENT_APPROVED_LINE_SQL}
+                       AND q.name NOT LIKE 'Additional work%') AS material_approved
+       FROM tbl_job j
+      WHERE j.job_id IN (?)`,
+    [ids],
+  );
+  const byId = new Map(facts.map((f) => [Number(f.job_id), f]));
+  for (const row of list) {
+    const f = byId.get(Number(row.job_id)) || {};
+    row.approvedOn = f.approved_on_date_time || null;
+    const travel = Math.round(Number(f.travel_charge) || 0);
+    if (travel > 0) row.travelCharge = travel;
+    row.isNewCustomer = f.new_customer == null ? null : Number(f.new_customer) === 1;
+    row.materialBought = Number(row.visitNo) >= 2 && Number(f.material_approved) === 1;
+  }
+  return list;
+}
+
+/*
+ * How was the customer's presence proven on this job, so far? `pinVerified` =
+ * a 'customer pin verified' history row (arrival or late — job-log.service),
+ * `signed` = a tbl_job_signature row (V3 Phase 4). One query; read by the
+ * detail (pinVerified) and by the checkout gate (both).
+ */
+async function closeProof(jobId) {
+  const [[row]] = await pool.query(
+    `SELECT EXISTS (SELECT 1 FROM tbl_job_logs WHERE job_id = ? AND log_for = ?) AS pin_verified,
+            EXISTS (SELECT 1 FROM tbl_job_signature WHERE job_id = ?) AS signed`,
+    [jobId, jobLog.LOG_FOR.CUSTOMER_PIN_VERIFIED, jobId],
+  );
+  return { pinVerified: Number(row?.pin_verified) === 1, signed: Number(row?.signed) === 1 };
+}
+
 router.get('/jobs', async (req, res, next) => {
   try {
     logger.info('List my jobs · status=' + (req.query.status != null ? req.query.status : 'active') + ' · limit=' + (req.query.limit != null ? req.query.limit : 50));
@@ -577,6 +651,8 @@ router.get('/jobs', async (req, res, next) => {
      * shared list is also the CRM's. Then every client price is stripped.
      */
     await claims.decorateJobState(rows);
+    // V3 Phase 4: the Home timeline's tags — after decorateJobState (visitNo).
+    await decorateHomeTags(rows);
     modernOk(res, stripClientPrices({ items: stripCustomerMobiles(await decorateTechnicianShare(rows)), total }));
   } catch (e) { next(e); }
 });
@@ -756,6 +832,21 @@ router.get('/jobs/:id', async (req, res, next) => {
       job.reports = reports;
       if (cancelRequest) job.cancelRequest = cancelRequest;
     }
+    /*
+     * V3 Phase 4 — "Tools to carry" (also on the offer, D8), "Products at site"
+     * (D9), the signature's date and whether a PIN was verified (D6: the finish
+     * step asks for neither again). extrasForJobs is ≤3 batched reads, plus
+     * closeProof's one — fixed, whoever views.
+     */
+    const [extras, proof] = await Promise.all([
+      extrasForJobs(pool, [job.job_id]),
+      closeProof(job.job_id),
+    ]);
+    const extra = extras.get(Number(job.job_id)) || {};
+    job.tools = extra.tools || [];
+    job.siteProducts = extra.siteProducts || [];
+    job.signatureOn = extra.signatureOn || null;
+    job.pinVerified = proof.pinVerified;
     // 3.9: the service lines keep their names and quantities, never their
     // client prices — see ./money-split.js.
     modernOk(res, stripClientPrices(stripCustomerMobiles(job)));
@@ -1330,10 +1421,11 @@ router.post('/jobs/:id/checkout',
      * gate cannot reach, so ops can always close a job the technician could not
      * (customer unreachable, wrong number on file, PIN never delivered).
      *
-     * A job whose row carries no PIN skips the check — same as check-in always
-     * did. Not every job goes through the BOOKED-confirm path that mints one, so
-     * enforcing unconditionally would make those permanently uncloseable.
-     * `/jobs/:id/checkin-sms` re-sends the PIN when the customer has lost it.
+     * A job whose row carries no PIN has no PIN check. Not every job goes
+     * through the BOOKED-confirm path that mints one; since V3 Phase 4 such a
+     * job COMPLETES on the customer's signature (see PIN OR SIGNATURE below),
+     * so it is never uncloseable. `/jobs/:id/checkin-sms` re-sends the PIN
+     * when the customer has lost it.
      */
     const jobPin = normalisePin(job.otp);
     const submittedPin = normalisePin(req.body.otp);
@@ -1352,11 +1444,48 @@ router.post('/jobs/:id/checkout',
     const pinLocked = (m) => refusePin('PIN attempts exceeded',
       `Too many incorrect PINs. Try again in ${m} minute${m === 1 ? '' : 's'}, or ask EasyFix to close the job.`,
       { reason: 'PIN_ATTEMPTS_EXCEEDED', retryAfterMinutes: m });
-    if (jobPin && !submittedPin) {
-      return refusePin('PIN missing', 'Closing PIN required. Ask the customer for the PIN sent to them.',
-        { reason: 'PIN_MISSING' });
+    /*
+     * ADDITIONAL WORK STILL WAITING → THIS IS VISIT 1, NOT THE END (V3 3.3,
+     * design sheet 12): "If he has reported additional work that is still
+     * unapproved, this same step lets him submit the booked portion and go;
+     * the additional comes back as visit 2, and visit 2 is paid." Decided
+     * HERE, from the server's own record of the claim, not from the app's
+     * isNextVisit — so a build that never learned to ask cannot close a job
+     * whose extra work the client has not yet answered. One indexed read.
+     * Read before the PIN gate because the gate differs by outcome (below).
+     */
+    const pendingExtraWork = await claims.hasUnresolvedAdditionalWork(job.job_id);
+    const isRevisit = req.body.isNextVisit === true || pendingExtraWork;
+    /*
+     * PIN OR SIGNATURE (V3 Phase 4, D6). Without a PIN in the body, the close
+     * is proven by the PIN verified EARLIER on this job (at arrival or late —
+     * the 'customer pin verified' history row) or by the customer's signature
+     * (tbl_job_signature). Neither → 409 PIN_OR_SIGNATURE_REQUIRED, which the
+     * app answers with "Enter the PIN now" or the signature pad. One query, and
+     * none of it is a guess: the attempt budget below is only spent on a PIN
+     * actually submitted.
+     *
+     * A COMPLETION (→ 3) needs that proof on every job — a job with no PIN on
+     * its row is closed by signature. A REVISIT (→ 10) keeps the old rule: a
+     * PIN-less job goes, a job with a PIN needs the PIN or the proof. Still
+     * mobile only: the CRM close (job.setStatus) is untouched.
+     */
+    if (!jobPin || !submittedPin) {
+      const { pinVerified, signed } = await closeProof(job.job_id);
+      if (!pinVerified && !signed && (jobPin || !isRevisit)) {
+        logger.warn('Check out blocked · id=' + req.params.id + ' · no PIN, verified PIN or signature');
+        if (res.locals) res.locals.logHint = 'checkout PIN or signature missing';
+        return modernError(res, 409, {
+          message: jobPin
+            ? 'Enter the customer\'s PIN, or take the customer\'s signature, to finish this job.'
+            : 'Take the customer\'s signature to finish this job.',
+          code: 'PIN_OR_SIGNATURE_REQUIRED',
+          // false = this job has no PIN, so only the signature can close it.
+          pinOnJob: Boolean(jobPin),
+        });
+      }
     }
-    if (jobPin) {
+    if (jobPin && submittedPin) {
       // Claimed BEFORE the compare; the store makes the claim atomic.
       const pinKey = 'job:' + job.job_id;
       const claim = await checkoutPinAttempts.claim(pinKey);
@@ -1372,17 +1501,6 @@ router.post('/jobs/:id/checkout',
       await checkoutPinAttempts.clear(pinKey);
     }
     const b = req.body;
-    /*
-     * ADDITIONAL WORK STILL WAITING → THIS IS VISIT 1, NOT THE END (V3 3.3,
-     * design sheet 12): "If he has reported additional work that is still
-     * unapproved, this same step lets him submit the booked portion and go;
-     * the additional comes back as visit 2, and visit 2 is paid." Decided
-     * HERE, from the server's own record of the claim, not from the app's
-     * isNextVisit — so a build that never learned to ask cannot close a job
-     * whose extra work the client has not yet answered. One indexed read.
-     */
-    const pendingExtraWork = await claims.hasUnresolvedAdditionalWork(job.job_id);
-    const isRevisit = b.isNextVisit === true || pendingExtraWork;
     const extras = {
       app_checkout_date_time: new Date(),
       is_collected_cash_by_app: b.isCashCollected ? 1 : 0,
@@ -1395,6 +1513,9 @@ router.post('/jobs/:id/checkout',
       extras.problem_reason_id = b.problemReasonId;
     }
     if (isRevisit) {
+      // V3 Phase 4 (D7): the revisit is visit N+1 — counted in setStatus's own
+      // UPDATE (and not again on a retry from 10). Visit 2 keeps this technician.
+      extras.bump_visit_number = true;
       if (b.easyfixerRevisitReasonId != null) extras.revisit_reason_id = b.easyfixerRevisitReasonId;
       if (b.requestedDateTime) {
         // App sends wall-clock 'yyyy-MM-ddTHH:mm:ss'. Legacy keeps the revisit

@@ -1205,7 +1205,9 @@ router.patch('/jobs/:id/estimate/reject', validate(Joi.object({ reason: Joi.stri
         'UPDATE tbl_job SET approval_reject_reason = ?, approval_reject_date_time = ? WHERE job_id = ?',
         [req.body.reason, new Date(), job.job_id]);
       await stampApprovalPendingLines(conn, job.job_id, false);
-      await jobService.setStatus(job.job_id, { status: 2 }, { user_id: link?.user_id ?? null }, { conn });
+      // 2 for an on-site estimate, 10 for additional work priced on a revisit.
+      const rejectTo = await require('../../services/job-estimate-approval').estimateRejectStatus(job.job_id, conn);
+      await jobService.setStatus(job.job_id, { status: rejectTo }, { user_id: link?.user_id ?? null }, { conn });
       await conn.commit();
     } catch (e) {
       try { await conn.rollback(); } catch { /* connection may already be gone */ }

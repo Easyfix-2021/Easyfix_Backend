@@ -436,6 +436,15 @@ const EXPECTED = {
     'qc_by_contact_id', 'qc_note', 'posted_on', 'post_error',
   ],
   tbl_client_qc_timing: ['client_id', 'qc_hours', 'check_hours', 'updated_on'],
+  /*
+   * V3 Phase 4 (migrations/2026-09-24-v3-phase4-tables.sql). Strict for the
+   * same reason as Phase 3: services/job-extras.service.js reads all three on
+   * the technician's job detail and the CRM job modal, so a missing column is a
+   * 500 there. RUN THE MIGRATION BEFORE THE DEPLOY — a missing table blocks boot.
+   */
+  tbl_job_signature: ['job_id', 'efr_id', 'svg_path', 'width', 'height', 'signed_on'],
+  tbl_job_tool: ['id', 'job_id', 'tool_id', 'added_on', 'added_by'],
+  tbl_job_site_product: ['id', 'job_id', 'name', 'qty', 'brand', 'added_on', 'added_by'],
 };
 
 /*
@@ -551,6 +560,13 @@ const REQUIRED_INDEXES = [
     columns: ['job_id', 'client_msg_id'],
     unique: true,
     impact: 'a phone retrying a chat send posts the same line twice',
+  },
+  // V3 Phase 4 — the tools-to-carry replace-set (migrations/2026-09-24-v3-phase4-tables.sql).
+  {
+    table: 'tbl_job_tool',
+    columns: ['job_id', 'tool_id'],
+    unique: true,
+    impact: 'a double-submitted Tools to Carry save lists the same tool twice on the job',
   },
 ];
 
