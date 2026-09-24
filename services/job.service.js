@@ -3067,6 +3067,14 @@ async function list({
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
+    /*
+     * Booking-queue attempt facts (attempts_count, last attempt, transferred_at),
+     * ONLY when a bucket is in play. They are correlated subqueries over the
+     * comment and call logs, and every other caller of this list would pay for
+     * columns it never renders. Same expressions the transfer rule uses, so a
+     * row's "2 of 3" and the tile it sits in cannot disagree.
+     */
+    + (bucket ? bookingQueue.attemptColumns('j') : '')
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
     + JOB_AGE_COLUMNS()

@@ -48,6 +48,15 @@ function holds(sql, job) {
   // regex: the opt-in subquery contains REPLACE(...) calls, so `[\s\S]*?\)`
   // stops at the first inner bracket and leaves a broken expression behind.
   let js = sql;
+  // The attempt ledger and the legacy marker, substituted before the EXISTS
+  // walk below — they are subqueries too, but they answer different questions.
+  js = js
+    .replace(/\(SELECT COUNT\(DISTINCT a2\.d\)[\s\S]*?\) a2\) >= 3/g, String(!!job.withClient))
+    // Anchored on the cut-over literal, which is the LAST thing inside this
+    // EXISTS — a lazy `\)\)` swallows the closing bracket of withClientSql
+    // too and leaves an expression that will not parse.
+    .replace(/EXISTS \(SELECT 1 FROM tbl_job_comment c_lg[\s\S]*?created_on < '[^']*'\)/g,
+      String(!!job.legacyTransfer));
   for (;;) {
     const at = js.indexOf('EXISTS (');
     if (at === -1) break;
@@ -86,17 +95,22 @@ test('every combination of facts lands in EXACTLY ONE tile', () => {
       for (const submitted of bools) {
         for (const failed of bools) {
           for (const hasRequest of bools) {
-            const job = { optedIn, sent, submitted, failed, hasRequest };
+            // withClient covers BOTH doors into the client queue (three
+            // attempt-days, or a pre-cutover Unreachable note) — they are the
+            // same fact to every other bucket, which must exclude it.
+            for (const withClient of bools) {
+            const job = { optedIn, sent, submitted, failed, hasRequest, withClient, legacyTransfer: withClient };
             const hit = bq.BUCKETS.filter((b) => holds(bq.bucketPredicate(b), job));
             assert.equal(hit.length, 1,
               `${JSON.stringify(job)} matched ${hit.length} tiles (${hit.join(', ') || 'none'}) — must be exactly 1`);
             checked += 1;
+            }
           }
         }
       }
     }
   }
-  assert.equal(checked, 32, 'the whole truth table was walked');
+  assert.equal(checked, 64, 'the whole truth table was walked');
 });
 
 test('the tile each kind of job lands in', () => {
@@ -115,6 +129,87 @@ test('the tile each kind of job lands in', () => {
   assert.equal(where({ optedIn: true, sent: true, failed: true }), 'delivery_failed', 'WhatsApp could not deliver');
   assert.equal(where({ optedIn: true, sent: true, failed: true, submitted: true }), 'response_received',
     'an answer beats an earlier failure report — it is the newer fact');
+});
+
+/* ── The attempt ledger and the transfer it triggers ─────────────────────── */
+
+/*
+ * THREE ATTEMPT-DAYS AND THE ORDER IS NOT OURS (ops, 2026-09-24).
+ *
+ * "One attempt" is something that actually went out THAT DAY: a delivered
+ * link, the Unreachable SMS, or a call that rang and did not connect. Three
+ * separate days and the order transfers itself — no button, exactly as the
+ * handover doc asks.
+ *
+ * What must NOT count, and each has a reason someone will otherwise re-add:
+ *   · an undelivered link — the customer never saw it, so a Delivery-failed
+ *     order would otherwise be handed over a day early;
+ *   · an ANSWERED call — that is the opposite of unreachable;
+ *   · two attempts on one day — distinct DATES, or an executive pressing
+ *     Unreachable twice in an afternoon transfers the order on day one.
+ */
+test('the attempt ledger counts distinct DAYS, from the three real sources', () => {
+  const sql = bq.attemptCountSql('j');
+  assert.match(sql, /COUNT\(DISTINCT a2\.d\)/, 'days, not rows');
+  assert.match(sql, /magic_link_sent_at/);
+  assert.match(sql, /comment_on = 16/, 'the Unreachable SMS and its note');
+  assert.match(sql, /tbl_job_caller_info/);
+  assert.match(sql, /NOT IN \('failed', 'undelivered'\)/,
+    'an undelivered link is not an attempt — the customer never saw it');
+  assert.match(sql, /caller_status IN \('NOANSWER_LEG2'/,
+    'only calls that rang and did not connect; an answered call is contact, not a failed attempt');
+  for (const answered of ['ANSWER', 'ANSWERED_LEG2', 'completed']) {
+    assert.ok(!bq.FAILED_CALL_STATUSES.includes(answered), `${answered} must never count`);
+  }
+});
+
+test('the transfer needs three days, and the client tile owns both doors', () => {
+  assert.equal(bq.ATTEMPTS_TO_TRANSFER, 3);
+  const client = bq.bucketPredicate('client_queue');
+  assert.match(client, />= 3/, 'three attempt-days');
+  assert.match(client, /c_lg\.created_on < '2026-09-25'/,
+    'or an Unreachable note from before the cut-over');
+});
+
+/*
+ * THE CUT-OVER, and why the date literal is not laziness.
+ *
+ * Until now ONE press of Unreachable moved an order to the client. 29 orders on
+ * QA sit there and only 3 have three attempt-days — so the new rule alone would
+ * push 26 orders the team has already handed over back onto the desk. A note
+ * written before the cut-over keeps the meaning it was written with; one after
+ * counts as an attempt like anything else.
+ */
+test('a pre-cutover Unreachable note still means transferred; a new one does not', () => {
+  const client = bq.bucketPredicate('client_queue');
+  const legacy = { optedIn: true, sent: true, withClient: false, legacyTransfer: true };
+  assert.ok(holds(client, legacy), 'the 26 stay with the client');
+
+  const today = { optedIn: true, sent: true, withClient: false, legacyTransfer: false };
+  assert.equal(holds(client, today), false,
+    'one press today records an attempt — it does not hand the order over');
+  assert.equal(holds(bq.bucketPredicate('no_response'), today), true,
+    'it stays in the calling queue until the third day');
+});
+
+test('the client tile counts days SINCE THE TRANSFER, not ticket age', () => {
+  const sql = bq.bucketPredicate('client_queue', { day: '1' });
+  assert.match(sql, /DATEDIFF\('\d{4}-\d{2}-\d{2}', COALESCE\(/,
+    'the clock starts at the third attempt, or the legacy note');
+  assert.doesNotMatch(sql, /DATEDIFF\('\d{4}-\d{2}-\d{2}', DATE\(j\.ticket_created_date_time\)\)/,
+    'ticket age on this tile would read "Day 148" for an order the client got yesterday');
+  // Every other tile keeps the ticket clock.
+  assert.match(bq.bucketPredicate('no_response', { day: '1' }),
+    /DATEDIFF\('\d{4}-\d{2}-\d{2}', DATE\(j\.ticket_created_date_time\)\)/);
+});
+
+test('the row chip and the transfer rule count the same thing', () => {
+  const cols = bq.attemptColumns('j');
+  assert.ok(cols.includes(bq.attemptCountSql('j')),
+    'the chip reads the ledger itself — a second count could say 2 of 3 on a row the rule already moved');
+  assert.match(cols, /AS attempts_count/);
+  assert.match(cols, /AS last_attempt_kind/);
+  assert.match(cols, /AS transferred_at/);
 });
 
 test('an instant failure is NOT left in "new" — that was the whole bug', () => {

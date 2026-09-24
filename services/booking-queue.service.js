@@ -45,11 +45,17 @@
  * Every open unconfirmed job lands in EXACTLY ONE bucket. A job listed twice
  * reads as two jobs and the tiles stop summing. The chain is:
  *
- *   1. not opted in            → no_link_needed   (no link will ever be sent)
- *   2. customer has answered   → response_received
- *   3. delivery failed         → delivery_failed
- *   4. link sent, no answer    → no_response
- *   5. nothing sent yet        → new
+ *   1. customer has answered   → response_received   (the newest, most useful fact)
+ *   2. three attempt-days      → client_queue        (it is not ours any more)
+ *   3. not opted in            → no_link_needed      (no link will ever be sent)
+ *   4. delivery failed         → delivery_failed
+ *   5. link sent, no answer    → no_response
+ *   6. nothing sent yet        → new
+ *
+ * client_queue sits SECOND, above even "not opted in": once an order has been
+ * handed to the client, which team would have called is no longer the point.
+ * It sits below "answered" because a customer who replies after we gave up is
+ * telling us something newer than our own three failures.
  *
  * "Answered" beats "failed" deliberately: if a customer somehow replied after
  * a failure report, the reply is the newer and more useful fact.
@@ -212,10 +218,22 @@ const DAY_BUCKETS = ['0', '1', '2', '3plus'];
  * BECAUSE IT IS NOT INPUT: it comes from the clock, never from a request, and
  * is re-checked against a strict YYYY-MM-DD shape before it is interpolated.
  */
-function ageDaysSql(alias = 'j', today = istToday()) {
+function ageDaysSql(alias = 'j', today = istToday(), anchor = 'ticket') {
   const ymd = String(today);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) throw new Error('booking-queue: bad IST date ' + ymd);
-  return `DATEDIFF('${ymd}', DATE(${alias}.ticket_created_date_time))`;
+  /*
+   * TWO CLOCKS, and the Client queue deliberately uses the second one.
+   *
+   *   ticket  how long the order has been in the system — what "Day 2" means
+   *           on every tile that is still ours to work.
+   *   client  how long it has sat WITH THE CLIENT. On that tile the ticket's
+   *           age is useless (they are all months old); the question is how
+   *           long the client has been sitting on it, so the pills count from
+   *           the day it was transferred. The column is labelled "With client"
+   *           so the two can never be read as the same number.
+   */
+  const from = anchor === 'client' ? transferredAtSql(alias) : `DATE(${alias}.ticket_created_date_time)`;
+  return `DATEDIFF('${ymd}', ${from})`;
 }
 
 /**
@@ -224,8 +242,8 @@ function ageDaysSql(alias = 'j', today = istToday()) {
  * predicate excludes the row from EVERY pill — so `3plus` claims it rather than
  * letting it fall out of the tile it is counted in.
  */
-function dayPredicate(day, alias = 'j', today = istToday()) {
-  const age = ageDaysSql(alias, today);
+function dayPredicate(day, alias = 'j', today = istToday(), anchor = 'ticket') {
+  const age = ageDaysSql(alias, today, anchor);
   switch (String(day)) {
     case '0': return `${age} = 0`;
     case '1': return `${age} = 1`;
@@ -235,7 +253,158 @@ function dayPredicate(day, alias = 'j', today = istToday()) {
   }
 }
 
-const BUCKETS = ['new', 'no_link_needed', 'response_received', 'no_response', 'delivery_failed'];
+/* ── Contact attempts, and the transfer they trigger ─────────────────────── */
+
+/*
+ * THE ATTEMPT LEDGER (ops, 2026-09-24).
+ *
+ * "One attempt" = something that actually went out to the customer on that
+ * day. Three separate days with at least one attempt, and the order stops
+ * being ours: it moves to the Client queue by itself, with no button — exactly
+ * as the handover doc asks ("the transfer happens automatically the moment the
+ * executive logs the last call as unanswered; do not build a separate button").
+ *
+ * THREE SOURCES, one rule:
+ *   the WhatsApp link, IF IT WAS DELIVERED   tbl_job.magic_link_sent_at
+ *   the Unreachable SMS + its note           tbl_job_comment, comment_on = 16
+ *   a call that rang and did not connect     tbl_job_caller_info
+ *
+ * WHAT DOES NOT COUNT, and why each matters:
+ *   · a link WhatsApp could not deliver — the customer never saw it, so a
+ *     Delivery-failed order needs three real attempts rather than being handed
+ *     to the client a day early on the strength of a message nobody received;
+ *   · a call the customer ANSWERED — we reached them; that is the opposite of
+ *     unreachable, and it neither counts nor resets. An answered day simply
+ *     adds nothing, so the order waits where it is;
+ *   · a second or third attempt on the SAME day — distinct DATES, not rows, or
+ *     an executive pressing Unreachable twice in an afternoon would hand the
+ *     order over on day one.
+ *
+ * Calendar days, not working days: EasyFix works seven days (ops, this phase).
+ */
+
+/** Call outcomes where the customer's leg rang and did not connect. */
+const FAILED_CALL_STATUSES = [
+  'NOANSWER_LEG2', 'BUSY_LEG2', 'FAILED_LEG2',
+  'NOANSWER', 'BUSY', 'CONGESTION', 'CANCEL',
+  'no_answer', 'busy', 'failed',
+];
+const FAILED_CALL_LIST = FAILED_CALL_STATUSES.map((v) => `'${v}'`).join(', ');
+
+/*
+ * The dates on which we reached out, as a subquery. Parameterless — every
+ * value in it is a constant of this module, never request input — so it drops
+ * into the list's WHERE and into the counts' SUM() columns alike.
+ */
+function attemptDatesSql(alias = 'j') {
+  return `SELECT DATE(a.at) AS d FROM (
+      SELECT ${alias}.magic_link_sent_at AS at
+       WHERE ${alias}.magic_link_sent_at IS NOT NULL
+         AND (${alias}.magic_link_delivery_status IS NULL
+              OR ${alias}.magic_link_delivery_status NOT IN ('failed', 'undelivered'))
+      UNION ALL
+      SELECT c_at.created_on FROM tbl_job_comment c_at
+       WHERE c_at.job_id = ${alias}.job_id AND c_at.comment_on = 16
+      UNION ALL
+      SELECT jci.inserted_time FROM tbl_job_caller_info jci
+       WHERE jci.job_id = ${alias}.job_id AND jci.call_type = 'OUT'
+         AND jci.caller_status IN (${FAILED_CALL_LIST})
+    ) a`;
+}
+
+/** How many separate days we have reached out on. */
+function attemptCountSql(alias = 'j') {
+  return `(SELECT COUNT(DISTINCT a2.d) FROM (${attemptDatesSql(alias)}) a2)`;
+}
+
+/** The day the third attempt landed — i.e. the day the order left our desk. */
+function thirdAttemptDateSql(alias = 'j') {
+  return `(SELECT a3.d FROM (SELECT DISTINCT DATE(a.at) AS d FROM (
+      SELECT ${alias}.magic_link_sent_at AS at
+       WHERE ${alias}.magic_link_sent_at IS NOT NULL
+         AND (${alias}.magic_link_delivery_status IS NULL
+              OR ${alias}.magic_link_delivery_status NOT IN ('failed', 'undelivered'))
+      UNION ALL
+      SELECT c_at.created_on FROM tbl_job_comment c_at
+       WHERE c_at.job_id = ${alias}.job_id AND c_at.comment_on = 16
+      UNION ALL
+      SELECT jci.inserted_time FROM tbl_job_caller_info jci
+       WHERE jci.job_id = ${alias}.job_id AND jci.call_type = 'OUT'
+         AND jci.caller_status IN (${FAILED_CALL_LIST})
+    ) a) a3 ORDER BY a3.d LIMIT 1 OFFSET 2)`;
+}
+
+/** How many days it takes before an order stops being ours. */
+const ATTEMPTS_TO_TRANSFER = 3;
+
+/*
+ * ── THE LEGACY CUT-OVER, and why a date literal is the honest answer ──────
+ *
+ * Until today, ONE press of Unreachable moved an order to the client — there
+ * was no counting. 29 orders on QA sit in that bucket and only 3 of them have
+ * three attempt-days; under the new rule alone, 26 orders the team has already
+ * handed over would reappear on the desk, which is not a migration, it is a
+ * surprise.
+ *
+ * So an Unreachable note written BEFORE the cut-over still means "transferred",
+ * exactly as it did when it was written, and one written after counts as an
+ * attempt like everything else. Old rows keep the meaning they were created
+ * with; new rows follow the new rule; nothing is rewritten in the database.
+ *
+ * The date is the day this shipped. It never changes.
+ */
+const LEGACY_TRANSFER_BEFORE = '2026-09-25';
+
+function legacyTransferSql(alias = 'j') {
+  return `EXISTS (SELECT 1 FROM tbl_job_comment c_lg
+       WHERE c_lg.job_id = ${alias}.job_id AND c_lg.comment_on = 16
+         AND c_lg.created_on < '${LEGACY_TRANSFER_BEFORE}')`;
+}
+
+/** The day an order reached the client: its third attempt, or the legacy note. */
+function transferredAtSql(alias = 'j') {
+  return `COALESCE(${thirdAttemptDateSql(alias)},
+      (SELECT MIN(DATE(c_lg2.created_on)) FROM tbl_job_comment c_lg2
+        WHERE c_lg2.job_id = ${alias}.job_id AND c_lg2.comment_on = 16))`;
+}
+
+/**
+ * The attempt facts a ROW needs, as a leading-comma projection fragment.
+ *
+ * Emitted only for the Booking queue (the list appends it when a `bucket` is in
+ * play), because these are correlated subqueries and every other page that
+ * reads /admin/jobs would pay for columns it never renders.
+ *
+ * The SAME expressions the transfer rule uses, so the chip on the row
+ * ("2 of 3 attempts") and the tile the row sits in can never tell different
+ * stories about the same order.
+ */
+function attemptColumns(alias = 'j') {
+  const union = `
+      SELECT ${alias}.magic_link_sent_at AS at, 'link' AS kind
+       WHERE ${alias}.magic_link_sent_at IS NOT NULL
+         AND (${alias}.magic_link_delivery_status IS NULL
+              OR ${alias}.magic_link_delivery_status NOT IN ('failed', 'undelivered'))
+      UNION ALL
+      SELECT c_k.created_on, 'sms' FROM tbl_job_comment c_k
+       WHERE c_k.job_id = ${alias}.job_id AND c_k.comment_on = 16
+      UNION ALL
+      SELECT jci_k.inserted_time, 'call' FROM tbl_job_caller_info jci_k
+       WHERE jci_k.job_id = ${alias}.job_id AND jci_k.call_type = 'OUT'
+         AND jci_k.caller_status IN (${FAILED_CALL_LIST})`;
+  return `,
+  ${attemptCountSql(alias)} AS attempts_count,
+  (SELECT k.at   FROM (${union}) k ORDER BY k.at DESC LIMIT 1) AS last_attempt_at,
+  (SELECT k.kind FROM (${union}) k ORDER BY k.at DESC LIMIT 1) AS last_attempt_kind,
+  ${transferredAtSql(alias)} AS transferred_at`;
+}
+
+/** With the client: three attempt-days, or an Unreachable note from before the cut-over. */
+function withClientSql(alias = 'j') {
+  return `(${attemptCountSql(alias)} >= ${ATTEMPTS_TO_TRANSFER} OR ${legacyTransferSql(alias)})`;
+}
+
+const BUCKETS = ['new', 'no_link_needed', 'response_received', 'no_response', 'delivery_failed', 'client_queue'];
 
 /*
  * The three Response-received pills are ALSO grid filters, so clicking one
@@ -250,6 +419,7 @@ const ALL_BUCKET_FILTERS = [...BUCKETS, ...RESPONSE_SUB_BUCKETS];
 const BUCKET_META = [
   { key: 'new', label: 'New — waiting for link', kind: 'waiting' },
   { key: 'response_received', label: 'Response received', kind: 'link' },
+  { key: 'client_queue', label: 'Client queue — pending', kind: 'client' },
   { key: 'no_response', label: 'No response', kind: 'link' },
   { key: 'delivery_failed', label: 'Delivery failed — call, no resend', kind: 'link' },
   { key: 'no_link_needed', label: 'No link needed — calling', kind: 'waiting' },
@@ -272,7 +442,9 @@ function bucketPredicate(bucket, { hasRequestTable = true, day } = {}) {
    * becoming its own query parameter to be combined by the caller — the grid
    * sends bucket + ageDay and gets exactly the rows the pill counted.
    */
-  const dayClause = day ? dayPredicate(day) : null;
+  const dayClause = day
+    ? dayPredicate(day, 'j', istToday(), bucket === 'client_queue' ? 'client' : 'ticket')
+    : null;
   if (day && !dayClause) return null;          // unknown pill: never unfiltered
   const withDay = (sql) => (dayClause ? `${sql} AND (${dayClause})` : sql);
   const optedIn = optedInSql();
@@ -289,17 +461,20 @@ function bucketPredicate(bucket, { hasRequestTable = true, day } = {}) {
     return withDay(`${optedIn} AND ${responded} AND (${sub})`);
   }
 
+  const client = withClientSql();
   switch (bucket) {
-    case 'no_link_needed':
-      return withDay(`NOT ${optedIn}`);
     case 'response_received':
       return withDay(`${optedIn} AND ${responded}`);
+    case 'client_queue':
+      return withDay(`NOT (${optedIn} AND ${responded}) AND ${client}`);
+    case 'no_link_needed':
+      return withDay(`NOT ${client} AND NOT ${optedIn}`);
     case 'delivery_failed':
-      return withDay(`${optedIn} AND NOT ${responded} AND ${failed}`);
+      return withDay(`NOT ${client} AND ${optedIn} AND NOT ${responded} AND ${failed}`);
     case 'no_response':
-      return withDay(`${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sent}`);
+      return withDay(`NOT ${client} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sent}`);
     case 'new':
-      return withDay(`${optedIn} AND NOT ${responded} AND NOT ${failed} AND NOT ${sent}`);
+      return withDay(`NOT ${client} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND NOT ${sent}`);
     default:
       return null;
   }
@@ -374,16 +549,19 @@ async function counts({
    * halves and the links-sent tally come off the same rows, so they cannot
    * disagree with each other and the five buckets always sum to `total`.
    */
-  const isNew = `${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}`;
+  const client = withClientSql();
+  const notClient = `NOT ${client}`;
+  const isNew = `${notClient} AND ${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}`;
   const ticketYmd = 'DATE(j.ticket_created_date_time)';
   const today = istToday(now);
   const [[row]] = await db.query(
     `SELECT COUNT(*) AS total,
         SUM(${isNew})                                                       AS b_new,
-        SUM(NOT ${optedIn})                                                 AS b_no_link,
+        SUM(${notClient} AND NOT ${optedIn})                                 AS b_no_link,
         SUM(${optedIn} AND ${responded})                                    AS b_responded,
-        SUM(${optedIn} AND NOT ${responded} AND ${failed})                  AS b_failed,
-        SUM(${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS b_no_response,
+        SUM(NOT (${optedIn} AND ${responded}) AND ${client})                 AS b_client,
+        SUM(${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed})  AS b_failed,
+        SUM(${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS b_no_response,
         SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable })}))      AS r_ready,
         SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable })})) AS r_reschedule,
         SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable })}))     AS r_cancel,
@@ -392,26 +570,30 @@ async function counts({
         SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
         SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
         SUM(${sentP})                             AS links_sent,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('0', 'j', today, 'client')}))     AS d_client_0,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('1', 'j', today, 'client')}))     AS d_client_1,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('2', 'j', today, 'client')}))     AS d_client_2,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('3plus', 'j', today, 'client')})) AS d_client_3plus,
         SUM((${isNew}) AND (${dayPredicate('0', 'j', today)})) AS d_new_0,
         SUM((${isNew}) AND (${dayPredicate('1', 'j', today)})) AS d_new_1,
         SUM((${isNew}) AND (${dayPredicate('2', 'j', today)})) AS d_new_2,
         SUM((${isNew}) AND (${dayPredicate('3plus', 'j', today)})) AS d_new_3plus,
-        SUM((NOT ${optedIn}) AND (${dayPredicate('0', 'j', today)})) AS d_no_link_0,
-        SUM((NOT ${optedIn}) AND (${dayPredicate('1', 'j', today)})) AS d_no_link_1,
-        SUM((NOT ${optedIn}) AND (${dayPredicate('2', 'j', today)})) AS d_no_link_2,
-        SUM((NOT ${optedIn}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_link_3plus,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('0', 'j', today)})) AS d_no_link_0,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('1', 'j', today)})) AS d_no_link_1,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('2', 'j', today)})) AS d_no_link_2,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_link_3plus,
         SUM((${optedIn} AND ${responded}) AND (${dayPredicate('0', 'j', today)})) AS d_responded_0,
         SUM((${optedIn} AND ${responded}) AND (${dayPredicate('1', 'j', today)})) AS d_responded_1,
         SUM((${optedIn} AND ${responded}) AND (${dayPredicate('2', 'j', today)})) AS d_responded_2,
         SUM((${optedIn} AND ${responded}) AND (${dayPredicate('3plus', 'j', today)})) AS d_responded_3plus,
-        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('0', 'j', today)})) AS d_failed_0,
-        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('1', 'j', today)})) AS d_failed_1,
-        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('2', 'j', today)})) AS d_failed_2,
-        SUM((${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('3plus', 'j', today)})) AS d_failed_3plus,
-        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('0', 'j', today)})) AS d_no_response_0,
-        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('1', 'j', today)})) AS d_no_response_1,
-        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('2', 'j', today)})) AS d_no_response_2,
-        SUM((${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_response_3plus
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('0', 'j', today)})) AS d_failed_0,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('1', 'j', today)})) AS d_failed_1,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('2', 'j', today)})) AS d_failed_2,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('3plus', 'j', today)})) AS d_failed_3plus,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('0', 'j', today)})) AS d_no_response_0,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('1', 'j', today)})) AS d_no_response_1,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('2', 'j', today)})) AS d_no_response_2,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_response_3plus
        FROM tbl_job j${joins}
       WHERE j.job_status = 9${scope}`,
     [today, today, today, today, ...whereParams],
@@ -429,6 +611,7 @@ async function counts({
     open: {
       new: n(row && row.b_new),
       no_link_needed: n(row && row.b_no_link),
+      client_queue: n(row && row.b_client),
       response_received: n(row && row.b_responded),
       no_response: n(row && row.b_no_response),
       delivery_failed: n(row && row.b_failed),
@@ -463,6 +646,8 @@ async function counts({
       response_received: dayMap(row, 'responded'),
       no_response: dayMap(row, 'no_response'),
       delivery_failed: dayMap(row, 'failed'),
+      /* Days WITH THE CLIENT, not ticket age — see ageDaysSql's two clocks. */
+      client_queue: dayMap(row, 'client'),
     },
     meta: BUCKET_META,
   };
@@ -474,4 +659,8 @@ module.exports = {
   DAY_BUCKETS, dayPredicate, ageDaysSql,
   optedInSql, respondedSql, failedSql, sentSql,
   bucketPredicate, istToday, counts,
+  // The attempt ledger — shared with job.service.js's list projection so the
+  // row chip and the transfer rule count the same thing.
+  ATTEMPTS_TO_TRANSFER, LEGACY_TRANSFER_BEFORE, FAILED_CALL_STATUSES,
+  attemptCountSql, thirdAttemptDateSql, transferredAtSql, withClientSql, attemptColumns,
 };
