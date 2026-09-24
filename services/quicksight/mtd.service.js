@@ -391,6 +391,12 @@ async function getMtdSummary({ from, to, verticalId, zonalManagerId, now } = {})
 module.exports = {
   METRICS,
   SORT_KEYS,
+  /*
+   * Exported for mtd-report.service.js, which groups the SAME job rows by the
+   * SAME person. Two copies of "is this row's SPOC a real member of staff"
+   * would be two answers the day the rule changes.
+   */
+  personIdOf,
   DEFAULT_SORT_BY,
   DEFAULT_SORT_DIR,
   MAX_PAGE_SIZE,
