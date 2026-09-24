@@ -194,13 +194,22 @@ const listQuery = Joi.object({
   customerId: intId.optional(),
   // Legacy "Filter Job" panel parity (2026-05-19). Each one is
   // narrow + cheap (single column LIKE or FK eq). See service.list().
-  customerQ:  Joi.string().min(1).max(100).optional(),
+  // customerQ min 3 (2026-09-24): a 1-2 char name term full-scans tbl_job for
+  // near-every row; the CRM withholds it below 3, this guards other callers.
+  customerQ:  Joi.string().trim().min(3).max(100).optional(),
   clientRef:  Joi.string().min(1).max(100).optional(),
   efrMobile:  Joi.string().min(1).max(20).optional(),
   pin:        Joi.string().min(1).max(10).optional(),
   stateId:    intId.optional(),
   categoryId: intId.optional(),
-  verticalId: intId.optional(),
+  /*
+   * `verticalId` — widened from a lone id to csvIds on 2026-09-23 for the
+   * dashboard bar's Verticals multi-select, which sends what Clients and Cities
+   * already send. A single id stays valid (csvIds is alternatives(intId, csv)),
+   * so every existing caller — Manage Jobs' filter card, the QuickSight report
+   * bodies, the export — is unaffected.
+   */
+  verticalId: csvIds.optional(),
   /*
    * `sourceType` (2026-08-07) — exact match on tbl_job.source_type, the
    * booking-CHANNEL label ('website', 'Bulk Upload', 'Client_App',
@@ -261,6 +270,20 @@ const listQuery = Joi.object({
    * rejected here rather than quietly returning an unfiltered list.
    */
   section: Joi.string().valid(...require('../services/client-request.service').SECTIONS).optional(),
+  /*
+   * `bucket` — one of the five My Orders -> Booking queue tiles. Valid values
+   * come from booking-queue.service.js for the same reason `section` reads its
+   * list from client-request.service.js: this schema must not be a second,
+   * drifting copy of the bucket names.
+   */
+  bucket: Joi.string().valid(...require('../services/booking-queue.service').ALL_BUCKET_FILTERS).optional(),
+  // The Booking-queue day pill. Values come from booking-queue.service.js for
+  // the same reason `bucket` does — this schema must not be a second, drifting
+  // copy of the vocabulary.
+  ageDay: Joi.string().valid(...require('../services/booking-queue.service').DAY_BUCKETS).optional(),
+  // The Booking-queue "Rescheduled by customer" flag chip. Distinct from
+  // auto_rescheduled (our own after-3pm shift) — this is the customer's ask.
+  customerRescheduled: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
   /*
    * `requestedBefore` — drives the AttentionSummary's Running Late tile.
    *   'now' → j.requested_date_time IS NOT NULL AND j.requested_date_time < NOW()
@@ -348,6 +371,47 @@ const PENDING_START_COUNT_FILTERS = ['q', 'categoryId', 'cityId', 'clientId', 'z
 const pendingStartCountsQuery = Joi.object(Object.fromEntries(
   PENDING_START_COUNT_FILTERS.map((key) => [key, listQuery.extract(key)]),
 ));
+
+/*
+ * ── THE DASHBOARD FILTER BAR (2026-09-23) ─────────────────────────────────
+ *
+ * The four filters on /dashboard — Client, City, Project Manager, Zonal
+ * Manager. Same construction and the same reason as the two tab-strip schemas
+ * above: every key is EXTRACTED from listQuery, so a card's number and the
+ * Manage Jobs grid an operator opens next accept a value identically. A
+ * hand-copied `csvIds.optional()` would be a second copy of the CSV cap for
+ * someone to keep in step by hand, and nothing would say when it stopped being
+ * in step.
+ *
+ * Four, not more. The dashboard has roughly one filter row of above-the-fold
+ * headroom, and the set is deliberately the four ways an EasyFix manager owns a
+ * queue rather than every column a job has — /jobs is where a twenty-field
+ * filter panel belongs.
+ *
+ * No date range, deliberately: both endpoints count LIVE OPEN STATE, so a date
+ * filter would quietly redefine every number on the page ("146 pending for
+ * scheduling" means right now, not booked-this-month). If ops asks for one it
+ * needs its own treatment on the card subtitles, not a silent extra key here.
+ */
+/*
+ * 2026-09-23: Project Manager gave way to Vertical on the bar, per ops. The
+ * page still shows FOUR filters and still fits one row — this is a swap, not an
+ * addition. `projectManagerId` is deliberately LEFT in listQuery and in
+ * buildDashboardFilters: it is a supported, tested filter on /admin/jobs, and
+ * keeping the predicate means putting the control back is a one-line FE change.
+ * It simply is not in this list any more, so the two dashboard endpoints stop
+ * lifting it off the query.
+ */
+const DASHBOARD_FILTERS = ['clientId', 'cityId', 'verticalId', 'zonalManagerId'];
+const dashboardFilterKeys = () => Object.fromEntries(
+  DASHBOARD_FILTERS.map((key) => [key, listQuery.extract(key)]),
+);
+/*
+ * /counts additionally accepts ownerId — the My Orders flow scopes the same
+ * cards to the operator's own jobs. /attention-summary never had it.
+ */
+const dashboardCountsQuery    = Joi.object({ ...dashboardFilterKeys(), ownerId: listQuery.extract('ownerId') });
+const dashboardAttentionQuery = Joi.object(dashboardFilterKeys());
 
 const customerBlock = Joi.object({
   customer_id: intId.optional(),
@@ -740,4 +804,8 @@ module.exports = {
   // so a test can assert the strip honours every filter the grid sends.
   pendingSchedulingCountsQuery, PENDING_SCHEDULING_COUNT_FILTERS,
   pendingStartCountsQuery, PENDING_START_COUNT_FILTERS,
+  // Same pairing for the dashboard bar: the two schemas plus the key list they
+  // are built from, so the route can lift exactly those keys off a validated
+  // query without re-typing them a third time.
+  dashboardCountsQuery, dashboardAttentionQuery, DASHBOARD_FILTERS,
 };

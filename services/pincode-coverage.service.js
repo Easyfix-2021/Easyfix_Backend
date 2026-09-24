@@ -17,6 +17,24 @@ const logger = require('../logger');
  * They now share this module, because two definitions of one word is exactly
  * how the old day-based TAT ended up with five.
  *
+ * ── COVERAGE vs SERVICE AREA — read this before adding a function ──────────
+ *
+ * There are exactly TWO questions here, and the difference is home pincodes:
+ *
+ *   COVERAGE      home ∪ declared   "can anyone be dispatched here?"
+ *                 getCoveredPincodes · isCovered · getTechnicianIdsForPincodes
+ *                 → TAT Visit targets, job allocation, zone membership
+ *
+ *   SERVICE AREA  declared only     "who signed up to work here?"
+ *                 getServiceAreaSet · getServiceAreaCounts
+ *                 → Settings → Manage Pincodes, the "Mapping" column
+ *
+ * This is NOT the "two definitions of one word" the paragraph above warns
+ * about — they are two words. A technician living in 122001 can be dispatched
+ * there, but has not committed to working there, and the Mapping column reports
+ * commitments because the list it drills into is the commitment table. Both
+ * questions are answered off ONE cached read of the supply; see SOURCE below.
+ *
  * ── Why this is not a SQL predicate ────────────────────────────────────────
  *
  * The obvious implementation is an EXISTS correlated on the pincode:
@@ -74,6 +92,16 @@ const CACHE_TTL_MS = 60_000;
 let cache = null;
 
 /*
+ * Where a supply row came from. The two are NOT interchangeable:
+ *   HOME         — tbl_easyfixer.efr_pin_no, the pincode the technician lives in
+ *   SERVICE_AREA — tbl_efr_serviceable_pincodes.pincodes, the list they maintain
+ *
+ * Living somewhere is not agreeing to take jobs there. Dispatch questions want
+ * the union; "who has signed up to work here" wants SERVICE_AREA alone.
+ */
+const SOURCE = Object.freeze({ HOME: 'home', SERVICE_AREA: 'service-area' });
+
+/*
  * Cache the RAW supply rows, not a derived index.
  *
  * The tempting shape is Map<pincode, Set<efrId>> — but ~30k technicians × ~50
@@ -106,28 +134,39 @@ async function loadSupply() {
 
   // Pre-split ONCE into (efrId, pins[]) — the split is the expensive part and
   // the token arrays are the same strings, not copies.
+  //
+  // Every row carries its SOURCE. Two different questions are asked of this one
+  // cache and they disagree about home pincodes (see SOURCE below), so the fact
+  // has to survive into the cached row — deriving it later is impossible.
   const supply = [];
   for (const r of homeRows) {
     const pin = String(r.pin).replace(/ /g, '');
-    if (pin) supply.push({ efrId: r.efr_id, pins: [pin], active: isDispatchable(r) });
+    if (pin) supply.push({ efrId: r.efr_id, pins: [pin], active: isDispatchable(r), source: SOURCE.HOME });
   }
   for (const r of csvRows) {
     // Mirrors REPLACE(pincodes, ' ', '') exactly — including internal spaces.
     const pins = String(r.pincodes).split(',').map((t) => t.replace(/ /g, '')).filter(Boolean);
-    if (pins.length) supply.push({ efrId: r.efr_id, pins, active: isDispatchable(r) });
+    if (pins.length) supply.push({ efrId: r.efr_id, pins, active: isDispatchable(r), source: SOURCE.SERVICE_AREA });
   }
 
   // The strict covered-set is precomputed because it is the hottest question
   // and is small (bounded by real pincodes, ~20k), unlike the per-technician
-  // index which is not.
-  const covered = new Set();
+  // index which is not. `serviceArea` is the same shape for the declared-only
+  // question — built in the SAME pass, so the second set costs one branch, not
+  // a second walk.
+  const covered     = new Set();
+  const serviceArea = new Set();
   for (const row of supply) {
     if (!row.active) continue;
-    for (const pin of row.pins) covered.add(pin);
+    for (const pin of row.pins) {
+      covered.add(pin);
+      if (row.source === SOURCE.SERVICE_AREA) serviceArea.add(pin);
+    }
   }
 
-  cache = { at: Date.now(), supply, covered };
-  logger.info('Pincode coverage refreshed · supplyRows=' + supply.length + ' coveredPincodes=' + covered.size);
+  cache = { at: Date.now(), supply, covered, serviceArea };
+  logger.info('Pincode coverage refreshed · supplyRows=' + supply.length
+    + ' coveredPincodes=' + covered.size + ' serviceAreaPincodes=' + serviceArea.size);
   return cache;
 }
 
@@ -159,52 +198,72 @@ async function getCoveredPincodes(pincodes) {
 }
 
 /*
- * The WHOLE covered set — every pincode at least one dispatchable technician
- * services. Same cache as getCoveredPincodes; this is the "I don't have a
- * candidate list to test" form of the same question.
+ * The WHOLE declared-service-area set — every pincode at least one dispatchable
+ * technician has LISTED in tbl_efr_serviceable_pincodes. Same cache as
+ * getCoveredPincodes; this is the "I don't have a candidate list to test" form
+ * of the service-area question.
+ *
+ * SERVICE_AREA only — home pincodes are excluded. See getServiceAreaCounts for
+ * why Manage Pincodes asks this narrower question rather than the dispatch one.
  *
  * Exists for the Manage Pincodes LOCAL/TRAVEL filter, which has to narrow the
  * query BEFORE pagination: deriving LOCAL/TRAVEL per row and filtering the page
  * afterwards drops rows out of a page that is already cut to size, and leaves
- * the total counting rows the filter rejected.
+ * the total counting rows the filter rejected. It MUST stay in step with
+ * getServiceAreaCounts — the filter and the badge describe one population, or a
+ * row shows LOCAL in a list its own filter would reject.
  *
  * Returned as a COPY. The cached Set is shared and long-lived; handing out the
  * live object invites a caller to mutate coverage for the whole process.
  */
-async function getCoveredSet() {
-  const { covered } = await loadSupply();
-  return new Set(covered);
+async function getServiceAreaSet() {
+  const { serviceArea } = await loadSupply();
+  return new Set(serviceArea);
 }
 
 /*
- * HOW MANY dispatchable technicians cover each of `pincodes`?
- * Returns Map<pincode, count>; a pincode with none is absent from the map.
+ * HOW MANY dispatchable technicians have DECLARED each of `pincodes` in their
+ * service area? Returns Map<pincode, count>; a pincode with none is absent.
  *
- * Manage Pincodes rendered "Local - 1 Technician" for every covered pincode,
- * because its caller derived the figure as `covered.has(pin) ? 1 : 0` — a
- * boolean wearing a count's clothes. It read as a real headcount on screen, so
- * a pincode with forty technicians and one with a single technician looked
- * identical, and the number was the one thing that column existed to say.
+ * ── Service area is not coverage ───────────────────────────────────────────
+ *
+ * SERVICE_AREA rows only. tbl_easyfixer.efr_pin_no — the technician's home
+ * pincode — is deliberately NOT counted here, though getCoveredPincodes /
+ * isCovered / getTechnicianIdsForPincodes (TAT, job allocation, zones) still
+ * include it. Two questions, two answers:
+ *
+ *   "can anyone be dispatched here?"    → home ∪ declared  (getCoveredPincodes)
+ *   "who signed up to work here?"       → declared only    (this)
+ *
+ * Living in a pincode is not agreeing to take jobs in it. Manage Pincodes asks
+ * the second question: its Mapping badge reports the technicians ops can hold
+ * to a service commitment, and the drill-down it opens
+ * (listTechniciansForPincode) lists exactly those people from
+ * tbl_efr_serviceable_pincodes. Counting home pincodes in the badge and not in
+ * the list made 122001 read "Local · 38 Technicians" over a list of 5.
+ *
+ * Do NOT "unify" this back onto `covered` to remove the second definition. The
+ * duplication is the point: one set answers dispatch, the other answers
+ * commitment, and the badge must match the list it opens.
  *
  * ONE pass over the cached supply, not one call per pincode. Same cache as
  * every other reader here, so this costs no query — and a technician is counted
  * once per pincode however many of their entries match it.
  */
-async function getCoverageCounts(pincodes) {
+async function getServiceAreaCounts(pincodes) {
   const wanted = new Set(normalise(pincodes));
   if (!wanted.size) return new Map();
   const { supply } = await loadSupply();
   /*
    * Sets of efr_id per pincode, collapsed to sizes at the end — NOT a running
-   * tally. One technician can reach the same pincode twice: once as their home
-   * pincode and again in their serviceable CSV, which are separate rows in the
-   * supply. Incrementing a counter double-counts that person, and a test caught
-   * exactly that. Identity is the thing being counted, so identity is what the
-   * structure has to hold.
+   * tally. One technician can list the same pincode more than once across their
+   * supply rows. Incrementing a counter double-counts that person, and a test
+   * caught exactly that. Identity is the thing being counted, so identity is
+   * what the structure has to hold.
    */
   const byPin = new Map();
   for (const row of supply) {
-    if (!row.active) continue;
+    if (!row.active || row.source !== SOURCE.SERVICE_AREA) continue;
     for (const pin of row.pins) {
       if (!wanted.has(pin)) continue;
       let ids = byPin.get(pin);
@@ -255,8 +314,8 @@ function invalidateCoverage() {
 
 module.exports = {
   getCoveredPincodes,
-  getCoveredSet,
-  getCoverageCounts,
+  getServiceAreaSet,
+  getServiceAreaCounts,
   getTechnicianIdsForPincodes,
   isCovered,
   invalidateCoverage,

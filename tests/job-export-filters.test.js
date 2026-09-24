@@ -192,8 +192,34 @@ test('the verticalId FILTER stays independent of the verticals SCOPE', () => {
    * EMPTY with nothing in it to explain why.
    */
   const w = where({ scope: SCOPE, verticalId: 3 });
-  assert.match(w, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id = \?\)/);
+  assert.match(w, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id IN \(\?\)\)/);
   assert.match(w, /CL\.vertical_id IN \(\?\)/);
+});
+
+/*
+ * THE RECORDED BUG (2026-09-23). listQuery's verticalId was widened from a lone
+ * id to csvIds for the dashboard bar's Verticals multi-select. This predicate
+ * was gated on `Number(verticalId) > 0`, and Number('3,7') is NaN — so a
+ * two-vertical selection made the clause VANISH and the sheet came back with
+ * every vertical in it.
+ *
+ * It was silent from every direction: validation passed (a CSV is legal now),
+ * the grid on screen was filtered correctly, and the route's "cannot apply
+ * these filters" warning stayed quiet because verticalId is ledgered 'filter'
+ * in FILTER_COVERAGE and so is never in UNAPPLIED_FILTERS. The only symptom was
+ * an export that did not match the table it was exported from.
+ *
+ * The fixture above and at the coverage table both use a SINGLE id, which is
+ * why the suite would not have caught it. This is the multi case.
+ */
+test('THE RECORDED BUG: a CSV verticalId still emits its clause, with every id bound', () => {
+  const w = where({ verticalId: '3,7' });
+  assert.match(
+    w,
+    /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id IN \(\?, \?\)\)/,
+    'a two-vertical selection must not silently drop the filter: ' + w,
+  );
+  assert.equal((w.match(/tbl_vertical_mapping/g) || []).length, 1, 'one EXISTS, not two');
 });
 
 test('cityId and the cities scope filter the SAME column', () => {
@@ -513,6 +539,12 @@ const SAMPLE = {
   quotationStatus: 'approved',
   requestedBefore: 'now',
   section: 'overdue',
+  // Booking-queue tile + its flag chip. Both are ignored by the export (see
+  // FILTER_COVERAGE): dropping them yields a superset of the tile, never
+  // another tile's rows.
+  bucket: 'no_response',
+  ageDay: '3plus',
+  customerRescheduled: 'true',
   sortBy: 'job_id',
   sortDir: 'asc',
   limit: 50,
@@ -880,4 +912,21 @@ test('the numeric path binds every value — wildcards and quotes are never inli
     const r = whereAndParams({ q });
     assert.equal(r.where.includes(q), false, `${q} must not appear inline in the SQL`);
   }
+});
+
+test('customerQ: a phone-shaped term uses the same prefix set lookup as list(); a name keeps the LIKE pair', () => {
+  const phone = whereAndParams({ customerQ: '98453 02806' });
+  assert.match(phone.where, /J\.fk_customer_id IN \(SELECT qmob\.customer_id FROM tbl_customer qmob WHERE qmob\.customer_mob_no LIKE \?\)/);
+  assert.ok(!/C\.customer_mob_no LIKE/.test(phone.where), 'no %t% join match for a phone');
+  assert.ok(phone.params.includes('9845302806%'));
+  const name = whereAndParams({ customerQ: 'ravi' });
+  assert.match(name.where, /C\.customer_mob_no LIKE \?\)/);
+  assert.ok(name.params.includes('%ravi%'));
+});
+
+test('customerQ requires 3+ characters after trimming', () => {
+  for (const bad of ['a', 'ab', '  ab  ']) {
+    assert.ok(listQuery.validate({ customerQ: bad }).error, `${JSON.stringify(bad)} must be rejected`);
+  }
+  assert.equal(listQuery.validate({ customerQ: ' abc ' }).value.customerQ, 'abc');
 });

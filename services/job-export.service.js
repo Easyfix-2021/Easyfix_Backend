@@ -655,7 +655,7 @@ const FILTER_COVERAGE = Object.freeze({
   pin:              ['filter',   'A.pin_code LIKE %v%'],
   stateId:          ['filter',   'city.state_id = ? (shared name)'],
   categoryId:       ['filter',   'J.fk_service_catg_id = ?'],
-  verticalId:       ['filter',   'EXISTS tbl_vertical_mapping — independent of the verticals SCOPE'],
+  verticalId:       ['filter',   'EXISTS tbl_vertical_mapping, id OR CSV — independent of the verticals SCOPE'],
   sourceType:       ['filter',   'J.source_type = ?'],
   rating:           ['filter',   'TERBC.customer_rating (shared name; legacy predicate)'],
   reopen:           ['filter',   'J.job_reopen_flag'],
@@ -719,6 +719,25 @@ const FILTER_COVERAGE = Object.freeze({
    * filters: a superset of the section, and the route logs the drop.
    */
   section:          ['ignored',  'needs reason ids from a DB read where() cannot do'],
+  /*
+   * The Booking-queue tiles, ignored for the same two reasons as the pair
+   * above and with the same safe failure mode.
+   *
+   * bucketPredicate() is synchronous and would fit here, but it needs the
+   * tbl_job_customer_request probe (an async DB read this module cannot make)
+   * to decide whether "the customer answered" may read that table, and its
+   * fragment is j-aliased while the export runs under J — the exact bind
+   * offerState above cannot do either. Assuming the table is present where it
+   * is not would 500 the export; assuming it absent would under-count answers
+   * and hand an operator a sheet that disagrees with the tile they clicked.
+   *
+   * Dropped, both of them, the sheet is every unconfirmed job matching the
+   * other filters — a SUPERSET of the tile, never somebody else's rows — and
+   * the route logs the drop.
+   */
+  bucket:              ['ignored',  'needs the customer-request probe + a J-alias bind where() cannot do'],
+  ageDay:              ['ignored',  'rides inside the bucket predicate — see bucket'],
+  customerRescheduled: ['ignored',  'same probe, same alias — see bucket'],
   /*
    * Keyset pagination requires the sort key to BE the cursor, and the cursor
    * is J.job_id DESC (see fetchExportChunk). An arbitrary ORDER BY would skip
@@ -1163,8 +1182,24 @@ function buildClauses(filters = {}) {
    * written against the V join can never both hold for different ids, and the
    * sheet comes back empty with nothing to explain it.
    */
-  if (Number(verticalId) > 0) {
-    push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.vertical_id = ?)', Number(verticalId));
+  /*
+   * CSV-aware since 2026-09-23, when listQuery's verticalId was widened from a
+   * lone id to csvIds for the dashboard bar's Verticals multi-select.
+   *
+   * The old gate was `Number(verticalId) > 0`, and Number('3,7') is NaN, so a
+   * two-vertical selection made this predicate VANISH — the sheet came back
+   * with every vertical in it and nothing said so, because verticalId is
+   * ledgered 'filter' in FILTER_COVERAGE and therefore never appears in the
+   * route's "cannot apply these filters" warning. That is verbatim the failure
+   * toIdArray's own docblock above describes for clientId. One toIdArray call
+   * is the whole fix, and it keeps a lone id working exactly as before.
+   */
+  const verticalIdList = toIdArray(verticalId);
+  if (verticalIdList.length) {
+    push(
+      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = J.fk_client_id AND vm.vertical_id IN (${verticalIdList.map(() => '?').join(', ')}))`,
+      ...verticalIdList,
+    );
   }
   // Project Manager — the user mapped to the job's client with user_type = 1.
   // Self-contained EXISTS, same shape as list().
@@ -1185,9 +1220,17 @@ function buildClauses(filters = {}) {
      * not the master name alone — same reason list() does: otherwise typing
      * the name visible on screen returns nothing for every job that overrides
      * it.
+     *
+     * A phone-shaped term takes list()'s prefix set lookup (2026-09-24), so the
+     * sheet holds exactly the rows the grid showed for the same search.
      */
-    const v = `%${String(customerQ).trim()}%`;
-    push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR C.customer_mob_no LIKE ?)`, v, v);
+    const mobileTerm = String(customerQ).replace(/[\s+-]/g, '');
+    if (/^\d+$/.test(mobileTerm) && mobileTerm.length >= MOBILE_MIN_DIGITS) {
+      push('J.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)', `${mobileTerm}%`);
+    } else {
+      const v = `%${String(customerQ).trim()}%`;
+      push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR C.customer_mob_no LIKE ?)`, v, v);
+    }
   }
 
   if (notEmpty(sourceType)) push('J.source_type = ?', String(sourceType));

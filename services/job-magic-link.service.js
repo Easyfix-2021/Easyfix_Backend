@@ -1123,6 +1123,86 @@ async function fetchPrefill(jobId, pool) {
   };
 }
 
+/*
+ * ── Instant (dispatch-time) link failures ───────────────────────────────────
+ *
+ * A link can fail two ways, and until 2026-09-22 only the second was recorded:
+ *
+ *   LATE     Gallabox accepts the message, then reports failed / undelivered
+ *            on a status callback → routes/webhook/whatsapp.js stamps
+ *            magic_link_delivery_status. Recorded.
+ *   INSTANT  the send is refused on the spot (number fails our own format
+ *            check, or Gallabox rejects the recipient). sendForJob released the
+ *            reserved slot and returned — and wrote NOTHING. magic_link_sent_at
+ *            stayed NULL, so the hourly cron's 24h cooldown never applied and it
+ *            retried the same bad number EVERY HOUR, forever, while the order
+ *            sat on the Unconfirmed page looking as if no one had tried.
+ *
+ * Ops rule (2026-09-22): a link that failed is not re-sent the next day — the
+ * team calls the customer instead. So an instant failure must be recorded the
+ * same way a late one is, which is what makes it (a) countable ("5 of today's
+ * 100 links failed") and (b) visible to the cron's skip-failed clause.
+ *
+ * ONLY CUSTOMER-SIDE failures are recorded. A failure that is about US — creds
+ * missing, NOTIFICATIONS_DISABLE, a Gallabox 5xx / 401 / 429, a network blip —
+ * says nothing about the customer's number. Marking those 'failed' would, on a
+ * single provider outage, permanently stop the cron for every order it touched.
+ * Those keep the old behaviour (nothing stamped; the next sweep retries).
+ */
+
+/** Gallabox HTTP statuses that can mean "bad recipient" — never 401/403/429/5xx. */
+const RECIPIENT_REJECT_HTTP = new Set([400, 404, 422]);
+/** The recipient words a 4xx body must mention before we blame the number. */
+const RECIPIENT_REJECT_TEXT = /phone|mobile|number|recipient|whatsapp user|not.{0,20}whatsapp/i;
+
+/**
+ * The reason to record when a not-delivered send is the CUSTOMER'S number's
+ * fault, or null when it is ours (and must not stop future attempts). Pure.
+ */
+function customerSideFailureReason(response) {
+  if (!response || response.delivered || response.disabled) return null;
+  if (/^invalid phone/i.test(String(response.error || ''))) return 'Invalid mobile number';
+  const body = String(response.providerResponse || '');
+  if (RECIPIENT_REJECT_HTTP.has(Number(response.httpStatus)) && RECIPIENT_REJECT_TEXT.test(body)) {
+    return ('WhatsApp rejected the number: ' + body.replace(/\s+/g, ' ').trim()).slice(0, 255);
+  }
+  return null;
+}
+
+/**
+ * Record an instant failure on the job, in the SAME columns the late-failure
+ * callback writes, so every reader (the red "Delivery Failed" chip, the cron's
+ * skip clause, the Booking-queue counts) sees one definition of "failed".
+ *
+ * magic_link_sent_at IS stamped — as the ATTEMPT time. That is a deliberate
+ * change from "sent_at only after a confirmed dispatch": a failed attempt has
+ * to fall into the day it happened for "N of today's links failed" to add up.
+ * It cannot light a misleading "Link Sent" pill — the CRM checks
+ * delivery_status first and renders "Delivery Failed" instead.
+ * The provider message id is cleared so a stale callback for an EARLIER send
+ * can never be matched to this attempt.
+ *
+ * Column-tolerant like the success stamp: on a deploy without the 2026-07-14
+ * delivery-status migration there is nowhere to record it, so it is skipped.
+ * Never throws — recording a failure must not turn into a second failure.
+ */
+async function markInstantFailure(pool, jobId, { reason, action, at }) {
+  try {
+    await pool.query(
+      `UPDATE tbl_job
+          SET magic_link_delivery_status = 'failed', magic_link_delivery_reason = ?,
+              magic_link_provider_msg_id = NULL,
+              magic_link_sent_at = ?, magic_link_last_action = ?
+        WHERE job_id = ?`,
+      [reason, at, action, jobId],
+    );
+    logger.warn({ jobId, reason }, 'magic-link: instant failure recorded — cron will not re-send; call the customer');
+  } catch (e) {
+    if (e && e.code === 'ER_BAD_FIELD_ERROR') return;
+    logger.warn({ jobId, err: e && e.message }, 'magic-link: could not record instant failure (non-fatal)');
+  }
+}
+
 /**
  * Fire the WhatsApp send + audit the attempt on tbl_job.
  *
@@ -1297,6 +1377,12 @@ async function sendForJob(jobId, { action, override = false } = {}, pool) {
           AND magic_link_send_count > 0`,
       [jobId],
     );
+    // Customer-side refusal (bad number) → record it so the cron stops
+    // retrying it hourly and the team calls instead. Ours → leave unstamped.
+    const failReason = customerSideFailureReason(response);
+    if (failReason) {
+      await markInstantFailure(pool, jobId, { reason: failReason, action: effectiveAction, at: sentAt });
+    }
     return {
       delivered:           false,
       error:               response.error || null,
@@ -1951,6 +2037,10 @@ module.exports = {
   fetchPrefill,
   autoRescheduleOnOpenIfLate,
   sendForJob,
+  // Shared with whatsapp-conversation.service.js — one definition of an
+  // instant, customer-side link failure for both send channels.
+  customerSideFailureReason,
+  markInstantFailure,
   /*
    * BOTH link builders are exported, and the choice between them is not stylistic.
    *   mintJobLink        — token + url, NO shortener row. For callers that must

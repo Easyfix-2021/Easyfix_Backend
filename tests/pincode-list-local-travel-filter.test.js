@@ -19,6 +19,9 @@
  *      nothing-is-LOCAL rather than to an empty IN () — which is a SQL syntax
  *      error, not an empty result.
  *   4. THE ROW'S OWN LABEL STILL AGREES WITH THE FILTER THAT SELECTED IT.
+ *   5. LOCAL MEANS DECLARED, NOT RESIDENT. The filter and the badge count must
+ *      ask ONE question (getServiceAreaSet / getServiceAreaCounts), or a row
+ *      renders TRAVEL inside the LOCAL page that selected it.
  *
  * No DB: the shared pool singleton is faked BEFORE the services load.
  *
@@ -63,9 +66,15 @@ const row = (pincode, over = {}) => ({
 beforeEach(() => {
   fake.reset();
   coverage.invalidateCoverage();
-  // 560001 is covered by a dispatchable technician; 560002 is not.
-  S.home = [{ efr_id: 1, pin: '560001', efr_status: 1, is_technician_verified: 1 }];
-  S.csv = [];
+  // 560001 is DECLARED by a dispatchable technician; 560002 is not.
+  //
+  // The declaration lives in S.csv (tbl_efr_serviceable_pincodes), not S.home
+  // (efr_pin_no). This screen's LOCAL means "somebody signed up to work here",
+  // not "somebody lives here" — see getServiceAreaCounts in
+  // pincode-coverage.service.js. A home-pincode fixture would make every test
+  // below assert the dispatch definition the Mapping column no longer uses.
+  S.home = [];
+  S.csv = [{ efr_id: 1, pincodes: '560001', efr_status: 1, is_technician_verified: 1 }];
   S.pincodes = [row('560001'), row('560002')];
   S.total = 2;
   S.zones = [];
@@ -127,12 +136,37 @@ test('every row the SQL returned is returned — nothing is dropped after pagina
 test('the row label still agrees with the filter that selected it', async () => {
   const out = await pin.listPincodes({ status: 'LOCAL' });
   const byCode = new Map(out.items.map((i) => [i.pincode, i.status]));
-  assert.equal(byCode.get('560001'), 'LOCAL', 'covered by a dispatchable technician');
-  assert.equal(byCode.get('560002'), 'TRAVEL', 'not covered — the label is computed, not assumed from the filter');
+  assert.equal(byCode.get('560001'), 'LOCAL', 'declared by a dispatchable technician');
+  assert.equal(byCode.get('560002'), 'TRAVEL', 'not declared — the label is computed, not assumed from the filter');
+});
+
+/*
+ * ── The 38-vs-5 bug, at the filter ─────────────────────────────────────────
+ *
+ * The badge counted home pincodes ∪ declared pincodes; the drill-down it opens
+ * lists declared pincodes alone. 122001 read "Local · 38 Technicians" over a
+ * list of 5 names. Both the count AND this filter now ask the declared-only
+ * question, so a pincode people merely LIVE in is TRAVEL here — while staying
+ * dispatchable for TAT and allocation, which ask getCoveredPincodes.
+ */
+test('residence alone is TRAVEL on this screen — the badge counts commitments', async () => {
+  S.home = [{ efr_id: 9, pin: '560002', efr_status: 1, is_technician_verified: 1 }];
+  const out = await pin.listPincodes({});
+  const byCode = new Map(out.items.map((i) => [i.pincode, i.status]));
+  assert.equal(byCode.get('560002'), 'TRAVEL', 'lives there, never declared it — no service commitment');
+  assert.equal(byCode.get('560001'), 'LOCAL', 'declared it');
+});
+
+test('a home-only pincode is excluded from the LOCAL filter too — row and filter agree', async () => {
+  S.home = [{ efr_id: 9, pin: '560002', efr_status: 1, is_technician_verified: 1 }];
+  await pin.listPincodes({ status: 'LOCAL' });
+  const { count } = listStatements();
+  assert.deepEqual(count.params, ['560001'],
+    '560002 must not enter the IN list, or it would render TRAVEL inside a LOCAL-filtered page');
 });
 
 test('an unverified or inactive technician grants no coverage — LOCAL then matches nothing', async () => {
-  S.home = [{ efr_id: 1, pin: '560001', efr_status: 1, is_technician_verified: 0 }];
+  S.csv = [{ efr_id: 1, pincodes: '560001', efr_status: 1, is_technician_verified: 0 }];
   await pin.listPincodes({ status: 'LOCAL' });
   const { page, count } = listStatements();
   // '1=0', never 'IN ()' — an empty IN list is a syntax error, not an empty set.
