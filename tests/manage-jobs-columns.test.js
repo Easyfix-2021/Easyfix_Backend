@@ -157,8 +157,15 @@ test('Rating reuses the escalation row rather than joining that table twice', ()
   // tbl_easyfixer_rating_by_customer's job_id is NOT unique, which is why
   // escalationJoin resolves it through MAX(table_id). Joining it a second time
   // for the rating would both fan out and pick a different row.
-  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated;/,
-    'the manage view must force the escalation JOIN on');
+  /*
+   * The Booking queue joined this list on 2026-09-24: it shows a flame on
+   * escalated rows in every bucket, so it needs the JOIN even when nobody is
+   * filtering by escalation. Widening the JOIN is safe; widening the FILTER is
+   * the regression this test exists for, and the assertions below still pin
+   * that half to the caller's own request.
+   */
+  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated \|\| !!bucket;/,
+    'the manage view — and the booking queue — must force the escalation JOIN on');
   assert.match(fragment('manageColumns', true, true), /esc\.customer_rating/,
     'and read the rating off that same alias');
   /*

@@ -3063,7 +3063,14 @@ async function list({
    */
   const filtersEscalated = isEscalated !== undefined && isEscalated !== ''
     && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
-  const wantsEscalation = wantsManage || filtersEscalated;
+  /*
+   * …and the Booking queue, which shows a 🔥 on every escalated row whichever
+   * bucket it sits in (ops, 2026-09-24). Without this the flag columns are only
+   * projected for the manage view or when the caller FILTERS on escalation, so
+   * the queue could filter by it but never display it — a row would look
+   * ordinary right up until somebody clicked the flag chip.
+   */
+  const wantsEscalation = wantsManage || filtersEscalated || !!bucket;
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
