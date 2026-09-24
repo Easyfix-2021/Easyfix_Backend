@@ -253,7 +253,7 @@ Price. Default Tx Share = 20% of the price, rounded to 2dp.
 
 ### Schema
 
-`migrations/2026-09-24-client-material-tx-share.sql` adds
+`migrations/executed/2026-09-24-client-material-tx-share.sql` adds
 `tx_share DECIMAL(12,2) NULL` to `tbl_client_material_price_group` and
 `tbl_client_material_state_price` (the two client tables only — the MASTER
 tables carry no such column; a master hit always computes 20% on the fly).
