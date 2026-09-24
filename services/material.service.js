@@ -221,6 +221,85 @@ async function getMaterialById(id) {
   return { ...row, price_pending, groups };
 }
 
+/*
+ * "Master rows" (2026-09-24) — master price-group data flattened to one row
+ * per active material × active brand, for the CRM's material picker (POST
+ * /admin/jobs/:id/quotation-lines needs a materialId + optional brandId with
+ * a known price). A No-Brand group (no brand rows at all, active or not)
+ * gives one item with brand null; a group whose brand rows are all inactive
+ * now contributes nothing (never mistaken for No Brand).
+ */
+async function masterRows({ search, limit = 50 } = {}) {
+  limit = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  const where = ['m.status = 1'];
+  const params = [];
+  if (search) { where.push('m.material_name LIKE ?'); params.push(`%${search}%`); }
+
+  const [groupRows] = await pool.query(
+    `SELECT g.group_id, g.material_id, g.price, m.material_name
+       FROM tbl_material_price_group g
+       JOIN tbl_material_master m ON m.material_id = g.material_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY m.material_name ASC`,
+    params,
+  );
+  if (!groupRows.length) return { items: [] };
+  const groupIds = groupRows.map((g) => g.group_id);
+
+  const [allBrandRows] = await pool.query(
+    `SELECT gb.group_id, bm.brand_id, bm.brand_name, CAST(bm.status AS SIGNED) AS brand_status
+       FROM tbl_material_price_group_brand gb
+       JOIN tbl_brand_master bm ON bm.brand_id = gb.brand_id
+      WHERE gb.group_id IN (?)`,
+    [groupIds],
+  );
+  const hasAnyBrandRow = new Set();
+  const activeBrandsByGroup = new Map();
+  for (const b of allBrandRows) {
+    hasAnyBrandRow.add(b.group_id);
+    if (b.brand_status !== 1) continue;
+    if (!activeBrandsByGroup.has(b.group_id)) activeBrandsByGroup.set(b.group_id, []);
+    activeBrandsByGroup.get(b.group_id).push(b);
+  }
+
+  const [stateRows] = await pool.query(
+    `SELECT sp.group_id, sps.state_id, st.state_name, sp.price
+       FROM tbl_material_state_price sp
+       JOIN tbl_material_state_price_state sps ON sps.state_price_id = sp.state_price_id
+       JOIN tbl_state st ON st.state_id = sps.state_id
+      WHERE sp.group_id IN (?)`,
+    [groupIds],
+  );
+  const statesByGroup = new Map();
+  for (const s of stateRows) {
+    if (!statesByGroup.has(s.group_id)) statesByGroup.set(s.group_id, []);
+    statesByGroup.get(s.group_id).push({ state_id: s.state_id, state_name: s.state_name, price: s.price });
+  }
+
+  const items = [];
+  for (const g of groupRows) {
+    const statePrices = statesByGroup.get(g.group_id) || [];
+    if (!hasAnyBrandRow.has(g.group_id)) {
+      items.push({
+        material_id: g.material_id, material_name: g.material_name,
+        brand_id: null, brand_name: null, label: g.material_name,
+        price: g.price, state_prices: statePrices,
+      });
+      continue;
+    }
+    for (const b of (activeBrandsByGroup.get(g.group_id) || [])) {
+      items.push({
+        material_id: g.material_id, material_name: g.material_name,
+        brand_id: b.brand_id, brand_name: b.brand_name,
+        label: `${g.material_name} - ${b.brand_name}`,
+        price: g.price, state_prices: statePrices,
+      });
+    }
+  }
+  items.sort((a, c) => a.label.localeCompare(c.label));
+  return { items: items.slice(0, limit) };
+}
+
 // ─── Group-payload validation (UI + import share this) ──────────────────
 
 /**
@@ -549,6 +628,7 @@ module.exports = {
   listMaterials,
   getMaterialRow,
   getMaterialById,
+  masterRows,
   validateGroupsPayload,
   writeGroups,
   createMaterial,

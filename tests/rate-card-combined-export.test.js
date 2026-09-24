@@ -156,9 +156,12 @@ describe('GET /:clientId/rate-cards/export.{xlsx,pdf}', () => {
       easyfix_direct_fixed: 200, easyfix_direct_variable: 10, overhead_fixed: 10, overhead_variable: 20,
       client_fixed: 0, client_variable: 0,
     }];
+    // tx_share matches what materialRatesSvc.list() computes from this
+    // describe block's fake-pool fixture (neither row carries its own
+    // tx_share — 20% default: 150 x 0.2 = 30, 275 x 0.2 = 55).
     const materialItems = [{
       material_id: 700, material_name: 'PVC Pipe',
-      groups: [{ price: 150, brands: [], states: [{ price: 275, state_ids: [21] }] }],
+      groups: [{ price: 150, tx_share: 30, brands: [], states: [{ price: 275, tx_share: 55, state_ids: [21] }] }],
     }];
     const stateNameById = new Map([[21, 'Maharashtra']]);
     const servicesOnlyBuf = await xlsxSvc.exportRateCards('A10 Design', rateCards);
@@ -227,6 +230,14 @@ describe('GET /:clientId/rate-cards/export.{xlsx,pdf}', () => {
     assert.match(text, /400\.00/, 'the service rate (tbl_client_service.total_amount) must be on the page');
     assert.doesNotMatch(text, /Easyfix Direct/i);
     assert.doesNotMatch(text, /Overhead/i);
+
+    // Tx Share (2026-09-24): the Materials table shows ONE combined rate —
+    // price (150) + tx_share (20% default, 30) = 180.00 for the base row;
+    // the Maharashtra override (275 + 55) = 330.00 — never the split, and
+    // never the literal column name "Tx Share".
+    assert.match(text, /180\.00/, 'base material rate must be price + tx_share combined');
+    assert.match(text, /330\.00/, 'the Maharashtra override rate must be price + tx_share combined');
+    assert.doesNotMatch(text, /Tx Share/i);
   });
 
   it('xlsx and pdf both refuse a client outside the caller\'s scope', async () => {

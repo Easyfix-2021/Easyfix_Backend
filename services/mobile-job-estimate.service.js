@@ -55,7 +55,7 @@ const {
   PROOF_AFTER_CATEGORIES,
 } = require('../utils/job-image-buckets');
 const { deleteJobImage } = require('./job-image.service');
-const { resolveMaterialPrice } = require('./material-price-resolver');
+const { resolveMaterialPrice, defaultTxShare } = require('./material-price-resolver');
 // Material Request Flow v2 (2026-09-21) — the single line-state derivation
 // and the pre_material_status get/store pair. Neither depends on
 // job.service.js, so requiring them here carries none of the circular-import
@@ -371,6 +371,7 @@ async function resolveLineForInsert(job, ctx, { type, itemId, name, quantity, am
   let lineName = name || null;
   let unitPrice = amount;
   let clientCharge = 0; // product lines: unchanged, always 0 (out of scope of this change)
+  let txShare = 0; // product lines: no Tx Share concept — stays 0, same as clientCharge above
 
   if (isProduct) {
     clientServiceId = itemId || null;
@@ -424,9 +425,15 @@ async function resolveLineForInsert(job, ctx, { type, itemId, name, quantity, am
     clientCharge = resolvedPrice;
     materialIdOut = materialId;
     lineName = material.material_name;
+    // Tx Share (2026-09-24) snapshot for this unit — the resolver's own
+    // figure (client_state/client_group's stored value, or 20% computed for
+    // a master hit / a NULL legacy client row), falling back to 20% of the
+    // billed unit_price when the resolver had no price at all ('none').
+    txShare = (resolved.tx_share !== null && resolved.tx_share !== undefined)
+      ? Number(resolved.tx_share) : defaultTxShare(unitPrice);
   }
 
-  return { type, name: lineName, quantity, unitPrice, clientCharge, clientServiceId, materialId: materialIdOut };
+  return { type, name: lineName, quantity, unitPrice, clientCharge, txShare, clientServiceId, materialId: materialIdOut };
 }
 
 /*
@@ -437,18 +444,24 @@ async function resolveLineForInsert(job, ctx, { type, itemId, name, quantity, am
  * own transaction; defaults to `pool` for the single-add path.
  */
 async function insertDraftLine(conn, jobId, efrId, resolved) {
+  // tx_charge appended LAST in the column list (rather than in its native
+  // table position) so every pre-existing positional param index above stays
+  // unchanged — see tests/mobile-job-materials.test.js's `ins.params[N]`
+  // assertions, none of which needed to move for the 2026-09-24 Tx Share
+  // addition.
   const [ins] = await conn.query(
     `INSERT INTO quotation_details
        (type, name, unit, unit_price,
-        tx_charge, client_charge, margin,
+        client_charge, margin,
         status, easyfxer_id, sent_on,
-        job_id, client_service_id, material_id)
-     VALUES (?, ?, ?, ?, 0, ?, 0, 1, ?, ?, ?, ?, ?)`,
+        job_id, client_service_id, material_id, tx_charge)
+     VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?)`,
     [
       resolved.type, resolved.name, resolved.quantity, resolved.unitPrice,
       resolved.clientCharge,
       efrId, null,
       jobId, resolved.clientServiceId, resolved.materialId,
+      resolved.txShare || 0,
     ],
   );
   return ins.insertId;

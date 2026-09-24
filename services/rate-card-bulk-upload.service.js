@@ -6,6 +6,8 @@ const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../ut
 const clientServicesSvc = require('./client-services.service');
 const materialRatesSvc = require('./client-material-rates.service');
 const stateService = require('./state.service');
+// Tx Share (2026-09-24) — the shared "20% of price, rounded to 2dp" default.
+const { defaultTxShare } = require('./material-price-resolver');
 
 /*
  * Rate Card Bulk Upload (Services + Materials tabs) — see
@@ -373,6 +375,9 @@ function addMaterialListsAndValidation(wb, sheetName, firstDataRow, { materialNa
   const materialsRange = rangeFormula('A', materialNames);
   const brandsRange = rangeFormula('B', brandNames);
   const statesRange = rangeFormula('C', stateNames);
+  // Lists sheet columns are unrelated to the DATA sheet's own layout — these
+  // three letters (A/B/C) name where the Lists sheet keeps its lookup
+  // columns, not where Material/Brand/State live on the Materials sheet.
 
   if (materialsRange) {
     ws.dataValidations.add(`A${firstDataRow}:A${lastRow}`, {
@@ -388,7 +393,9 @@ function addMaterialListsAndValidation(wb, sheetName, firstDataRow, { materialNa
     });
   }
   if (statesRange) {
-    ws.dataValidations.add(`D${firstDataRow}:D${lastRow}`, {
+    // Column E — State — now that Tx Share (2026-09-24) occupies D between
+    // Price and State on the Materials sheet.
+    ws.dataValidations.add(`E${firstDataRow}:E${lastRow}`, {
       type: 'list', allowBlank: true, formulae: statesRange,
       showErrorMessage: true, errorTitle: 'Unknown state',
       error: 'Pick a state from the dropdown list, or leave blank for the all-states price.',
@@ -421,17 +428,18 @@ async function generateMaterialRatesTemplate(res) {
 
   const wb = buildStyledWorkbook({
     title: 'EasyFix · Rate Card (Materials) Template',
-    meta: 'One row = one (Material, Brand, State) price. Leave State blank for the all-states price; leave Brand blank for No Brand. Use the dropdown in each cell.',
+    meta: 'One row = one (Material, Brand, State) price. Leave State blank for the all-states price; leave Brand blank for No Brand; leave Tx Share blank for the 20% default. Use the dropdown in each cell.',
     sheetName: 'Material Rates',
     columns: [
       { header: 'Material', key: 'material', width: 28 },
       { header: 'Brand',    key: 'brand',    width: 20 },
       { header: 'Price',    key: 'price',    width: 14 },
+      { header: 'Tx Share', key: 'tx_share', width: 14 },
       { header: 'State',    key: 'state',    width: 20 },
     ],
     rows: [
-      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 150, state: '' },
-      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 275, state: stateNames[0] || 'Maharashtra' },
+      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 150, tx_share: '', state: '' },
+      { material: materialNames[0] || 'Adapter 5A', brand: brandNames[0] || 'Philips', price: 275, tx_share: '', state: stateNames[0] || 'Maharashtra' },
     ],
   });
   // buildStyledWorkbook with no `kpis` puts the header on row 4 (title/meta/
@@ -459,14 +467,16 @@ async function loadMaterialRatesRef() {
 
 // Canonical signature for a price group — order-independent so the
 // round-trip test (export → reimport, unchanged) matches regardless of how
-// brands/states were listed within a cell.
-function groupSignature(price, brandIds, states) {
+// brands/states were listed within a cell. Includes tx_share (2026-09-24) —
+// two brands with the same price but a DIFFERENT tx_share must never be
+// folded into one group (a group has exactly one tx_share value).
+function groupSignature(price, txShare, brandIds, states) {
   const b = [...brandIds].map(Number).sort((a, c) => a - c).join(',');
   const s = states
-    .map((st) => `${[...st.state_ids].map(Number).sort((a, c) => a - c).join(',')}:${Number(st.price).toFixed(2)}`)
+    .map((st) => `${[...st.state_ids].map(Number).sort((a, c) => a - c).join(',')}:${Number(st.price).toFixed(2)}:${Number(st.tx_share).toFixed(2)}`)
     .sort()
     .join('|');
-  return `${Number(price).toFixed(2)}|${b}|${s}`;
+  return `${Number(price).toFixed(2)}|${Number(txShare).toFixed(2)}|${b}|${s}`;
 }
 
 // Every row that individually failed to parse, or that a later cross-row
@@ -505,7 +515,7 @@ async function parseMaterialRateRows(buffer, clientId) {
   for (const it of existingItems) {
     existingSignaturesByMaterialId.set(
       it.material_id,
-      new Set(it.groups.map((g) => groupSignature(g.price, g.brands.map((b) => b.brand_id), g.states))),
+      new Set(it.groups.map((g) => groupSignature(g.price, g.tx_share, g.brands.map((b) => b.brand_id), g.states))),
     );
   }
 
@@ -520,6 +530,7 @@ async function parseMaterialRateRows(buffer, clientId) {
     const materialRaw = String(cell(r, 'Material') || '').trim();
     const brandRaw = String(cell(r, 'Brand') || '').trim();
     const priceRaw = String(cell(r, 'Price') ?? '').trim();
+    const txShareRaw = String(cell(r, 'Tx Share') ?? '').trim();
     const stateRaw = String(cell(r, 'State') || '').trim();
 
     let material = null;
@@ -550,8 +561,20 @@ async function parseMaterialRateRows(buffer, clientId) {
       if (!(price > 0)) errors.push('Price must be greater than 0');
     }
 
+    // Tx Share (2026-09-24) — optional; blank defaults to 20% of THIS row's
+    // own price (computed below, once price itself is known to be valid).
+    let txShare = null;
+    if (txShareRaw) {
+      if (!/^-?\d+(\.\d+)?$/.test(txShareRaw)) errors.push('Tx Share must be a number');
+      else {
+        txShare = Number(txShareRaw);
+        if (txShare < 0) errors.push('Tx Share must be >= 0');
+      }
+    }
+
     const row = {
-      row_number: rowNumber, material: materialRaw, brand: brandRaw, price: priceRaw, state: stateRaw,
+      row_number: rowNumber, material: materialRaw, brand: brandRaw, price: priceRaw,
+      tx_share: txShareRaw, state: stateRaw,
       errors, warnings, outcome: errors.length ? 'blocked' : null,
       _resolved: errors.length === 0,
       _brand_key: isNoBrand ? '' : (brand ? nameKey(brand.brand_name) : null),
@@ -559,6 +582,9 @@ async function parseMaterialRateRows(buffer, clientId) {
       _brand_name: isNoBrand ? '' : (brand ? brand.brand_name : brandRaw),
       _state_id: state ? state.state_id : null,
       _price: price,
+      // errors is empty here only when price parsed cleanly, so this default
+      // is always computed from a real price.
+      _tx_share: errors.length === 0 ? (txShare !== null ? txShare : defaultTxShare(price)) : null,
     };
     rows.push(row);
 
@@ -594,10 +620,10 @@ async function parseMaterialRateRows(buffer, clientId) {
     let hasConflict = false;
     for (const dupRows of byKey.values()) {
       if (dupRows.length < 2) continue;
-      const prices = new Set(dupRows.map((r) => r._price));
-      if (prices.size > 1) {
+      const sigs = new Set(dupRows.map((r) => `${r._price}:${r._tx_share}`));
+      if (sigs.size > 1) {
         const rowNums = dupRows.map((r) => r.row_number).join(', ');
-        for (const r of dupRows) r.errors.push(`Conflicting duplicate rows (${rowNums}) for the same material/brand/state with different prices`);
+        for (const r of dupRows) r.errors.push(`Conflicting duplicate rows (${rowNums}) for the same material/brand/state with different Price or Tx Share`);
         hasConflict = true;
       } else {
         // Identical duplicates — keep the first for grouping, warn on the rest.
@@ -626,37 +652,41 @@ async function parseMaterialRateRows(buffer, clientId) {
     }
     if (missingBase) continue;
 
-    // Compile client price GROUPS: brands whose base price AND whole
-    // state-override map are identical share ONE group.
+    // Compile client price GROUPS: brands whose base price + tx_share AND
+    // whole state-override map (price + tx_share) are identical share ONE
+    // group (2026-09-24: tx_share is now part of what "identical" means).
     const perBrand = new Map();
     for (const bk of brandKeys) {
       const brandRows = liveRows.filter((r) => r._brand_key === bk);
       const baseRow = brandRows.find((r) => r._state_id == null);
       const overrides = new Map();
-      for (const r of brandRows) if (r._state_id != null) overrides.set(r._state_id, r._price);
-      perBrand.set(bk, { brand_id: baseRow._brand_id, brand_name: baseRow._brand_name, basePrice: baseRow._price, overrides });
+      for (const r of brandRows) if (r._state_id != null) overrides.set(r._state_id, { price: r._price, txShare: r._tx_share });
+      perBrand.set(bk, {
+        brand_id: baseRow._brand_id, brand_name: baseRow._brand_name,
+        basePrice: baseRow._price, baseTxShare: baseRow._tx_share, overrides,
+      });
     }
 
     const bySig = new Map();
     for (const b of perBrand.values()) {
       const ov = [...b.overrides.entries()].sort((a, c) => a[0] - c[0])
-        .map(([sid, p]) => `${sid}:${Number(p).toFixed(2)}`).join(',');
-      const sig = `${Number(b.basePrice).toFixed(2)}|${ov}`;
-      if (!bySig.has(sig)) bySig.set(sig, { basePrice: b.basePrice, overrides: b.overrides, brand_ids: [], brand_names: [] });
+        .map(([sid, o]) => `${sid}:${Number(o.price).toFixed(2)}:${Number(o.txShare).toFixed(2)}`).join(',');
+      const sig = `${Number(b.basePrice).toFixed(2)}|${Number(b.baseTxShare).toFixed(2)}|${ov}`;
+      if (!bySig.has(sig)) bySig.set(sig, { basePrice: b.basePrice, baseTxShare: b.baseTxShare, overrides: b.overrides, brand_ids: [], brand_names: [] });
       const entry = bySig.get(sig);
       if (b.brand_id != null) { entry.brand_ids.push(b.brand_id); entry.brand_names.push(b.brand_name); }
     }
 
     const groups = [...bySig.values()].map((entry) => {
-      // Group states sharing the same override price into one entry.
+      // Group states sharing the same override price AND tx_share into one entry.
       const priceToStates = new Map();
-      for (const [stateId, price] of entry.overrides) {
-        const priceKey = Number(price).toFixed(2);
-        if (!priceToStates.has(priceKey)) priceToStates.set(priceKey, { price: Number(price), state_ids: [] });
+      for (const [stateId, o] of entry.overrides) {
+        const priceKey = `${Number(o.price).toFixed(2)}:${Number(o.txShare).toFixed(2)}`;
+        if (!priceToStates.has(priceKey)) priceToStates.set(priceKey, { price: Number(o.price), tx_share: Number(o.txShare), state_ids: [] });
         priceToStates.get(priceKey).state_ids.push(stateId);
       }
       return {
-        price: entry.basePrice, brand_ids: entry.brand_ids, brand_names: entry.brand_names,
+        price: entry.basePrice, tx_share: entry.baseTxShare, brand_ids: entry.brand_ids, brand_names: entry.brand_names,
         states: [...priceToStates.values()],
       };
     });
@@ -664,7 +694,7 @@ async function parseMaterialRateRows(buffer, clientId) {
     // Belt-and-suspenders: reuse the SAME cross-row validation the direct
     // PUT route enforces — the per-row checks above should already agree,
     // but this guarantees commit-time parity with replace().
-    const groupsForValidation = groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states }));
+    const groupsForValidation = groups.map((g) => ({ price: g.price, tx_share: g.tx_share, brand_ids: g.brand_ids, states: g.states }));
     try {
       materialRatesSvc.validateClientGroupsPayload(groupsForValidation);
     } catch (e) {
@@ -676,7 +706,7 @@ async function parseMaterialRateRows(buffer, clientId) {
 
     const isNewMaterial = acc.material_id == null || !existingByMaterialId.has(acc.material_id);
     const existingSigs = acc.material_id != null ? existingSignaturesByMaterialId.get(acc.material_id) : null;
-    const newSigs = new Set(groups.map((g) => groupSignature(g.price, g.brand_ids, g.states)));
+    const newSigs = new Set(groups.map((g) => groupSignature(g.price, g.tx_share, g.brand_ids, g.states)));
     const unchanged = !isNewMaterial && existingSigs && existingSigs.size === newSigs.size
       && [...newSigs].every((s) => existingSigs.has(s));
     acc.outcome = isNewMaterial ? 'new' : (unchanged ? 'unchanged' : 'update');
@@ -688,7 +718,8 @@ async function parseMaterialRateRows(buffer, clientId) {
 
 function publicMaterialRow(r) {
   return {
-    row_number: r.row_number, material: r.material, brand: r.brand, price: r.price, state: r.state,
+    row_number: r.row_number, material: r.material, brand: r.brand, price: r.price,
+    tx_share: r.tx_share, state: r.state,
     outcome: r.outcome, errors: r.errors, warnings: r.warnings,
   };
 }
@@ -705,10 +736,10 @@ function publicMaterialPlan(acc, stateNameById) {
   for (const g of (acc.groups || [])) {
     const brandLabels = g.brand_ids.length === 0 ? ['No Brand'] : g.brand_names;
     for (const brandLabel of brandLabels) {
-      lines.push({ brand: brandLabel, state: 'All States', price: g.price });
+      lines.push({ brand: brandLabel, state: 'All States', price: g.price, tx_share: g.tx_share });
       for (const s of g.states) {
         for (const stateId of s.state_ids) {
-          lines.push({ brand: brandLabel, state: stateNameById.get(stateId) || `#${stateId}`, price: s.price });
+          lines.push({ brand: brandLabel, state: stateNameById.get(stateId) || `#${stateId}`, price: s.price, tx_share: s.tx_share });
         }
       }
     }
@@ -762,7 +793,7 @@ async function commitMaterialRatesUpload(buffer, clientId, actor = {}) {
   try {
     await conn.beginTransaction();
     for (const acc of writable) {
-      const groups = acc.groups.map((g) => ({ price: g.price, brand_ids: g.brand_ids, states: g.states }));
+      const groups = acc.groups.map((g) => ({ price: g.price, tx_share: g.tx_share, brand_ids: g.brand_ids, states: g.states }));
       await materialRatesSvc.replace(clientId, acc.material_id, { groups }, actor, { conn });
     }
     await conn.commit();
