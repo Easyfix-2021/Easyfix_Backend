@@ -13,10 +13,13 @@
  *     JSON reply can arrive wrapped in prose / markdown fences — parseJsonLoose
  *     recovers it. Callers should still instruct "return JSON only".
  *
- * IMPORTANT: Sophy is TEXT-ONLY — no realtime / audio / STT / TTS. The live voice
- * leg of AI calling uses OpenAI Realtime DIRECTLY; this client is for the
- * post-call mapping and any other text reasoning. Returns null on ANY failure so
- * every caller degrades gracefully.
+ * IMPORTANT: Sophy has no realtime and no TTS, so the live voice leg of AI calling
+ * uses OpenAI Realtime DIRECTLY. Sophy DOES now serve buffered speech-to-text at
+ * POST /v1/audio/transcriptions (OpenAI-compatible multipart, 4.5 MB body cap),
+ * but only for a key bound to a transcription model — our existing text keys
+ * return 400 `model_not_transcription` (probed 2026-09-24). This client only
+ * speaks chat/completions; it is for the post-call mapping and any other text
+ * reasoning. Returns null on ANY failure so every caller degrades gracefully.
  *
  * PER-CALLER KEYS: each consuming feature passes its OWN `mw_live_…` key (so each
  * gets its own model/prompt/quota/cost line in Sophy). There is deliberately NO

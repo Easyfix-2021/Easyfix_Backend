@@ -8,6 +8,14 @@
 
 ## 1. Why NOT Sophy (settled — do not revisit without new information)
 
+> **Superseded premise (2026-09-24).** Sophy now serves speech-to-text at
+> `POST /v1/audio/transcriptions` (OpenAI-compatible multipart, 4.5 MB body cap)
+> for a key bound to a transcription model. A live probe returned 401
+> `missing_api_key` unauthenticated and 400 `model_not_transcription` with our
+> existing text keys — the route is real; we simply have no STT key yet. The
+> reasoning below was correct when written; re-evaluate this plan against a
+> dedicated Sophy STT key before building it.
+
 Sophy is Channelplay's central OpenAI-compatible LLM gateway and is the correct
 home for *text* reasoning. It **cannot** carry transcription:
 

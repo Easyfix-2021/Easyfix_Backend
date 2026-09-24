@@ -881,3 +881,20 @@ test('the numeric path binds every value — wildcards and quotes are never inli
     assert.equal(r.where.includes(q), false, `${q} must not appear inline in the SQL`);
   }
 });
+
+test('customerQ: a phone-shaped term uses the same prefix set lookup as list(); a name keeps the LIKE pair', () => {
+  const phone = whereAndParams({ customerQ: '98453 02806' });
+  assert.match(phone.where, /J\.fk_customer_id IN \(SELECT qmob\.customer_id FROM tbl_customer qmob WHERE qmob\.customer_mob_no LIKE \?\)/);
+  assert.ok(!/C\.customer_mob_no LIKE/.test(phone.where), 'no %t% join match for a phone');
+  assert.ok(phone.params.includes('9845302806%'));
+  const name = whereAndParams({ customerQ: 'ravi' });
+  assert.match(name.where, /C\.customer_mob_no LIKE \?\)/);
+  assert.ok(name.params.includes('%ravi%'));
+});
+
+test('customerQ requires 3+ characters after trimming', () => {
+  for (const bad of ['a', 'ab', '  ab  ']) {
+    assert.ok(listQuery.validate({ customerQ: bad }).error, `${JSON.stringify(bad)} must be rejected`);
+  }
+  assert.equal(listQuery.validate({ customerQ: ' abc ' }).value.customerQ, 'abc');
+});
