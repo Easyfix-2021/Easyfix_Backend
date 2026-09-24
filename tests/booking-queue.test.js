@@ -23,8 +23,8 @@
  *    the counts are ONE query: it cannot hold if five numbers come from five
  *    passes over a table that is moving underneath them.
  *
- * 5. THE DATE TABS FILTER THE TICKET'S CREATION DATE, on the same column the
- *    grid below filters, and All (the default) narrows nothing.
+ * 5. THERE IS NO DATE WINDOW. The age lives in the Day 0/1/2/3+ pills, whose
+ *    four counts sum to their own tile.
  *
  * No DB, no network. Runner: `node --test`.
  */
@@ -307,44 +307,23 @@ test('each tile\'s four pills sum to the tile', async () => {
   assert.equal(n[0] + n[1] + n[2] + n['3plus'], out.open.new);
 });
 
-/* ── 2. The period window, in IST ────────────────────────────────────────── */
-
-const IST = (s) => new Date(new Date(`${s}+05:30`).toISOString());
-
-test('today covers the IST calendar day, not the UTC one', () => {
-  // 02:00 IST on the 23rd is still 20:30 UTC on the 22nd.
-  const now = IST('2026-09-23T02:00:00');
-  const { start, end } = bq.periodRange('today', now);
-  assert.equal(start.toISOString(), IST('2026-09-23T00:00:00').toISOString());
-  assert.equal(end.toISOString(), IST('2026-09-24T00:00:00').toISOString());
-  assert.ok(now >= start && now < end, 'a link sent at 02:00 IST counts as TODAY');
-});
-
-test('yesterday is the previous IST day, and the two windows do not overlap', () => {
-  const now = IST('2026-09-23T14:00:00');
-  const y = bq.periodRange('yesterday', now);
-  const t = bq.periodRange('today', now);
-  assert.equal(y.start.toISOString(), IST('2026-09-22T00:00:00').toISOString());
-  assert.equal(y.end.toISOString(), t.start.toISOString(), 'yesterday ends exactly where today begins');
-});
-
-test('last7 is seven calendar days ending today, today included', () => {
-  const now = IST('2026-09-23T14:00:00');
-  const { start, end } = bq.periodRange('last7', now);
-  assert.equal(start.toISOString(), IST('2026-09-17T00:00:00').toISOString());
-  assert.equal(end.toISOString(), IST('2026-09-24T00:00:00').toISOString());
-  assert.equal((end - start) / 86400000, 7);
-});
-
-test('all, and anything unrecognised, means NO window', () => {
-  const now = IST('2026-09-23T14:00:00');
-  assert.deepEqual(bq.periodRange('all', now), { start: null, end: null });
-  assert.deepEqual(bq.periodRange('garbage', now), { start: null, end: null },
-    'an unknown tab shows the whole desk — never an empty screen that looks like "nothing to do"');
-});
-
-test('istToday reads the IST date even when UTC is still on yesterday', () => {
-  assert.equal(bq.istToday(IST('2026-09-23T01:00:00')), '2026-09-23');
+/*
+ * THE PERIOD FILTER IS GONE, and this is the test that keeps it gone.
+ *
+ * The counts once took All / Today / Yesterday / Last 7 days and the ROUTE
+ * defaulted to `today`. When the day pills replaced the date tabs the page
+ * stopped sending a period, the default took over, and every tile read 0 while
+ * 149 orders sat open — a screen that looked calm rather than broken.
+ */
+test('counts() takes no period and never narrows by date on its own', async () => {
+  const fake = countsPool(QA_ROW);
+  const out = await bq.counts({ db: fake.pool });
+  assert.equal(out.total, 149, 'the whole open book, with nothing filtered away');
+  assert.doesNotMatch(fake.calls[0].sql, /ticket_created_date_time\) >=/,
+    'a date window nothing sends is one nobody can see is wrong');
+  assert.equal(bq.PERIODS, undefined, 'the vocabulary is gone, not merely unused');
+  assert.equal(bq.periodRange, undefined);
+  assert.equal(out.period, undefined);
 });
 
 /* ── 3. counts(): the shape the tiles render ─────────────────────────────── */
@@ -389,31 +368,6 @@ test('an empty book reads as zeros, never NULL or NaN', async () => {
  * onto created_date_time — which an earlier cut did — would count rows the grid
  * then refuses to list, and the tile would disagree with its own rows.
  */
-test('the window is the ticket date, bounded the way the list bounds it', async () => {
-  const fake = countsPool(QA_ROW);
-  const now = IST('2026-09-23T14:00:00');
-  await bq.counts({ db: fake.pool, period: 'yesterday', now });
-  const q = fake.calls[0];
-  assert.match(q.sql, /DATE\(j\.ticket_created_date_time\) >= DATE\(\?\)/);
-  assert.match(q.sql, /DATE\(j\.ticket_created_date_time\) < DATE\(\?\)/);
-  assert.doesNotMatch(q.sql, /COALESCE\(j\.ticket_created_date_time/,
-    'the grid filters on this column alone — counting a fallback would list fewer rows than the tile claims');
-  // Bound as Dates for the +05:30 pool, and they are yesterday's IST bounds.
-  const dates = q.params.filter((p) => p instanceof Date);
-  assert.equal(dates.length, 2);
-  assert.equal(dates[0].toISOString(), IST('2026-09-22T00:00:00').toISOString());
-  assert.equal(dates[1].toISOString(), IST('2026-09-23T00:00:00').toISOString());
-});
-
-test('ALL is the default and applies NO date filter', async () => {
-  const fake = countsPool(QA_ROW);
-  const out = await bq.counts({ db: fake.pool });
-  assert.equal(out.period, 'all', 'the page opens on the whole desk, not on today');
-  assert.doesNotMatch(fake.calls[0].sql, /ticket_created_date_time\) >=/,
-    'All must not narrow anything — 149 open orders would otherwise read as 0');
-  assert.equal(out.period_start, null);
-});
-
 test('the caller\'s row filter and owner scope reach the count', async () => {
   const fake = countsPool(QA_ROW);
   await bq.counts({

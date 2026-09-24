@@ -24,28 +24,21 @@
  *   WhatsApp could not deliver it     → DELIVERY FAILED   (call, never re-send)
  *   sent, no answer yet               → NO RESPONSE
  *
- * ── THE TWO KINDS OF NUMBER, AND WHY BOTH EXIST ───────────────────────────
+ * ── ONE KIND OF NUMBER PER TILE ───────────────────────────────────────────
  *
- * The tiles read "70 / 100 · 58 still to call". Those are different questions
- * and they must behave differently:
+ * Every tile counts the same thing: OPEN orders (job_status = 9) in that
+ * bucket. The five sum to the total the page prints, which is the check that
+ * catches a bucket quietly claiming nobody, and the grid below lists exactly
+ * the tile you clicked.
  *
- *   70 / 100  WHAT HAPPENED TO THE LINK. A fact about the day, counted over
- *             the links SENT in the period whatever became of the job after.
- *             It never goes down. If the team rings a customer who ignored the
- *             link and books the order, the link was still ignored — the job
- *             leaves the page, but it does not leave this number, because
- *             otherwise 25 + 70 + 5 would stop adding up to the 100 links we
- *             actually sent, and the day's funnel would silently lose orders.
+ * Inside each tile the Day 0/1/2/3+ pills split that number by how long the
+ * ticket has waited, and those four sum to the tile. Response received also
+ * splits by WHAT the customer asked for, because that is what decides who
+ * picks the order up.
  *
- *   58        WORK LEFT. Counted over jobs still sitting at job_status = 9.
- *             It goes down every time somebody books or cancels one. This is
- *             the number the grid lists, so the row count and the small number
- *             always match.
- *
- * NEW and NO LINK NEEDED have no link outcome to report, so they are plain
- * work counts, split Today / Old by the ticket's creation date. "Old" is not
- * decoration: it is where a job goes when its link never went out (every send
- * failed on our side, say). Without that split those jobs would be invisible.
+ * An earlier cut had the tiles counting "links sent today" alongside the work,
+ * and the two were confused for each other more than once. One number, one
+ * meaning, and the pills for everything else.
  *
  * ── PRECEDENCE, NOT FIVE INDEPENDENT FILTERS ──────────────────────────────
  *
@@ -312,52 +305,29 @@ function bucketPredicate(bucket, { hasRequestTable = true, day } = {}) {
   }
 }
 
-/* ── The period the link tiles are counted over ──────────────────────────── */
-
-const PERIODS = ['all', 'today', 'yesterday', 'last7'];
-
-/**
- * The period as IST calendar days, resolved to a [start, end) pair of JS
- * Dates the pool binds directly.
+/*
+ * ── THERE IS NO PERIOD FILTER ANY MORE, and its removal is deliberate ─────
  *
- * IST, not UTC, and not SQL CURDATE(): magic_link_sent_at is written as a JS
- * Date against a pool running at +05:30 (the clock rule the send paths and the
- * cron already follow), so the day boundary has to be computed the same way or
- * a link sent at 02:00 IST would be counted on the previous day.
+ * This file used to carry All / Today / Yesterday / Last 7 days, and the route
+ * defaulted to `today` when the caller sent nothing. When the day pills
+ * replaced the date tabs the page stopped sending a period — and the default
+ * quietly filtered every tile to tickets raised TODAY, of which QA had none.
+ * The screen read 0 across the board while 149 orders sat open, and it looked
+ * calm rather than broken.
+ *
+ * So the concept is gone rather than re-defaulted. The page counts every open
+ * order, and the Day 0/1/2/3+ pills inside each tile do the slicing by age.
+ * A filter nothing sends is a filter nobody can see is wrong.
+ */
+
+/*
+ * India is +05:30 from UTC, and the whole page's idea of "a day" hangs off it:
+ * the pool stores datetimes at this offset, so a ticket raised at 01:00 IST
+ * belongs to that IST date even though UTC is still on the day before.
  */
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
-function istDayStart(now, daysBack = 0) {
-  const ist = new Date(now.getTime() + IST_OFFSET_MS);
-  const ymd = Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate() - daysBack);
-  return new Date(ymd - IST_OFFSET_MS);
-}
-
-function periodRange(period, now = new Date()) {
-  const todayStart = istDayStart(now, 0);
-  const tomorrowStart = new Date(istDayStart(now, -1).getTime());
-  switch (period) {
-    case 'today':
-      return { start: todayStart, end: tomorrowStart };
-    case 'yesterday':
-      return { start: istDayStart(now, 1), end: todayStart };
-    case 'last7':
-      // Seven calendar days ENDING today, today included — "the last 7 days"
-      // as ops reads it off a calendar, not a rolling 168 hours.
-      return { start: istDayStart(now, 6), end: tomorrowStart };
-    case 'all':
-    default:
-      /*
-       * NO WINDOW AT ALL, and it is the DEFAULT (ops, 2026-09-23). The page's
-       * job is "what is open on my desk", and most of that book was raised
-       * weeks ago — a date filter that defaults to today would open on an
-       * empty screen while 149 orders waited. The other three narrow it.
-       */
-      return { start: null, end: null };
-  }
-}
-
-/** The IST calendar date (YYYY-MM-DD) it is right now — the Today/Old split. */
+/** The IST calendar date (YYYY-MM-DD) it is right now — the day pills' anchor. */
 function istToday(now = new Date()) {
   return new Date(now.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
@@ -365,11 +335,12 @@ function istToday(now = new Date()) {
 /* ── The counts behind the tiles ─────────────────────────────────────────── */
 
 /**
- * Every number the tile strip shows, in TWO queries.
+ * Every number the tile strip shows, in ONE query.
  *
- * Two, not ten: one pass over the links sent in the period, one over the open
- * unconfirmed jobs. Counting each tile separately would mean a query per tile
- * per day filter, and the page would be slower than the list it sits above.
+ * One, not twenty-five: five tiles x four day pills, plus the answer split and
+ * the links tally, all come off a single pass over the open book. A query per
+ * pill would make the strip slower than the list beneath it, and — worse —
+ * numbers read at slightly different moments cannot be relied on to add up.
  *
  * `scopeSql` / `scopeParams` let the caller push its RBAC and owner filters in
  * unchanged, so the tiles describe the same population as the grid. Passed as
@@ -377,10 +348,9 @@ function istToday(now = new Date()) {
  * may this user see" is exactly the drift this file exists to avoid.
  */
 async function counts({
-  period = 'all', now = new Date(), scopeSql = '', scopeParams = [], scopeJoins = '',
+  now = new Date(), scopeSql = '', scopeParams = [], scopeJoins = '',
   ownerId, hasRequestTable = true, db = pool,
 } = {}) {
-  const { start, end } = periodRange(period, now);
   const responded = respondedSql('j', hasRequestTable);
   const failed = failedSql();
   const optedIn = optedInSql();
@@ -396,29 +366,6 @@ async function counts({
   if (scopeSql) { where.push(`(${scopeSql})`); whereParams.push(...scopeParams); }
   if (Number.isFinite(Number(ownerId))) { where.push('j.job_owner = ?'); whereParams.push(Number(ownerId)); }
 
-  /*
-   * THE DATE FILTER IS THE TICKET'S CREATION DATE, and it narrows EVERY tile.
-   *
-   * It used to be "links sent in this period", which answered a different
-   * question from the one the tabs appear to ask and left the tiles describing
-   * a slice of the board nobody had asked for. Ops settled it (2026-09-23): the
-   * tabs filter ORDERS BY WHEN THE TICKET CAME IN, every bucket moves with them,
-   * and All is the default.
-   *
-   * `j.ticket_created_date_time` EXACTLY as the list's dateType=ticket applies
-   * it — not COALESCE'd onto created_date_time — because the grid underneath
-   * sends dateType=ticket&startDate&endDate, and a tile counting one column
-   * while the rows filter another is the mismatch this whole file exists to
-   * avoid. (Measured on QA: 0 of 149 open orders have a NULL ticket date.)
-   *
-   * DATE(...) bounds, not raw instants: the pool runs at +05:30, and the list
-   * truncates its own bounds the same way (job.service.js, the 2026-08-18 fix)
-   * so a one-day range means that whole IST day in both places.
-   */
-  if (start && end) {
-    where.push('DATE(j.ticket_created_date_time) >= DATE(?) AND DATE(j.ticket_created_date_time) < DATE(?)');
-    whereParams.push(start, end);
-  }
   const scope = where.length ? ` AND ${where.join(' AND ')}` : '';
   const joins = scopeJoins ? ` ${scopeJoins}` : '';
 
@@ -478,9 +425,6 @@ async function counts({
     '3plus': n(r && r[`d_${key}_3plus`]),
   });
   return {
-    period,
-    period_start: start,
-    period_end: end,
     /* Every open order in the range, one bucket each. These sum to `total`. */
     open: {
       new: n(row && row.b_new),
@@ -525,9 +469,9 @@ async function counts({
 }
 
 module.exports = {
-  BUCKETS, BUCKET_META, PERIODS,
+  BUCKETS, BUCKET_META,
   RESPONSE_KINDS, RESPONSE_SUB_BUCKETS, ALL_BUCKET_FILTERS, responseKindSql,
   DAY_BUCKETS, dayPredicate, ageDaysSql,
   optedInSql, respondedSql, failedSql, sentSql,
-  bucketPredicate, periodRange, istToday, counts,
+  bucketPredicate, istToday, counts,
 };

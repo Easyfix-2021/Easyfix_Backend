@@ -738,18 +738,22 @@ router.get('/unconfirmed-sections', async (req, res, next) => {
 });
 
 /*
- * GET /api/admin/jobs/booking-queue?period=today|yesterday|last7&ownerId=
+ * GET /api/admin/jobs/booking-queue?ownerId=
  *
  * Every number on the Booking-queue tile strip (My Orders -> Unconfirmed, the
- * new tab), in two queries.
+ * new tab), in ONE query.
  *
- * Two shapes of number come back, and the FE renders them as one tile each:
- *   links.*   what happened to the links SENT in the period — a fact about the
- *             day that never goes down. links.sent = the other three, always.
- *   open.*    how many of those are still waiting for the team. Goes down as
- *             orders are booked or cancelled, and matches the grid's row count.
- *   waiting.* the two tiles with no link outcome (New / No link needed), split
- *             Today vs Old by the ticket's creation date.
+ *   open.*              open orders per bucket. The five sum to `total`, and
+ *                       each matches the grid's row count for that tile.
+ *   days.<bucket>.*     that bucket split by ticket age: Day 0/1/2/3+, summing
+ *                       to the bucket. '3plus' is three-or-MORE, so the oldest
+ *                       orders have a pill instead of falling out of the sum.
+ *   response_breakdown  what the customers who answered asked for.
+ *   links_sent          how many of these orders have had a link go out.
+ *
+ * NO DATE WINDOW, deliberately: this route once defaulted to `period=today`,
+ * and when the page stopped sending a period every tile silently read 0 while
+ * 149 orders sat open. The age lives in the day pills now.
  *
  * The bucket definitions are NOT duplicated here: the same module supplies the
  * counts and the `bucket=` filter the grid below sends to GET /admin/jobs, so
@@ -758,11 +762,8 @@ router.get('/unconfirmed-sections', async (req, res, next) => {
  */
 router.get('/booking-queue', async (req, res, next) => {
   try {
-    const period = bookingQueue.PERIODS.includes(String(req.query.period))
-      ? String(req.query.period) : 'today';
     const ownerId = Number(req.query.ownerId);
-    logger.info('Booking-queue counts · period=' + period
-      + ' ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
+    logger.info('Booking-queue counts · ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
 
     // Required inside the handler, as the sibling handlers in this file do.
     const { pool } = require('../../db');
@@ -774,7 +775,6 @@ router.get('/booking-queue', async (req, res, next) => {
     );
 
     const counts = await bookingQueue.counts({
-      period,
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scopeSql: frag.clauses.join(' AND '),
       scopeParams: frag.params,
