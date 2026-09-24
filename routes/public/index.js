@@ -40,6 +40,10 @@ router.use('/job-completion', require('./job-completion'));
 // routes show a summary and run the OTP that issues a one-job guest session.
 // (Not the page retired 2026-09-10, which was a view-only page for any job.)
 router.use('/shared-job', require('./shared-job'));
+// /dynamic-report (2026-09-23) — a QuickSight Custom Report's public link. The
+// :token is the report's revocable random share_token (not a JWT); it reads
+// that one report's CURRENT upload only. Rate-limited per token inside.
+router.use('/dynamic-report', require('./dynamic-report'));
 // Easyfixer-facing profile-update magic-link surface. Token lives in the
 // query string (?token=…) rather than the URL path because the FE keeps the
 // path stable (/profile-update/<jwt>) and proxies the JWT through to the BE

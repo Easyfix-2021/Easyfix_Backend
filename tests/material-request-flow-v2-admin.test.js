@@ -359,10 +359,35 @@ function handlerFor(router, routePath, method) {
 function mockRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
 }
+// Material Request Flow v2, 2026-09-22 correction: the estimate/approve
+// routes now REQUIRE visit_date_time + permission (see
+// services/job-estimate-approval.js#approveWithVisitSchedule). Defaulted
+// here so every existing call below keeps exercising what it always tested
+// (the stamp/status/transaction behaviour) without each needing its own
+// edit; a test with different needs still overrides via its own `body`.
+/*
+ * TOMORROW, computed — never a literal date. A hardcoded '2026-09-23 10:00:00'
+ * here stopped every QA deploy on 2026-09-23: assertSlotBookable refuses a slot
+ * that is not in the future and within 30 days, so the fixture passed CI until
+ * the day it named arrived, then failed 14 tests across two files for a reason
+ * that had nothing to do with the change being deployed. IST, and 10:00 on the
+ * NEXT day, so it is a valid slot hour (SLOT_START_HOURS) whatever time the
+ * suite runs.
+ */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+const TOMORROW_IST_10AM = (() => {
+  const ist = new Date(Date.now() + IST_OFFSET_MS + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
+const APPROVE_BODY_DEFAULTS = { visit_date_time: TOMORROW_IST_10AM, permission: 'not_required' };
+
 async function callClient(routePath, method, body = {}) {
   const r = mockRes();
   await handlerFor(clientRouter, routePath, method)(
-    { spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(JOB_ID) }, body },
+    {
+      spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(JOB_ID) },
+      body: routePath.includes('/estimate/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;
@@ -374,7 +399,10 @@ function mintEstimateToken(jobId, clientContactId = null) {
 async function callPublic(routePath, method, { token, body = {} } = {}) {
   const r = mockRes();
   await handlerFor(publicEstimateRouter, routePath, method)(
-    { params: { token: token || mintEstimateToken(JOB_ID, 42) }, body },
+    {
+      params: { token: token || mintEstimateToken(JOB_ID, 42) },
+      body: routePath.includes('/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;

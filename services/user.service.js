@@ -1065,6 +1065,13 @@ async function suggestNextEmpCode() {
  * for audit FKs. If a new joiner has the same email/mobile as an inactive
  * row, the operator should reactivate that row instead.
  */
+// manage_states is a comma list of state ids ('0' = all). Lazy require: the
+// state service loads the DB layer, and this module is required very early.
+async function assertScopeStatesLive(csv) {
+  const st = require('../lib/scope').parseScope(csv);
+  if (st.mode === 'allow') await require('./state.service').assertActiveStates(st.ids);
+}
+
 async function createUser({
   user_name, official_email, mobile_no, user_role,
   city_id, alternate_no,
@@ -1277,6 +1284,10 @@ async function createUser({
       err.field = 'user_code';
       throw err;
     }
+
+    // Regions must be ACTIVE states: an inactive state is offered nowhere, and
+    // a user scoped to one would silently lose its cities (lib/scope.js).
+    await assertScopeStatesLive(manage_states);
 
     [r] = await conn.query(
       `INSERT INTO tbl_user
@@ -1667,6 +1678,9 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     if (normaliseForCompare(key, fields[key]) === normaliseForCompare(key, me[key])) continue;
 
     let val = fields[key];
+    // Only when the region list is actually changing (the no-change skip above),
+    // so an old scope never blocks an unrelated edit.
+    if (key === 'manage_states' && val) await assertScopeStatesLive(val);
     if (key === 'user_role' && val) {
       const role = await roleService.getRoleById(val);
       if (!role) throw mkErr(400, `Unknown role_id ${val}`);

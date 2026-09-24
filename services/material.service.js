@@ -293,6 +293,17 @@ function onMaterialPricesChanged(materialId, diff) {
   logger.info({ material_id: materialId, diff }, 'onMaterialPricesChanged (no-op)');
 }
 
+// Price overrides go on ACTIVE states only — an inactive state is offered
+// nowhere, so a price on it would never apply. validateGroupsPayload stays
+// pure (no DB), so this runs beside it.
+async function assertGroupStatesActive(groups) {
+  const ids = [];
+  for (const g of (Array.isArray(groups) ? groups : [])) {
+    for (const st of (Array.isArray(g.states) ? g.states : [])) ids.push(...(st.state_ids || []));
+  }
+  await require('./state.service').assertActiveStates(ids);
+}
+
 async function writeGroups(conn, materialId, pricingType, groups, { allowNullPrice = false } = {}) {
   await conn.query(
     `DELETE FROM tbl_material_state_price_state WHERE group_id IN (SELECT group_id FROM tbl_material_price_group WHERE material_id = ?)`,
@@ -350,6 +361,7 @@ async function createMaterial(input, actor = {}) {
   const key = nameKey(name);
 
   await validateGroupsPayload(pricingType, input.groups, { allowNullPrice: false });
+  await assertGroupStatesActive(input.groups);
 
   const [[dup]] = await pool.query(
     `SELECT material_id, material_name FROM tbl_material_master WHERE material_key = ? AND service_catg_id = ? LIMIT 1`,
@@ -401,6 +413,7 @@ async function updateMaterial(id, input, actor = {}) {
   const key = nameKey(name);
 
   await validateGroupsPayload(pricingType, input.groups, { allowNullPrice: false });
+  await assertGroupStatesActive(input.groups);
 
   const [[dup]] = await pool.query(
     `SELECT material_id, material_name FROM tbl_material_master WHERE material_key = ? AND service_catg_id = ? AND material_id <> ? LIMIT 1`,

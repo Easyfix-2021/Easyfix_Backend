@@ -589,6 +589,9 @@ const SORTABLE_COLUMNS = {
  * material_count: count of lines in draft/review_pending/approval_pending —
  * the technician/CRM "still open" set (quotationLineState.OPEN_STATES).
  */
+// material_draft_count (2026-09-22): each Send is its own quotation, so a job at 16 or 15 can
+// ALSO hold drafts of the NEXT quotation — which material_state (status first) cannot say. The
+// app's footer offers Send for Approval off this count, not off material_state.
 function materialStateColumns() {
   const draftExists = quotationLineState.statePredicateSql('mst', quotationLineState.STATE.DRAFT);
   const openLine = quotationLineState.openLineSql('msc');
@@ -603,7 +606,10 @@ function materialStateColumns() {
   (SELECT COUNT(*) FROM quotation_details msc
      WHERE msc.job_id = j.job_id
        AND (${openLine})
-  ) AS material_count`;
+  ) AS material_count,
+  (SELECT COUNT(*) FROM quotation_details mdc
+     WHERE mdc.job_id = j.job_id AND ${quotationLineState.statePredicateSql('mdc', quotationLineState.STATE.DRAFT)}
+  ) AS material_draft_count`;
 }
 
 // ─── Projections ────────────────────────────────────────────────────

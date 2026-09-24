@@ -61,6 +61,10 @@ test('getByIdCore SELECTs a material_count over draft/review_pending/approval_pe
   assert.doesNotMatch(detailSql, /CAST\(\w+\.status AS UNSIGNED\) = 0/, 'the rejected predicate must not appear in material_count');
 });
 
+test('getByIdCore SELECTs material_draft_count over DRAFT lines only (drafts of the next quotation at 16/15)', () => {
+  assert.match(detailSql, /SELECT COUNT\(\*\) FROM quotation_details \w+\s+WHERE \w+\.job_id = j\.job_id AND \w+\.sent_on IS NULL\s*\) AS material_draft_count/);
+});
+
 // ─── LIST projection ─────────────────────────────────────────────────────
 
 test('list() carries the SAME material_state/material_count fragment as getByIdCore (one shared function, not two copies)', () => {
@@ -68,6 +72,7 @@ test('list() carries the SAME material_state/material_count fragment as getByIdC
   assert.match(listSql, /WHEN j\.job_status = 16 THEN 'review_pending'/);
   assert.match(listSql, /WHEN j\.job_status = 15 THEN 'approval_pending'/);
   assert.match(listSql, /AS material_count/);
+  assert.match(listSql, /AS material_draft_count/);
 });
 
 /*

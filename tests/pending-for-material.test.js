@@ -115,6 +115,9 @@ const fake = installFakePool([
   // material-review tests assert on an EMPTY `lines` review).
   [/^\s*SELECT id FROM quotation_details(?!.*type\s*=\s*'material')/is, () => [{ id: 1 }]],
   [/^\s*SELECT id FROM quotation_details.*type\s*=\s*'material'/is, () => []],
+  // One-timestamp-per-send lookup (2026-09-22 amendment) — no prior sent_on
+  // in this file's world, so nextSentOn falls straight through to `now`.
+  [/^\s*SELECT MAX\(sent_on\)/i, () => [{ maxSentOn: null }]],
   [/^\s*UPDATE quotation_details\b/i, () => ({ affectedRows: 1 })],
   // Client/public approve-reject: the approval_pending line stamp — no line
   // fixtures in THIS file's world, so an UPDATE that touches 0 rows is
@@ -200,14 +203,17 @@ test('materialRequired: 20 (IN_PROGRESS_ALT) also qualifies', async () => {
   assert.equal(out.status, 16);
 });
 
-// 15 -> 409 "Waiting for client approval" (Material Request Flow v2's
-// job-level write lock — every OTHER status still refuses too, but 15 is the
-// one with its own contract message).
+// 15 -> 409 "Your previous quotation is with the client — send this one
+// after they decide" (2026-09-22 amendment — SEND is refused at 15 with its
+// own contract message; adding/drafting is allowed there now, but
+// materialRequired has no drafts of its own to add — see the fixture, which
+// carries no quotation line at all — so it hits this message, not the 422
+// "no draft" one).
 test('materialRequired refuses a job at 15 — nothing is written', async () => {
   jobFixture = makeJob({ job_status: 15, fk_easyfixter_id: TECH_EFR_ID });
   await assert.rejects(
     () => estimateService.materialRequired(jobFixture.job_id, TECH_EFR_ID),
-    (e) => { assert.equal(e.status, 409); assert.match(e.message, /Waiting for client approval/); return true; },
+    (e) => { assert.equal(e.status, 409); assert.match(e.message, /send this one after they decide/); return true; },
   );
   assert.equal(jobUpdates(fake.calls).length, 0);
 });
@@ -351,10 +357,34 @@ function handlerFor(router, routePath, method) {
 function mockRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
 }
+// Material Request Flow v2, 2026-09-22 correction: the estimate/approve
+// routes now REQUIRE visit_date_time + permission (see
+// services/job-estimate-approval.js#approveWithVisitSchedule). Defaulted
+// here so every existing call below keeps exercising what it always tested
+// (the 15->1/2 move, the 16 guard) without each needing its own edit.
+/*
+ * TOMORROW, computed — never a literal date. A hardcoded '2026-09-23 10:00:00'
+ * here stopped every QA deploy on 2026-09-23: assertSlotBookable refuses a slot
+ * that is not in the future and within 30 days, so the fixture passed CI until
+ * the day it named arrived, then failed 14 tests across two files for a reason
+ * that had nothing to do with the change being deployed. IST, and 10:00 on the
+ * NEXT day, so it is a valid slot hour (SLOT_START_HOURS) whatever time the
+ * suite runs.
+ */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+const TOMORROW_IST_10AM = (() => {
+  const ist = new Date(Date.now() + IST_OFFSET_MS + 24 * 3600 * 1000);
+  return ist.toISOString().slice(0, 10) + ' 10:00:00';
+})();
+const APPROVE_BODY_DEFAULTS = { visit_date_time: TOMORROW_IST_10AM, permission: 'not_required' };
+
 async function callClient(routePath, method, body = {}) {
   const r = mockRes();
   await handlerFor(clientRouter, routePath, method)(
-    { spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(jobFixture.job_id) }, body },
+    {
+      spoc: { id: 42, client_id: 133 }, access: { allStores: true }, query: {}, params: { id: String(jobFixture.job_id) },
+      body: routePath.includes('/estimate/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;
@@ -420,7 +450,10 @@ function mintEstimateToken(jobId, clientContactId = null) {
 async function callPublic(routePath, method, { token, body = {} } = {}) {
   const r = mockRes();
   await handlerFor(publicEstimateRouter, routePath, method)(
-    { params: { token: token || mintEstimateToken(jobFixture.job_id, 42) }, body },
+    {
+      params: { token: token || mintEstimateToken(jobFixture.job_id, 42) },
+      body: routePath.includes('/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
+    },
     r, (e) => { throw e; },
   );
   return r;
