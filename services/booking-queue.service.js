@@ -283,7 +283,55 @@ function dayPredicate(day, alias = 'j', today = istToday(), anchor = 'ticket') {
  * Calendar days, not working days: EasyFix works seven days (ops, this phase).
  */
 
-/** Call outcomes where the customer's leg rang and did not connect. */
+/*
+ * ── TWO TELEPHONY PROVIDERS, TWO VOCABULARIES ────────────────────────────
+ *
+ * Calls reach us through Plivo today and through Kaleyra historically, and they
+ * do not describe an outcome the same way:
+ *
+ *   Kaleyra  caller_status carries the outcome itself — NOANSWER, BUSY,
+ *            FAILED_LEG2, no_answer … (two spellings, from two integrations).
+ *   Plivo    caller_status is only 'completed' / 'hungup'; whether the CUSTOMER
+ *            ever picked up is `answered_on` on tbl_plivo_call_log.
+ *
+ * The first cut of this ledger knew only the Kaleyra words, so NO PLIVO CALL
+ * EVER COUNTED — answered or not. Measured on job #482470: two calls placed on
+ * 2026-09-24 and the row still read "1 of 3", which is what ops reported.
+ *
+ * WHO WAS CALLED MATTERS TOO. tbl_plivo_call_log.call_flow says 'job' /
+ * 'customer' when the operator rang the CUSTOMER and 'spoc' when they rang the
+ * CLIENT's contact. Chasing the client is not an attempt to reach the customer
+ * — #482470 carries four unanswered 'spoc' calls from July, and counting those
+ * would have handed the order over without anybody ever ringing the customer.
+ */
+
+/*
+ * WHICH PLIVO ROW IS THE CUSTOMER.
+ *
+ * A web call is a CONFERENCE of two legs, and both are logged against the same
+ * job: `participant_role = 'operator'` is our own executive's phone, and
+ * `'customer'` is the customer's. Measured on #482470, one call:
+ *
+ *   flow=job        role=operator  dialled 9810…(the executive)  answered +1s
+ *   flow=conference role=customer  the customer's leg            answered +21s
+ *
+ * The operator's leg answers instantly, every time, because it is the person
+ * who pressed Call. Counting it would mean every call looks answered; counting
+ * it when it fails would mean an executive's own flaky line reads as "the
+ * customer did not pick up". Neither is an attempt to reach anybody.
+ *
+ * `participant_role IS NULL` is a plain 1:1 call, from before conferences
+ * existed (and rows written by the mobile path), where the dialled number IS
+ * the customer's — so the call_flow tells us instead: 'job'/'customer' are the
+ * customer, 'spoc' and 'technician' are not. #482470 carries four unanswered
+ * 'spoc' calls from July; chasing the CLIENT is not an attempt to reach the
+ * customer, and counting them would have handed the order over without anyone
+ * ever ringing them.
+ */
+const PLIVO_CUSTOMER_LEG = `AND (pcl.participant_role = 'customer'
+        OR (pcl.participant_role IS NULL AND pcl.call_flow IN ('job', 'customer')))`;
+
+/** Call outcomes where the customer's leg rang and did not connect (Kaleyra). */
 const FAILED_CALL_STATUSES = [
   'NOANSWER_LEG2', 'BUSY_LEG2', 'FAILED_LEG2',
   'NOANSWER', 'BUSY', 'CONGESTION', 'CANCEL',
@@ -309,6 +357,10 @@ function attemptDatesSql(alias = 'j') {
       SELECT jci.inserted_time FROM tbl_job_caller_info jci
        WHERE jci.job_id = ${alias}.job_id AND jci.call_type = 'OUT'
          AND jci.caller_status IN (${FAILED_CALL_LIST})
+      UNION ALL
+      SELECT pcl.initiated_on FROM tbl_plivo_call_log pcl
+       WHERE pcl.job_id = ${alias}.job_id ${PLIVO_CUSTOMER_LEG}
+         AND pcl.answered_on IS NULL
     ) a`;
 }
 
@@ -331,6 +383,10 @@ function thirdAttemptDateSql(alias = 'j') {
       SELECT jci.inserted_time FROM tbl_job_caller_info jci
        WHERE jci.job_id = ${alias}.job_id AND jci.call_type = 'OUT'
          AND jci.caller_status IN (${FAILED_CALL_LIST})
+      UNION ALL
+      SELECT pcl.initiated_on FROM tbl_plivo_call_log pcl
+       WHERE pcl.job_id = ${alias}.job_id ${PLIVO_CUSTOMER_LEG}
+         AND pcl.answered_on IS NULL
     ) a) a3 ORDER BY a3.d LIMIT 1 OFFSET 2)`;
 }
 
@@ -391,12 +447,25 @@ function attemptColumns(alias = 'j') {
       UNION ALL
       SELECT jci_k.inserted_time, 'call' FROM tbl_job_caller_info jci_k
        WHERE jci_k.job_id = ${alias}.job_id AND jci_k.call_type = 'OUT'
-         AND jci_k.caller_status IN (${FAILED_CALL_LIST})`;
+         AND jci_k.caller_status IN (${FAILED_CALL_LIST})
+      UNION ALL
+      SELECT pcl.initiated_on, 'call' FROM tbl_plivo_call_log pcl
+       WHERE pcl.job_id = ${alias}.job_id ${PLIVO_CUSTOMER_LEG}
+         AND pcl.answered_on IS NULL`;
   return `,
   ${attemptCountSql(alias)} AS attempts_count,
   (SELECT k.at   FROM (${union}) k ORDER BY k.at DESC LIMIT 1) AS last_attempt_at,
   (SELECT k.kind FROM (${union}) k ORDER BY k.at DESC LIMIT 1) AS last_attempt_kind,
-  ${transferredAtSql(alias)} AS transferred_at`;
+  ${transferredAtSql(alias)} AS transferred_at,
+  /*
+   * Remarks = the LATEST comment on the job, not tbl_job.remarks. That column
+   * is a single mutable field the next write overwrites (job.service.js says so
+   * where it writes it), so a row could show a remark that has already been
+   * replaced. Comment rows persist and carry their own date.
+   */
+  (SELECT c_rm.comments FROM tbl_job_comment c_rm
+    WHERE c_rm.job_id = ${alias}.job_id AND c_rm.comments IS NOT NULL AND c_rm.comments <> ''
+    ORDER BY c_rm.created_on DESC, c_rm.comment_id DESC LIMIT 1) AS latest_comment`;
 }
 
 /** With the client: three attempt-days, or an Unreachable note from before the cut-over. */

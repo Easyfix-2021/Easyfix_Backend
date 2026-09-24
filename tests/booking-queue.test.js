@@ -163,6 +163,41 @@ test('the attempt ledger counts distinct DAYS, from the three real sources', () 
   }
 });
 
+/*
+ * PLIVO CALLS COUNT — and only the CUSTOMER's leg of them.
+ *
+ * Reported from QA on #482470: two calls placed on 2026-09-24 and the row still
+ * read "1 of 3". The ledger knew only the Kaleyra vocabulary (NOANSWER, BUSY…),
+ * and Plivo writes 'completed' / 'hungup' with the real outcome in answered_on
+ * — so NO Plivo call had ever counted, answered or not.
+ *
+ * A web call is a conference of two legs against one job. The operator's leg
+ * answers instantly every time (they pressed Call), so counting it makes every
+ * call look answered — and counting its failures makes an executive's own flaky
+ * line read as "the customer did not pick up". #482470 also carries four
+ * unanswered 'spoc' calls: chasing the CLIENT is not an attempt to reach the
+ * customer, and counting them would have transferred the order without anyone
+ * ever ringing them.
+ */
+test('a Plivo call counts only when the CUSTOMER leg never connected', () => {
+  const sql = bq.attemptCountSql('j');
+  assert.match(sql, /tbl_plivo_call_log/, 'Plivo is how calls are placed today');
+  assert.match(sql, /answered_on IS NULL/,
+    "Plivo's status is only completed/hungup — answered_on is where the outcome lives");
+  assert.match(sql, /participant_role = 'customer'/, 'the customer leg, not the operator');
+  assert.match(sql, /participant_role IS NULL AND pcl\.call_flow IN \('job', 'customer'\)/,
+    'a pre-conference 1:1 row has no role, so the flow says who was dialled');
+  assert.doesNotMatch(sql, /'spoc'/, 'calling the CLIENT is not an attempt to reach the customer');
+});
+
+test('Remarks is the latest COMMENT, never the overwritable column', () => {
+  const cols = bq.attemptColumns('j');
+  assert.match(cols, /FROM tbl_job_comment c_rm[\s\S]*ORDER BY c_rm\.created_on DESC/);
+  assert.match(cols, /AS latest_comment/);
+  assert.doesNotMatch(cols, /j\.remarks/,
+    'tbl_job.remarks is one mutable field the next write replaces — a row would show a remark that is already gone');
+});
+
 test('the transfer needs three days, and the client tile owns both doors', () => {
   assert.equal(bq.ATTEMPTS_TO_TRANSFER, 3);
   const client = bq.bucketPredicate('client_queue');
