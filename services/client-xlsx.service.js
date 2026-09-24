@@ -156,18 +156,21 @@ async function exportRateCards(clientName, rateCards) {
  */
 function addMaterialRatesSheet(wb, sheetName, items, stateNameById = new Map()) {
   const { ws } = newWorkbook(sheetName, wb);
-  applyHeader(ws, ['Material', 'Brand', 'Price', 'State']);
+  // Tx Share (2026-09-24) — inserted after Price, so every reader of this
+  // shared sheet (per-tab download, combined workbook, bulk-upload template
+  // + round-trip) sees the same 5-column layout.
+  applyHeader(ws, ['Material', 'Brand', 'Price', 'Tx Share', 'State']);
   let rowCount = 0;
   for (const item of (items || [])) {
     for (const g of (item.groups || [])) {
       const brandNames = (g.brands || []).length === 0 ? [''] : g.brands.map((b) => b.brand_name);
       for (const brandName of brandNames) {
-        ws.addRow([item.material_name ?? '', brandName, Number(g.price) || 0, '']);
+        ws.addRow([item.material_name ?? '', brandName, Number(g.price) || 0, Number(g.tx_share) || 0, '']);
         rowCount++;
         for (const s of (g.states || [])) {
           for (const stateId of (s.state_ids || [])) {
             const stateName = stateNameById.get(stateId) || `#${stateId}`;
-            ws.addRow([item.material_name ?? '', brandName, Number(s.price) || 0, stateName]);
+            ws.addRow([item.material_name ?? '', brandName, Number(s.price) || 0, Number(s.tx_share) || 0, stateName]);
             rowCount++;
           }
         }

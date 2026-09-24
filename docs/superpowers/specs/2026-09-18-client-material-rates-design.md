@@ -239,3 +239,126 @@ Migration first on QA (never Prod without an explicit instruction), then
 backend, then CRM — each promoted only after the owner's explicit yes, with the
 served-build guard in `easyfix-deploy.mjs` respected (never remove a colleague's
 deployed work).
+
+## 2026-09-24 — Tx Share
+
+Owner-approved, implemented alongside the CRM built in parallel against this
+section as the contract.
+
+**Concept**: a client's material rate now carries a **Tx Share** — the
+technician's charge on top of the material Price — alongside the Price. The
+CLIENT is asked to approve Price + Tx Share (shown as one combined rate on
+the letterhead PDF, never the split); the TECHNICIAN only ever sees the
+Price. Default Tx Share = 20% of the price, rounded to 2dp.
+
+### Schema
+
+`migrations/2026-09-24-client-material-tx-share.sql` adds
+`tx_share DECIMAL(12,2) NULL` to `tbl_client_material_price_group` and
+`tbl_client_material_state_price` (the two client tables only — the MASTER
+tables carry no such column; a master hit always computes 20% on the fly).
+Backfill: `tx_share = ROUND(price * 0.2, 2) WHERE tx_share IS NULL`. NULL
+(pre-migration rows, or a data fix) reads as the same computed 20% at every
+call site — the column is never a required write.
+
+### API
+
+- `GET`/`PUT`/`POST .../batch` on `/:clientId/material-rates*` — every group
+  and every state override carries `tx_share`. On write: optional, a number
+  `>= 0` with at most 2 decimal places (Joi `precision(2)` at the route,
+  which rounds; `client-material-rates.service.js#invalidTxShare` rejects at
+  the SERVICE level for callers that skip Joi, e.g. the bulk-upload parser).
+  Omitted/null → `ROUND(price * 0.2, 2)`. Reads always return a value — NULL
+  legacy → computed 20%.
+- **NEW** `GET /:clientId/material-rates/master-rows?search=&limit=` →
+  `{ items: [{ material_id, material_name, brand_id, brand_name, label,
+  price, state_prices: [{state_id, state_name, price}] }] }` — one row per
+  active master material x active brand (`tbl_material_price_group` +
+  `_brand`); a No-Brand material (or a group whose brands are all now
+  inactive) gives brand_id/brand_name null. Same read-level guard as the
+  other material-rates GETs; for the CRM's "Add Material" picker behind
+  `POST /admin/jobs/:id/quotation-lines`. `services/material.service.js#masterRows`.
+
+### Resolver
+
+`services/material-price-resolver.js#resolveMaterialPrice` returns a new
+`tx_share` field alongside `price`/`source`/`groupId`:
+
+| source | tx_share |
+|---|---|
+| `client_state` | that state row's own `tx_share` (NULL → 20% of that row's price) |
+| `client_group` | the group's own `tx_share` (NULL → 20% of the group's price) |
+| `master_state` / `master_group` | always `ROUND(price * 0.2, 2)` — no column on the master tables |
+| `none` | `null` |
+
+`defaultTxShare(price)` (the shared 20%-rounded-to-2dp helper) is exported
+alongside `resolveMaterialPrice` and reused everywhere else this document
+says "20% default" — the resolver, `client-material-rates.service.js`,
+`routes/admin/jobs.js`'s CRM add-line route, and
+`rate-card-bulk-upload.service.js`'s per-row Materials parser.
+
+**The technician app must never see `tx_share`.** Every mobile response this
+backend returns (`GET /mobile/jobs/:id/materials`, `GET/POST
+/mobile/jobs/:id/quotation`, etc.) strips it — guarded by tests asserting the
+JSON payload never contains the string, with a positive control (a non-zero
+fixture tx_share) so an accidentally-vacuous pass is ruled out.
+
+### Quotation lines (`quotation_details.tx_charge`)
+
+Audited every reader/writer of this legacy FLOAT column before reusing it
+(2026-09-24): it was written as a literal/caller-supplied `0` by three paths
+(`routes/admin/quotations.js` POST `/product`/`/material` — a generic,
+out-of-scope admin route, left untouched; `services/mobile-job-estimate
+.service.js#insertDraftLine`; `routes/admin/jobs.js` POST
+`/:id/quotation-lines`) and otherwise only ever SELECTed for display
+(`GET /admin/quotations?jobId=`) or schema-existence-checked
+(`scripts/schema-verify.js`) — no billing, finance, ledger, export or
+client-portal reader consumes it (those all key off `client_charge` /
+`approved_charge` / `unit_price` — see `services/job-line-total.js`,
+`routes/admin/finance.js`, `services/job-export.service.js`,
+`routes/client/index.js`). No conflicting meaning found, so it is now the
+**per-unit Tx Share snapshot**:
+
+- Mobile `addQuotationLine` / `POST .../quotation/draft` (via the shared
+  `resolveLineForInsert` → `insertDraftLine`) and the CRM's
+  `POST /admin/jobs/:id/quotation-lines` all set `tx_charge` from the
+  resolver's `tx_share`, falling back to `defaultTxShare(unit_price)` (20% of
+  the actually-billed price) when the resolver had none (`source: 'none'`).
+  Product lines carry no Tx Share concept and keep `tx_charge = 0`.
+  `tx_charge` is appended LAST in each INSERT's column list (not its native
+  table position) so no pre-existing positional test assertion had to move.
+- `GET /admin/quotations?jobId=` rows gain `tx_share`: the row's own
+  `tx_charge` when it is a real (non-zero, non-null) per-unit snapshot; for a
+  legacy row (`tx_charge` 0/NULL, inserted before this date) it is computed —
+  20% of `client_charge` when the line has one, else 20% of `unit_price`.
+- `POST /admin/jobs/:id/material-review` (approve) — each approved line may
+  now carry an optional `quoted_unit_price` (a whole number `>= 0` —
+  `quotation_details.unit_price` is a legacy INT column, so a fractional
+  value 422s before any write, same rule the technician app's own quote
+  already enforces), which updates `unit_price` in the SAME transaction,
+  before the approval columns. `approved_amount` semantics (the line total
+  sent to the client) are unchanged.
+
+### Bulk upload + letterhead PDF
+
+The Materials flat format (`Material, Brand, Price, State`) gains an
+optional **Tx Share** column between Price and State — blank defaults to 20%
+of that row's own price. `services/client-xlsx.service.js#addMaterialRatesSheet`
+(shared by the per-tab download, the combined `export.xlsx`, and — via
+`namedOrFirstSheet` — the bulk-upload template/preview/commit, since there is
+only ONE writer of this sheet) writes it; the upload template's hidden
+`Lists` sheet dropdown for State moved from column D to E accordingly.
+`services/rate-card-bulk-upload.service.js#parseMaterialRateRows` parses it,
+folds it into the (material, brand, state) grouping/signature comparison
+(two brands sharing a price but NOT a Tx Share compile to two groups, not
+one — a group has exactly one Tx Share) and re-validates the compiled
+groups' `tx_share` through `validateClientGroupsPayload` exactly like the
+direct PUT route. The round-trip test (export → preview, all `unchanged`)
+stays green because both sides — the export and the "existing" signature —
+read `tx_share` from the SAME `materialRatesSvc.list()` call.
+
+`utils/pdf-rate-card.js`'s Materials table shows **ONE** rate per row —
+`price + tx_share` combined — for both the base price and every state
+override; the literal text "Tx Share" never appears on the letterhead (the
+client is shown a single number, not the split, same principle as the
+Services table never showing Easyfix Direct/Overhead).

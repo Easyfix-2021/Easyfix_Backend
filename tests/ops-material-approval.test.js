@@ -146,6 +146,17 @@ const fake = installFakePool([
   // client-facing read below.
   [/^\s*SELECT id FROM quotation_details/i, (sql, params) => filterQuotationRows(sql, [params[0]]).map((r) => ({ id: r.id }))],
 
+  // Admin material-review — quoted_unit_price (2026-09-24), written BEFORE
+  // the approved_charge/status write below, on its own UPDATE. Matched first
+  // (fake-pool tries routes in order) so it never falls into the
+  // approve/reject dispatcher beneath it, whose column positions differ.
+  [/^\s*UPDATE quotation_details SET unit_price = \?/i, (sql, params) => {
+    const [unitPrice, id] = params;
+    const row = quotationRows.find((r) => r.id === id);
+    if (row) row.unit_price = unitPrice;
+    return { affectedRows: row ? 1 : 0 };
+  }],
+
   // Admin material-review — per-line write.
   [/^\s*UPDATE quotation_details\b/i, (sql, params) => {
     const isApprove = /approved_charge/.test(sql);
@@ -318,6 +329,46 @@ test('approve: approved line gets approved_charge/status=1/action stamps, reject
   const qUpdIdx = fake.calls.findIndex((c) => /^\s*UPDATE quotation_details\b/i.test(c.sql));
   const jobUpdIdx = fake.calls.findIndex((c) => c === statusUpd);
   assert.ok(qUpdIdx >= 0 && qUpdIdx < jobUpdIdx, 'quotation_details writes must precede the job_status UPDATE');
+});
+
+// ─── quoted_unit_price (2026-09-24) ────────────────────────────────────
+
+test('approve with quoted_unit_price updates unit_price in the same transaction, before approval', async () => {
+  quotationRows = [materialLine({ id: 91, unit_price: 999 })];
+  const events = await withConnSpy(async () => {
+    const res = await adminPost({
+      decision: 'approve',
+      lines: [{ line_id: 91, decision: 'approve', approved_amount: 450, quoted_unit_price: 520 }],
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+  });
+  assert.deepEqual(events, ['beginTransaction', 'commit'], 'one transaction covers both writes');
+  const row = quotationRows.find((r) => r.id === 91);
+  assert.equal(row.unit_price, 520, 'quoted_unit_price must overwrite unit_price');
+  assert.equal(row.approved_charge, 450, 'approved_amount semantics (line total to the client) are unchanged');
+
+  const unitPriceUpdIdx = fake.calls.findIndex((c) => /^\s*UPDATE quotation_details SET unit_price = \?/i.test(c.sql));
+  const approveUpdIdx = fake.calls.findIndex((c) => /approved_charge/.test(c.sql));
+  assert.ok(unitPriceUpdIdx >= 0 && unitPriceUpdIdx < approveUpdIdx, 'unit_price must be written BEFORE the approval columns');
+});
+
+test('approve without quoted_unit_price leaves unit_price untouched', async () => {
+  quotationRows = [materialLine({ id: 91, unit_price: 999 })];
+  const res = await adminPost({ decision: 'approve', lines: [{ line_id: 91, decision: 'approve', approved_amount: 450 }] });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(quotationRows.find((r) => r.id === 91).unit_price, 999, 'omitted quoted_unit_price must not touch unit_price');
+  assert.ok(!fake.calls.some((c) => /^\s*UPDATE quotation_details SET unit_price = \?/i.test(c.sql)), 'no unit_price UPDATE should even run');
+});
+
+test('422: a fractional quoted_unit_price is refused before any write (unit_price is a legacy INT column)', async () => {
+  quotationRows = [materialLine({ id: 91, unit_price: 999 })];
+  const res = await adminPost({
+    decision: 'approve',
+    lines: [{ line_id: 91, decision: 'approve', approved_amount: 450, quoted_unit_price: 520.5 }],
+  });
+  assert.equal(res.status, 422, JSON.stringify(res.body));
+  assert.match(res.body.error, /whole number/);
+  assert.equal(quotationUpdates(fake.calls).length, 0, 'a 422 on content validation must write nothing');
 });
 
 test('a job with no material lines is still approvable — empty lines array', async () => {

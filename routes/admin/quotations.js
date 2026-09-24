@@ -7,6 +7,24 @@ const { buildRequestScope, assertEntityInScope } = require('../../lib/scope');
 const logger = require('../../logger');
 // Material Request Flow v2 (2026-09-21) — the single line-state derivation.
 const quotationLineState = require('../../services/quotation-line-state');
+// Tx Share (2026-09-24) — the shared "20% of price" default.
+const { defaultTxShare } = require('../../services/material-price-resolver');
+
+/*
+ * tx_share for a listed row: tx_charge itself is the per-unit snapshot for
+ * every line written after 2026-09-24 (mobile addQuotationLine/draft, CRM
+ * POST /:id/quotation-lines). A LEGACY row (tx_charge 0 or NULL, inserted
+ * before that date) has none, so it's computed the same way the resolver
+ * would have: 20% of client_charge (the rate-card price the line was quoted
+ * against) when there is one, else 20% of unit_price (a CRM-typed manual
+ * quote with no resolvable rate-card price at all).
+ */
+function txShareForRow(row) {
+  const tx = Number(row.tx_charge);
+  if (row.tx_charge !== null && row.tx_charge !== undefined && tx !== 0) return tx;
+  const base = (row.client_charge !== null && row.client_charge !== undefined) ? row.client_charge : row.unit_price;
+  return defaultTxShare(base);
+}
 
 // Helper: given a jobId, return {client_id, city_id, vertical_id} for scope check.
 async function jobScopeFields(jobId) {
@@ -73,7 +91,7 @@ router.get('/', async (req, res, next) => {
     // sent_on within the job; null for a draft. Same shared helper the
     // mobile quotation list uses — see services/quotation-line-state.js.
     const quotationNos = quotationLineState.quotationNumbers(rows.map((r) => r.sent_on));
-    rows.forEach((r, i) => { r.quotation_no = quotationNos[i]; });
+    rows.forEach((r, i) => { r.quotation_no = quotationNos[i]; r.tx_share = txShareForRow(r); });
     logger.info('Found ' + rows.length + ' quotations');
     modernOk(res, rows);
   } catch (e) { logger.error('List quotations failed · ' + e.message); next(e); }

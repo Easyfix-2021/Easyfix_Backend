@@ -49,7 +49,13 @@ const SERVICES_HEADER = [
   'Overhead Fixed', 'Overhead Variable',
   'Client Fixed', 'Client Variable',
 ];
-const MATERIALS_HEADER = ['Material', 'Brand', 'Price', 'State'];
+const MATERIALS_HEADER = ['Material', 'Brand', 'Price', 'Tx Share', 'State'];
+// Row literals below are [material, brand, price, state] (4 cols) for
+// brevity, since almost none of them care about Tx Share — mtRow() splices
+// in a blank Tx Share cell (20% default) at the right position.
+function mtRow([material, brand, price, state]) {
+  return [material, brand, price, '', state];
+}
 
 // ═══════════════════════════ Round trip (both tabs) ═══════════════════════
 
@@ -105,12 +111,18 @@ describe('round-trip: export → preview is unchanged, zero blocked', () => {
   it('Materials: exportMaterialRates → previewMaterialRatesUpload is all unchanged', async () => {
     const xlsxSvc = require('../services/client-xlsx.service');
     const svc = require('../services/rate-card-bulk-upload.service');
+    // tx_share here matches exactly what materialRatesSvc.list() computes
+    // from this describe block's fake-pool fixtures (group price 200, state
+    // price 275, neither carrying its own tx_share — 20% default: 40 / 55)
+    // — in production BOTH the export and the "existing" signature this
+    // preview compares against come from that SAME list() call, so a
+    // realistic fixture has to agree with it or the round-trip proves nothing.
     const items = [{
       material_id: 700, material_name: 'PVC Pipe', pricing_type: 'per_unit',
       groups: [{
-        group_id: 9001, material_id: 700, price: 200, status: 1,
+        group_id: 9001, material_id: 700, price: 200, tx_share: 40, status: 1,
         brands: [],
-        states: [{ state_price_id: 701, price: 275, state_ids: [21, 22] }],
+        states: [{ state_price_id: 701, price: 275, tx_share: 55, state_ids: [21, 22] }],
         master_price_seen: 200, master_price_today: 200, review: { flagged: false },
       }],
     }];
@@ -125,9 +137,9 @@ describe('round-trip: export → preview is unchanged, zero blocked', () => {
     assert.equal(out.materials.length, 1);
     assert.equal(out.materials[0].outcome, 'unchanged');
     assert.deepEqual(out.materials[0].lines, [
-      { brand: 'No Brand', state: 'All States', price: 200 },
-      { brand: 'No Brand', state: 'Maharashtra', price: 275 },
-      { brand: 'No Brand', state: 'Gujarat', price: 275 },
+      { brand: 'No Brand', state: 'All States', price: 200, tx_share: 40 },
+      { brand: 'No Brand', state: 'Maharashtra', price: 275, tx_share: 55 },
+      { brand: 'No Brand', state: 'Gujarat', price: 275, tx_share: 55 },
     ]);
   });
 });
@@ -179,7 +191,7 @@ describe('Materials — blocked-row reasons', () => {
 
   async function preview(rows) {
     const svc = require('../services/rate-card-bulk-upload.service');
-    const buf = aoaBuffer([MATERIALS_HEADER, ...rows]);
+    const buf = aoaBuffer([MATERIALS_HEADER, ...rows.map(mtRow)]);
     return svc.previewMaterialRatesUpload(buf, 1);
   }
 
@@ -273,9 +285,54 @@ describe('Materials — blocked-row reasons', () => {
     // groups Karnataka into ONE {price, state_ids} entry.
     assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
     assert.equal(out.materials[0].lines.length, 2);
+    // Both rows leave Tx Share blank → 20% of that row's own price (100 → 20, 275 → 55).
     assert.deepEqual(out.materials[0].lines, [
-      { brand: 'BrandX', state: 'All States', price: 100 },
-      { brand: 'BrandX', state: 'Karnataka', price: 275 },
+      { brand: 'BrandX', state: 'All States', price: 100, tx_share: 20 },
+      { brand: 'BrandX', state: 'Karnataka', price: 275, tx_share: 55 },
+    ]);
+  });
+
+  // ─── Tx Share column (2026-09-24) ────────────────────────────────────
+  // These build the raw 5-column row directly (Material, Brand, Price,
+  // Tx Share, State) rather than through preview()/mtRow(), since they need
+  // to set an explicit Tx Share value.
+
+  it('an explicit Tx Share is kept, not replaced by the 20% default', async () => {
+    const svc = require('../services/rate-card-bulk-upload.service');
+    const buf = aoaBuffer([MATERIALS_HEADER, ['Material A', '', 100, 42, '']]);
+    const out = await svc.previewMaterialRatesUpload(buf, 1);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.deepEqual(out.materials[0].lines, [{ brand: 'No Brand', state: 'All States', price: 100, tx_share: 42 }]);
+  });
+
+  it('a non-numeric Tx Share → blocked', async () => {
+    const svc = require('../services/rate-card-bulk-upload.service');
+    const buf = aoaBuffer([MATERIALS_HEADER, ['Material A', '', 100, 'abc', '']]);
+    const out = await svc.previewMaterialRatesUpload(buf, 1);
+    assert.equal(out.rows[0].outcome, 'blocked');
+    assert.match(out.rows[0].errors.join(';'), /Tx Share must be a number/);
+  });
+
+  it('a negative Tx Share → blocked', async () => {
+    const svc = require('../services/rate-card-bulk-upload.service');
+    const buf = aoaBuffer([MATERIALS_HEADER, ['Material A', '', 100, -5, '']]);
+    const out = await svc.previewMaterialRatesUpload(buf, 1);
+    assert.equal(out.rows[0].outcome, 'blocked');
+    assert.match(out.rows[0].errors.join(';'), /Tx Share must be >= 0/);
+  });
+
+  it('a base row (blank Tx Share, default 20%) and a state row (explicit Tx Share) both compile correctly into one group', async () => {
+    const svc = require('../services/rate-card-bulk-upload.service');
+    const buf = aoaBuffer([
+      MATERIALS_HEADER,
+      ['Material A', 'BrandX', 100, '', ''],
+      ['Material A', 'BrandX', 275, 88, 'Karnataka'],
+    ]);
+    const out = await svc.previewMaterialRatesUpload(buf, 1);
+    assert.equal(out.summary.blocked, 0, JSON.stringify(out.rows));
+    assert.deepEqual(out.materials[0].lines, [
+      { brand: 'BrandX', state: 'All States', price: 100, tx_share: 20 },
+      { brand: 'BrandX', state: 'Karnataka', price: 275, tx_share: 88 },
     ]);
   });
 });
@@ -328,7 +385,7 @@ describe('Materials — grouping into client price groups', () => {
 
   async function preview(rows) {
     const svc = require('../services/rate-card-bulk-upload.service');
-    const buf = aoaBuffer([MATERIALS_HEADER, ...rows]);
+    const buf = aoaBuffer([MATERIALS_HEADER, ...rows.map(mtRow)]);
     return svc.previewMaterialRatesUpload(buf, 1);
   }
 
@@ -554,10 +611,10 @@ describe('commit re-validates: a material that goes inactive between preview and
 
   it('Material A (processed first) is attempted, Material B 404s, and the whole file rolls back', async () => {
     const svc = require('../services/rate-card-bulk-upload.service');
-    const buf = aoaBuffer([MATERIALS_HEADER,
+    const buf = aoaBuffer([MATERIALS_HEADER, ...[
       ['Material A', '', 100, ''],
       ['Material B', '', 200, ''],
-    ]);
+    ].map(mtRow)]);
     // Preview sees both materials as active/valid — 'new', zero blocked.
     const preview = await svc.previewMaterialRatesUpload(buf, 1);
     assert.equal(preview.summary.blocked, 0);
