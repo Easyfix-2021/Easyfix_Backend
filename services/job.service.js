@@ -5015,10 +5015,39 @@ async function getAttentionSummary({ scope, allowedStages, filters } = {}) {
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────
+/*
+ * The name typed on a booking also becomes the CUSTOMER-MASTER name.
+ *
+ * Decided 2026-09-24 (Priyanka): Book New Call and Confirm & Schedule show the
+ * master name, and whatever the operator leaves in that box is the customer's
+ * name from then on — not just this job's. tbl_job.job_customer_name still
+ * records what was typed FOR THIS JOB (see JOB_CUSTOMER_NAME_EXPR above); this
+ * additionally keeps tbl_customer in step, so Manage Customers, the customer
+ * lookup and every other job that shares this mobile show the corrected name.
+ *
+ * ⚠ The master row is keyed on the MOBILE NUMBER and shared by every job that
+ * number ever booked, so this renames the customer everywhere. Blank names are
+ * ignored, and a name that only differs by case or spacing writes nothing.
+ */
+async function syncCustomerName(conn, existingRow, typedName, actor) {
+  const next = String(typedName ?? '').trim();
+  if (!next) return;
+  const current = String(existingRow?.customer_name ?? '').trim();
+  if (current.toLowerCase() === next.toLowerCase() && current === next) return;
+  // customer_name / update_date / updated_by — all three on the verified column
+  // list in scripts/schema-verify.js, so the rename carries who did it.
+  await conn.query(
+    'UPDATE tbl_customer SET customer_name = ?, update_date = ?, updated_by = ? WHERE customer_id = ?',
+    [next, new Date(), actor?.user_id || null, existingRow.customer_id]
+  );
+  logger.info('Customer master name updated from a booking · customerId=' + existingRow.customer_id
+    + ' · "' + current + '" -> "' + next + '"');
+}
+
 async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_no, customer_email }, actor) {
   if (customer_id) {
     const [[found]] = await conn.query(
-      'SELECT customer_id FROM tbl_customer WHERE customer_id = ? LIMIT 1',
+      'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_id = ? LIMIT 1',
       [customer_id]
     );
     if (!found) {
@@ -5026,14 +5055,18 @@ async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_n
       err.status = 400;
       throw err;
     }
+    await syncCustomerName(conn, found, customer_name, actor);
     return customer_id;
   }
   // Lookup by mobile — reuse existing
   const [[existing]] = await conn.query(
-    'SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
+    'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
     [customer_mob_no]
   );
-  if (existing) return existing.customer_id;
+  if (existing) {
+    await syncCustomerName(conn, existing, customer_name, actor);
+    return existing.customer_id;
+  }
 
   const [ins] = await conn.query(
     `INSERT INTO tbl_customer (customer_name, customer_mob_no, customer_email, is_active, created_by, insert_date, update_date)
@@ -6026,6 +6059,21 @@ async function update(jobId, input, actor) {
      * key and treated as immutable here (callers must use the dedicated
      * customer swap flow if they truly need a different number).
      */
+    /*
+     * Confirm & Schedule shows the customer's name and saves it to
+     * tbl_job.job_customer_name. Since 2026-09-24 the master follows it too, so
+     * a correction made on a booking is the customer's name everywhere — see
+     * syncCustomerName. Only when no explicit customer.customer_name came with
+     * the request; that block below owns the field when it does.
+     */
+    if (!hasCustomerEdit && existing.fk_customer_id && input.job_customer_name !== undefined) {
+      const [[custRow]] = await conn.query(
+        'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_id = ? LIMIT 1',
+        [existing.fk_customer_id]
+      );
+      if (custRow) await syncCustomerName(conn, custRow, input.job_customer_name, actor);
+    }
+
     if (hasCustomerEdit && existing.fk_customer_id) {
       const custSets = [];
       const custVals = [];
@@ -8901,6 +8949,9 @@ async function notifyCustomerNotReachable(jobId) {
 }
 
 module.exports = {
+  // Exported for tests: the rule is three lines of guard, and driving it
+  // through create()/update() would stub half the job schema to see them.
+  syncCustomerName,
   // preferred_slot column probe — shared by the customer reschedule writer and
   // the admin request readers (routes/public/job-completion.js, routes/admin/).
   customerRequestSlotColumnExists,
