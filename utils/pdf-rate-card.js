@@ -30,10 +30,13 @@ function money(n) {
  * Same grammar the pre-redesign exportMaterialRates wrote to the "State
  * Overrides" XLSX column ("Maharashtra, Gujarat: ₹275.00; Delhi: ₹260.00") —
  * kept here purely as a human-readable PDF cell, not as anything re-parsed.
+ *
+ * Tx Share (2026-09-24): the letterhead shows ONE rate per row — price +
+ * tx_share combined — never the split, same as the base-price column below.
  */
 function formatStateOverrides(states, stateNameById) {
   return (states || [])
-    .map((s) => `${(s.state_ids || []).map((id) => stateNameById.get(id) || `#${id}`).join(', ')}: ${money(s.price)}`)
+    .map((s) => `${(s.state_ids || []).map((id) => stateNameById.get(id) || `#${id}`).join(', ')}: ${money(Number(s.price) + Number(s.tx_share || 0))}`)
     .join('; ');
 }
 
@@ -83,13 +86,15 @@ function renderRateCardPdf({ client, brandLine, services = [], materialItems = [
   // One row per client price GROUP — same unit exportMaterialRates used to
   // write per row before the Material/Brand/Price/State redesign; here it's
   // display-only, so the compact "one group, one line" view still reads best.
+  // Tx Share (2026-09-24): price + tx_share combined into ONE "Price (₹)"
+  // figure — the client is never shown the split.
   const materialRows = [];
   for (const item of materialItems) {
     for (const g of item.groups || []) {
       materialRows.push({
         material: item.material_name || `Material #${item.material_id}`,
         brands: (g.brands || []).length === 0 ? 'No Brand' : g.brands.map((b) => b.brand_name).join(', '),
-        price: money(g.price),
+        price: money(Number(g.price) + Number(g.tx_share || 0)),
         statePrices: formatStateOverrides(g.states, stateNameById),
       });
     }

@@ -231,10 +231,12 @@ test('getJobMaterials 404s when the job is not this technician\'s', async () => 
 // ─── 2. POST /:id/quotation: technician amount → unit_price,
 //        resolved rate-card price → client_charge (snapshot) ─────────────
 //
-// Bound params for every INSERT INTO quotation_details below (tx_charge/
-// margin/status are literal 0/0/1 in the SQL, not bound):
+// Bound params for every INSERT INTO quotation_details below (margin/status
+// are literal 0/1 in the SQL, not bound). tx_charge (2026-09-24, the Tx Share
+// snapshot) is appended LAST in the column list rather than in its native
+// table position, so it lands at index 10 without moving any index below:
 //   type, name, unit, unit_price, client_charge, easyfxer_id, sent_on,
-//   job_id, client_service_id, material_id.
+//   job_id, client_service_id, material_id, tx_charge.
 
 test('addQuotationLine: unit_price = technician amount, client_charge = resolved rate-card price (positive control, different values)', async () => {
   MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
@@ -281,6 +283,27 @@ test('addQuotationLine: amount present with source "none" stores the amount as u
   const ins = QUOTATIONS[out.lineId];
   assert.equal(ins.params[3], 77, 'with no resolvable price, the technician amount is the only source for unit_price');
   assert.equal(ins.params[4], null, 'client_charge must be NULL — distinguishable from a real ₹0 rate-card price — when the resolver has no price at all');
+  assert.equal(ins.params[10], 15.4, 'no resolver tx_share → 20% of the BILLED unit_price (77 x 0.2), never of a null client_charge');
+});
+
+// ─── Tx Share (2026-09-24) — the resolver's per-unit tx_charge snapshot ───
+
+test('addQuotationLine: tx_charge is the resolver\'s tx_share (master_group hit → 20% of price, computed, no client override)', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 });
+  const out = await estimateService.addQuotationLine(200, 42, {
+    type: 'material', materialId: 10, quantity: 1, amount: 550,
+  });
+  const ins = QUOTATIONS[out.lineId];
+  assert.equal(ins.params[10], 100, 'master hit has no tx_share column — always 20% of the master price (500 x 0.2)');
+});
+
+test('addQuotationLine: tx_charge uses the client group\'s own stored tx_share when set', async () => {
+  CLIENT_GROUP_NOBRAND.set('5:10', { group_id: 60, price: 500, tx_share: 65 });
+  const out = await estimateService.addQuotationLine(200, 42, {
+    type: 'material', materialId: 10, quantity: 1, amount: 500,
+  });
+  const ins = QUOTATIONS[out.lineId];
+  assert.equal(ins.params[10], 65, 'a client group with its own tx_share must win over the 20% default');
 });
 
 test('addQuotationLine: neither a positive amount nor a resolvable price → 422, no row written', async () => {
@@ -381,4 +404,29 @@ test('addQuotationLine rounds a fractional rate-card fallback rather than trunca
   const [, , , unitPrice, clientCharge] = QUOTATIONS[out.lineId].params;
   assert.equal(unitPrice, 181, 'the INT unit_price gets the rounded rate, not a truncated 180');
   assert.equal(clientCharge, 180.5, 'client_charge is FLOAT and keeps the exact rate');
+});
+
+// ─── 5. Mobile payload guard (2026-09-24) — Tx Share must never reach the
+//        technician. The resolver now returns tx_share on every hit
+//        (services/material-price-resolver.js); these prove neither
+//        technician-facing function this file drives ever forwards it.
+//        Positive control: both fixtures below give a NON-ZERO tx_share
+//        (20 for the client override, 100 for the plain master hit) so a
+//        vacuous "field absent because nothing resolved" pass is ruled out.
+
+test('GET /:id/materials never leaks tx_share to the technician', async () => {
+  MASTER_GROUP_NOBRAND.set('2', { group_id: 20, price: 500 }); // computed tx_share = 100
+  CLIENT_GROUP_NOBRAND.set('5:1', { group_id: 10, price: 100, tx_share: 20 }); // explicit tx_share
+  const out = await estimateService.getJobMaterials(100, 42, {});
+  assert.ok(out.items.some((i) => i.material_id === 1 && i.price === 100), 'fixture must actually resolve — else this test proves nothing');
+  assert.doesNotMatch(JSON.stringify(out), /tx_?share/i, 'the technician-facing materials picker must never carry tx_share');
+});
+
+test('POST /:id/quotation response never leaks tx_share', async () => {
+  MASTER_GROUP_NOBRAND.set('10', { group_id: 50, price: 500 }); // computed tx_share = 100
+  const out = await estimateService.addQuotationLine(200, 42, {
+    type: 'material', materialId: 10, quantity: 1, amount: 550,
+  });
+  assert.ok(out.lineId, 'fixture must actually insert a row — else this test proves nothing');
+  assert.doesNotMatch(JSON.stringify(out), /tx_?share/i);
 });

@@ -140,6 +140,10 @@ let conferencesById = {};
 let participants = [];
 let creatingRows = [];
 let stuckLegRows = [];
+// startRecordingOnAnswer: rows the claim UPDATE "wins" (0 = already claimed /
+// not flagged to record) and the operator leg it then reads.
+let recClaimRows = 1;
+let opLeg = null;
 
 /* ──────────────────────────────── fake DB ──────────────────────────────── */
 
@@ -222,6 +226,11 @@ const fake = installFakePool([
 
   [/SELECT COUNT\(\*\) AS n FROM tbl_job_conference/i, () => [{ n: 0 }]],
 
+  // ── startRecordingOnAnswer: the once-per-room claim and the operator leg.
+  [/SET recording_id = \?, updated_on = \?\s+WHERE conference_id = \? AND participant_role = 'operator' AND recording_requested = 1/i,
+    () => ({ affectedRows: recClaimRows })],
+  [/SELECT call_uuid, job_caller_info_id FROM tbl_plivo_call_log/i, () => (opLeg ? [opLeg] : [])],
+
   [/^\s*UPDATE /i, () => ({ affectedRows: 1 })],
 ]);
 
@@ -292,6 +301,8 @@ beforeEach(() => {
   participants = [participant()];
   creatingRows = [];
   stuckLegRows = [];
+  recClaimRows = 1;
+  opLeg = { call_uuid: 'op-leg-uuid', job_caller_info_id: 5001 };
 });
 
 /* ────────────────────────────── helpers ────────────────────────────────── */
@@ -307,7 +318,14 @@ async function postForm(fields, t = token()) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
-const writes = () => fake.calls.filter((c) => /^\s*(UPDATE|INSERT|DELETE)\s/i.test(c.sql));
+// Recording bookkeeping (startRecordingOnAnswer's claim/finish) is excluded:
+// the leg-status assertions below are about the leg, and section 1b owns these.
+const isRecWrite = (c) => /SET recording_id = \?/i.test(c.sql);
+const writes = () => fake.calls.filter((c) => /^\s*(UPDATE|INSERT|DELETE)\s/i.test(c.sql) && !isRecWrite(c));
+const recWrites = () => fake.calls.filter(isRecWrite);
+// startRecordingOnAnswer runs off the response path — let it finish.
+const settle = () => new Promise((r) => setTimeout(r, 25));
+const recordCalls = () => wire.filter((w) => /\/Call\/[^/]+\/Record\/$/.test(w.url));
 const writesMatching = (re) => writes().filter((c) => re.test(c.sql));
 
 /* ══════════════════════ 1. THE WEBHOOK — happy path ═════════════════════ */
@@ -382,6 +400,65 @@ test('a ringing event moves initiated → ringing ONLY', async () => {
   // after the answer callback cannot pull a live leg backwards.
   assert.match(upd.sql, /WHERE id = \? AND status IN \(\?\)/i);
   assert.ok(upd.params.includes('initiated'), "the guarded FROM status, in the call log's vocabulary");
+});
+
+/* ═════════ 1b. RECORDING STARTS WHEN THE RECEIVER ANSWERS ════════════════ */
+
+test('the customer joining starts ONE stereo recording on the operator leg', async () => {
+  plivoHandler = (u) => (/\/Record\/$/.test(u)
+    ? { status: 202, body: JSON.stringify({ api_id: 'a1', recording_id: 'rec-123', url: 'https://x/rec-123.mp3' }) }
+    : { status: 200, body: '{}' });
+  await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 });
+  await settle();
+
+  const rec = recordCalls();
+  assert.equal(rec.length, 1, 'exactly one Record API call');
+  assert.match(rec[0].url, /\/Account\/MATEST0000000000TEST\/Call\/op-leg-uuid\/Record\/$/,
+    "on the OPERATOR's leg — the leg <Record recordSession> used to run on");
+  assert.equal(rec[0].method, 'POST');
+  // The API defaults to MONO; Call Analytics needs ch0 agent / ch1 customer.
+  assert.equal(rec[0].body.record_channel_type, 'stereo');
+  assert.equal(rec[0].body.file_format, 'mp3');
+  assert.ok(rec[0].body.time_limit > 60, 'the 60 s default cap is lifted');
+  assert.match(rec[0].body.callback_url, /\/api\/public\/plivo\/recording-callback\?t=/,
+    'the SAME jci-signed callback the bridge recording uses');
+  const t = decodeURIComponent(rec[0].body.callback_url.split('t=')[1]);
+  const plivo = require('../services/plivo.service');
+  assert.equal(plivo.verifyRecordingToken(t).jci, 5001, "signed for the operator leg's jci");
+
+  const [claim, finish] = recWrites();
+  assert.match(claim.sql, /recording_requested = 1/, 'only calls the answer route flagged to record');
+  assert.match(claim.sql, /recording_id IS NULL AND recording_url IS NULL/, 'the once-per-room guard');
+  assert.ok(claim.params.includes(CONF_ID));
+  assert.ok(finish.params.includes('rec-123'), 'the claim placeholder is replaced by the real id');
+});
+
+test('the OPERATOR joining starts nothing — ringback is not recorded', async () => {
+  participants = [participant({ target_kind: 'operator' })];
+  await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 });
+  await settle();
+  assert.equal(recWrites().length, 0);
+  assert.equal(recordCalls().length, 0);
+});
+
+test('a lost claim (duplicate join, later technician, not flagged) records nothing again', async () => {
+  recClaimRows = 0;
+  await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 });
+  await settle();
+  assert.equal(recWrites().length, 1, 'the claim is tried');
+  assert.equal(recordCalls().length, 0, 'and losing it means no second recording');
+});
+
+test('a Record API failure releases the claim so a later join can retry — and the webhook still 200s', async () => {
+  plivoHandler = (u) => (/\/Record\/$/.test(u) ? { status: 500, body: '{"error":"boom"}' } : { status: 200, body: '{}' });
+  const res = await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 });
+  await settle();
+  assert.equal(res.status, 200);
+  assert.equal(res.body.handled, true);
+  const [, release] = recWrites();
+  assert.ok(release, 'the claim is released');
+  assert.equal(release.params[0], null, 'back to NULL');
+  assert.match(release.sql, /AND recording_id = \?/, 'only OUR placeholder is released');
 });
 
 /* ═════════ 2. THE WEBHOOK — the events that end things ══════════════════ */

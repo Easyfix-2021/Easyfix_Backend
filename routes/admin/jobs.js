@@ -3424,6 +3424,12 @@ const materialLineBody = require('joi').object({
   line_id: require('joi').number().integer().positive().required(),
   decision: require('joi').string().valid('approve', 'reject').required(),
   approved_amount: require('joi').number().optional(),
+  // quoted_unit_price (2026-09-24): optional, approve-only — updates
+  // quotation_details.unit_price (a legacy INT column) in the same
+  // transaction, before approval. Left as a bare number here (not
+  // .integer()) so a fractional value 422s from validateMaterialLineContent
+  // below with the design's own message, rather than a generic 400.
+  quoted_unit_price: require('joi').number().min(0).optional(),
 });
 
 const materialReviewBody = require('joi').object({
@@ -3479,6 +3485,16 @@ function validateMaterialLineContent(lines) {
       }
       if (Number(line.approved_amount) < 0) {
         return `approved_amount must be >= 0 for line ${lid}`;
+      }
+      // quoted_unit_price (2026-09-24) — optional, updates the legacy INT
+      // unit_price column: a fractional value would be TRUNCATED by MySQL
+      // with no error, so it 422s here instead, same rule
+      // mobile-job-estimate.service.js already enforces on the technician's
+      // own quote.
+      if (line.quoted_unit_price !== undefined && line.quoted_unit_price !== null) {
+        if (!Number.isInteger(Number(line.quoted_unit_price))) {
+          return `quoted_unit_price must be a whole number for line ${lid}`;
+        }
       }
     } else if (line.approved_amount !== undefined) {
       return `approved_amount is forbidden on rejected line ${lid}`;
@@ -3543,6 +3559,15 @@ router.post(
           const now = new Date();
           for (const line of lines) {
             if (line.decision === 'approve') {
+              // quoted_unit_price (2026-09-24) updates unit_price in the SAME
+              // transaction, BEFORE the approval columns below — content
+              // validation above already 422'd a fractional value.
+              if (line.quoted_unit_price !== undefined && line.quoted_unit_price !== null) {
+                await conn.query(
+                  `UPDATE quotation_details SET unit_price = ? WHERE id = ? AND job_id = ?`,
+                  [Math.round(Number(line.quoted_unit_price)), line.line_id, jobId],
+                );
+              }
               await conn.query(
                 `UPDATE quotation_details
                     SET approved_charge = ?, status = 1, action_by = ?, action_on = ?
@@ -3739,7 +3764,7 @@ router.post(
           WHERE j.job_id = ? LIMIT 1`,
         [jobId],
       );
-      const { resolveMaterialPrice } = require('../../services/material-price-resolver');
+      const { resolveMaterialPrice, defaultTxShare } = require('../../services/material-price-resolver');
       const resolvedPrice = await resolveMaterialPrice({
         clientId: req.scopedJob.fk_client_id, materialId: req.body.materialId,
         brandId: req.body.brandId || null, stateId: addr ? addr.state_id : null,
@@ -3748,6 +3773,11 @@ router.post(
 
       const approvedAmount = Number(req.body.approvedAmount);
       const unitPrice = Math.round(approvedAmount);
+      // Tx Share (2026-09-24) snapshot for this unit — the resolver's own
+      // figure, falling back to 20% of the BILLED unit_price when the
+      // resolver had no price at all ('none').
+      const txShare = (resolvedPrice.tx_share !== null && resolvedPrice.tx_share !== undefined)
+        ? Number(resolvedPrice.tx_share) : defaultTxShare(unitPrice);
       const now = new Date();
       const entersEstimatePending = CRM_ADD_LINE_ENTRY_STATUSES.has(jobStatus);
 
@@ -3755,17 +3785,21 @@ router.post(
       let lineId;
       try {
         await conn.beginTransaction();
+        // tx_charge appended LAST in the column list (not its native table
+        // position) so every existing positional param index above is
+        // unchanged — see tests/material-request-flow-v2-admin.test.js's
+        // INSERT INTO quotation_details destructuring.
         const [ins] = await conn.query(
           `INSERT INTO quotation_details
-             (type, name, unit, unit_price, tx_charge, client_charge, approved_charge, margin,
+             (type, name, unit, unit_price, client_charge, approved_charge, margin,
               status, action_by, sent_by, sent_on, action_on,
-              job_id, material_id)
-           VALUES ('material', ?, ?, ?, 0, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?)`,
+              job_id, material_id, tx_charge)
+           VALUES ('material', ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?, ?)`,
           [
             material.material_name, req.body.quantity, unitPrice,
             clientCharge, approvedAmount,
             req.user.user_id, req.user.user_id, now, now,
-            jobId, req.body.materialId,
+            jobId, req.body.materialId, txShare,
           ],
         );
         lineId = ins.insertId;

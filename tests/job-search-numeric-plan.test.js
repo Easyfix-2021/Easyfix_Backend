@@ -378,3 +378,29 @@ test('an empty / absent term emits no search clause at all', async () => {
     assert.deepEqual(count.params, [5]);
   }
 });
+
+/* ── customerQ (the "Customer Name / No." filter) — same mobile set lookup ── */
+
+test('customerQ: a phone-shaped term takes the uncorrelated prefix set lookup, not the %t% join', async () => {
+  const { count, data } = await listWith({ customerQ: '98 4530 2806', status: 5 });
+  const clause = qClauseOf(topLevelWhere(), 1);
+  assert.match(clause, /^j\.fk_customer_id IN \(SELECT qmob\.customer_id FROM tbl_customer qmob WHERE qmob\.customer_mob_no LIKE \?\)$/);
+  assert.deepEqual(count.params, [5, '9845302806%'], 'spaces stripped, prefix-anchored, one binding');
+  assert.doesNotMatch(count.sql, /\bcu\./, 'COUNT no longer joins tbl_customer');
+  assert.equal(data.sql.slice(data.sql.lastIndexOf('WHERE')).includes('9845302806'), false, 'bound, not interpolated');
+});
+
+test('customerQ PARITY: 530280-shaped mid-number hits cannot match; a prefix does', async () => {
+  await listWith({ customerQ: '5302801234', status: 5 });
+  const { params } = countQuery();
+  const matched = evaluate(`(${qClauseOf(topLevelWhere(), 1)})`, params.slice(1), FIXTURE);
+  assert.deepEqual([...matched], [411003]);
+});
+
+test('customerQ: names and short digit fragments keep the original two-binding name/mobile search', async () => {
+  for (const customerQ of ['Bharathi', '8891', 'kachari#171']) {
+    const { count } = await listWith({ customerQ, status: 5 });
+    assert.match(topLevelWhere(), /LIKE \? OR cu\.customer_mob_no LIKE \?\)$/);
+    assert.deepEqual(count.params, [5, `%${customerQ}%`, `%${customerQ}%`]);
+  }
+});

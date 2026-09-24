@@ -76,39 +76,52 @@ test('resolver: client_state wins when the client has a state price for the bran
   scenario.clientGroupBranded = { group_id: 1, price: 100 };
   scenario.clientStatePrice = { price: 150 };
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: 150, source: 'client_state', groupId: 1 });
+  assert.deepEqual(out, { price: 150, source: 'client_state', groupId: 1, tx_share: 30 });
+});
+
+test('resolver: client_state uses its OWN stored tx_share when set, not the 20% default', async () => {
+  scenario.clientGroupBranded = { group_id: 1, price: 100 };
+  scenario.clientStatePrice = { price: 150, tx_share: 42 };
+  const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
+  assert.deepEqual(out, { price: 150, source: 'client_state', groupId: 1, tx_share: 42 });
 });
 
 test('resolver: client_group wins when the client has a brand price but no matching state price', async () => {
   scenario.clientGroupBranded = { group_id: 1, price: 100 };
   scenario.clientStatePrice = null;
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1 });
+  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1, tx_share: 20 });
+});
+
+test('resolver: client_group uses its OWN stored tx_share when set, not the 20% default', async () => {
+  scenario.clientGroupBranded = { group_id: 1, price: 100, tx_share: 33 };
+  const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
+  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1, tx_share: 33 });
 });
 
 test('resolver: master_state wins when there is no client override but the master has a state price', async () => {
   scenario.masterGroupBranded = { group_id: 9, price: 80 };
   scenario.masterStatePrice = { price: 95 };
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: 95, source: 'master_state', groupId: 9 });
+  assert.deepEqual(out, { price: 95, source: 'master_state', groupId: 9, tx_share: 19 });
 });
 
 test('resolver: master_group wins when there is no client override and no master state price', async () => {
   scenario.masterGroupBranded = { group_id: 9, price: 80 };
   scenario.masterStatePrice = null;
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: 80, source: 'master_group', groupId: 9 });
+  assert.deepEqual(out, { price: 80, source: 'master_group', groupId: 9, tx_share: 16 });
 });
 
 test('resolver: none when nothing prices the material anywhere (phase-1 Price Pending)', async () => {
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: null, source: 'none', groupId: null });
+  assert.deepEqual(out, { price: null, source: 'none', groupId: null, tx_share: null });
 });
 
 test('resolver: none when the master group exists but its price is NULL (Price Pending) and no state override', async () => {
   scenario.masterGroupBranded = { group_id: 9, price: null };
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: null, source: 'none', groupId: null });
+  assert.deepEqual(out, { price: null, source: 'none', groupId: null, tx_share: null });
 });
 
 // ─── Rule: a missing stateId skips steps 1 and 3 ──────────────────────────
@@ -117,7 +130,7 @@ test('resolver rule: missing stateId skips the client_state lookup entirely', as
   scenario.clientGroupBranded = { group_id: 1, price: 100 };
   scenario.clientStatePrice = { price: 999 }; // would win if the rule were violated
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3 }); // no stateId
-  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1 });
+  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1, tx_share: 20 });
   assert.ok(!fake.calls.some((c) => /FROM tbl_client_material_state_price sp/i.test(c.sql)),
     'no stateId means the client-state query must never run');
 });
@@ -126,7 +139,7 @@ test('resolver rule: missing stateId skips the master_state lookup entirely', as
   scenario.masterGroupBranded = { group_id: 9, price: 80 };
   scenario.masterStatePrice = { price: 999 }; // would win if the rule were violated
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3 }); // no stateId
-  assert.deepEqual(out, { price: 80, source: 'master_group', groupId: 9 });
+  assert.deepEqual(out, { price: 80, source: 'master_group', groupId: 9, tx_share: 16 });
   assert.ok(!fake.calls.some((c) => /FROM tbl_material_state_price sp/i.test(c.sql)),
     'no stateId means the master-state query must never run');
 });
@@ -139,7 +152,7 @@ test('resolver rule: a client group with no price for this state never falls thr
   scenario.masterGroupBranded = { group_id: 9, price: 80 };
   scenario.masterStatePrice = { price: 55 }; // must be ignored — client_group wins first
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2, brandId: 3, stateId: 4 });
-  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1 });
+  assert.deepEqual(out, { price: 100, source: 'client_group', groupId: 1, tx_share: 20 });
   assert.ok(!fake.calls.some((c) => /FROM tbl_material_price_group_brand gb/i.test(c.sql)),
     'once a client group is found, master tables must never be queried');
   assert.ok(!fake.calls.some((c) => /FROM tbl_material_state_price sp/i.test(c.sql)),
@@ -151,13 +164,13 @@ test('resolver rule: a client group with no price for this state never falls thr
 test('resolver rule: missing brandId resolves against the client\'s sole No Brand group', async () => {
   scenario.clientGroupNoBrand = { group_id: 5, price: 60 };
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2 }); // no brandId
-  assert.deepEqual(out, { price: 60, source: 'client_group', groupId: 5 });
+  assert.deepEqual(out, { price: 60, source: 'client_group', groupId: 5, tx_share: 12 });
 });
 
 test('resolver rule: missing brandId falls to the master\'s sole No Brand group with no client override', async () => {
   scenario.masterGroupNoBrand = { group_id: 11, price: 40 };
   const out = await resolveMaterialPrice({ clientId: 1, materialId: 2 }); // no brandId
-  assert.deepEqual(out, { price: 40, source: 'master_group', groupId: 11 });
+  assert.deepEqual(out, { price: 40, source: 'master_group', groupId: 11, tx_share: 8 });
 });
 
 // ─── 2. Validation guards (services/client-material-rates.service.js) ────
@@ -204,6 +217,43 @@ test('validation: distinct branded groups with valid prices are legal', () => {
     { price: 100, brand_ids: [5] },
     { price: 200, brand_ids: [8], states: [{ price: 210, state_ids: [12] }] },
   ]));
+});
+
+// ─── 2b. Tx Share validation (2026-09-24) ─────────────────────────────
+// Exercised directly against the service — the ROUTE'S own Joi schema
+// (routes/admin/clients.js's txShareField: min(0) + precision(2), which
+// ROUNDS rather than rejects extra decimals) already blocks a negative
+// value before this guard would ever see it; this is what protects a
+// caller that skips Joi entirely — the bulk-upload service, which compiles
+// groups programmatically from parsed Excel rows.
+
+test('validation: a negative tx_share on a group → 422', () => {
+  assert.throws(
+    () => ratesSvc.validateClientGroupsPayload([{ price: 100, brand_ids: [5], tx_share: -1 }]),
+    (e) => { assert.equal(e.status, 422); return true; },
+  );
+});
+
+test('validation: a tx_share with more than 2 decimal places on a group → 422', () => {
+  assert.throws(
+    () => ratesSvc.validateClientGroupsPayload([{ price: 100, brand_ids: [5], tx_share: 12.345 }]),
+    (e) => { assert.equal(e.status, 422); return true; },
+  );
+});
+
+test('validation: a negative tx_share on a state override → 422', () => {
+  assert.throws(
+    () => ratesSvc.validateClientGroupsPayload([
+      { price: 100, brand_ids: [5], states: [{ price: 110, state_ids: [12], tx_share: -1 }] },
+    ]),
+    (e) => { assert.equal(e.status, 422); return true; },
+  );
+});
+
+test('validation: an omitted or valid tx_share is legal', () => {
+  assert.doesNotThrow(() => ratesSvc.validateClientGroupsPayload([{ price: 100, brand_ids: [5] }]));
+  assert.doesNotThrow(() => ratesSvc.validateClientGroupsPayload([{ price: 100, brand_ids: [5], tx_share: 0 }]));
+  assert.doesNotThrow(() => ratesSvc.validateClientGroupsPayload([{ price: 100, brand_ids: [5], tx_share: 33.5 }]));
 });
 
 // ─── 3. Review flag ────────────────────────────────────────────────────
@@ -366,7 +416,7 @@ describe('GET /:clientId/material-rates/download', () => {
     if (downloadServer) await new Promise((resolve) => downloadServer.close(resolve));
   });
 
-  it('streams a flat Material|Brand|Price|State xlsx, one row per (material, brand, state)', async () => {
+  it('streams a flat Material|Brand|Price|Tx Share|State xlsx, one row per (material, brand, state)', async () => {
     scopeForDownloadTest = allowClients(CLIENT_ID);
     const res = await fetch(`${downloadBaseUrl}/clients/${CLIENT_ID}/material-rates/download`);
     assert.equal(res.status, 200);
@@ -381,11 +431,13 @@ describe('GET /:clientId/material-rates/download', () => {
     assert.equal(ws.rowCount, 4, 'header row + base row + one row per overridden state');
 
     const header = ws.getRow(1).values.slice(1);
-    assert.deepEqual(header, ['Material', 'Brand', 'Price', 'State']);
+    assert.deepEqual(header, ['Material', 'Brand', 'Price', 'Tx Share', 'State']);
 
-    assert.deepEqual(ws.getRow(2).values.slice(1), ['PVC Pipe', '', 200, '']);
-    assert.deepEqual(ws.getRow(3).values.slice(1), ['PVC Pipe', '', 275, 'Maharashtra']);
-    assert.deepEqual(ws.getRow(4).values.slice(1), ['PVC Pipe', '', 275, 'Gujarat']);
+    // Neither fixture row sets tx_share — list() computes 20% of price
+    // (2026-09-24 default): 200 x 0.2 = 40, 275 x 0.2 = 55.
+    assert.deepEqual(ws.getRow(2).values.slice(1), ['PVC Pipe', '', 200, 40, '']);
+    assert.deepEqual(ws.getRow(3).values.slice(1), ['PVC Pipe', '', 275, 55, 'Maharashtra']);
+    assert.deepEqual(ws.getRow(4).values.slice(1), ['PVC Pipe', '', 275, 55, 'Gujarat']);
   });
 
   it('refuses a client outside the caller\'s scope, same as the list route', async () => {
@@ -415,7 +467,7 @@ describe('POST /:clientId/material-rates/batch', () => {
     clients: { mode: 'allow', ids }, cities: { mode: 'all', ids: [] },
     states: { mode: 'all', ids: [] }, verticals: { mode: 'all', ids: [] },
   });
-  const groupsPayload = (price) => [{ price, brand_ids: [], states: [] }];
+  const groupsPayload = (price, extra = {}) => [{ price, brand_ids: [], states: [], ...extra }];
 
   let batchFake;
   let batchServer;
@@ -424,6 +476,7 @@ describe('POST /:clientId/material-rates/batch', () => {
   let committed;
   let rolledBack;
   let materialStatusById; // material_id -> 1 (active) | 0 (inactive) | undefined (missing)
+  let insertedGroups; // captured params of every INSERT INTO tbl_client_material_price_group
 
   before(async () => {
     materialStatusById = new Map([[301, 1], [302, 1]]);
@@ -441,7 +494,10 @@ describe('POST /:clientId/material-rates/batch', () => {
       [/FROM tbl_state\b/i, () => []],
       // resolveMasterPriceForBrandSet — No Brand branch (brandIds is empty).
       [/FROM tbl_material_price_group g\b/i, () => []],
-      [/^\s*INSERT INTO tbl_client_material_price_group\b/i, () => ({ insertId: 9001 })],
+      [/^\s*INSERT INTO tbl_client_material_price_group\b/i, (sql, params) => {
+        insertedGroups.push(params); // [client_id, material_id, price, tx_share, master_price_seen, ...]
+        return { insertId: 9001 };
+      }],
     ]);
 
     const db = require('../db');
@@ -479,6 +535,7 @@ describe('POST /:clientId/material-rates/batch', () => {
     batchFake.reset();
     committed = false;
     rolledBack = false;
+    insertedGroups = [];
     materialStatusById.set(301, 1);
     materialStatusById.set(302, 1);
     scopeForBatchTest = allowClients(CLIENT_ID);
@@ -533,6 +590,21 @@ describe('POST /:clientId/material-rates/batch', () => {
     assert.equal(rolledBack, false, 'refused before a connection was ever opened');
   });
 
+  // ─── Tx Share (2026-09-24) ────────────────────────────────────────────
+
+  it('replace(): tx_share defaults to 20% of price when omitted', async () => {
+    const res = await postBatch([{ material_id: 301, groups: groupsPayload(250) }]);
+    assert.equal(res.status, 200, JSON.stringify(await res.json()));
+    assert.equal(insertedGroups.length, 1);
+    assert.equal(insertedGroups[0][3], 50, 'tx_share must be 20% of price (250 x 0.2), rounded to 2dp');
+  });
+
+  it('replace(): an explicit tx_share is kept as given, not overwritten by the 20% default', async () => {
+    const res = await postBatch([{ material_id: 301, groups: groupsPayload(250, { tx_share: 37.5 }) }]);
+    assert.equal(res.status, 200, JSON.stringify(await res.json()));
+    assert.equal(insertedGroups[0][3], 37.5);
+  });
+
   it('refuses a client outside the caller\'s scope, same as the other material-rates routes', async () => {
     scopeForBatchTest = allowClients(999); // NOT this client
     const res = await postBatch([{ material_id: 301, groups: groupsPayload(100) }]);
@@ -545,5 +617,93 @@ describe('POST /:clientId/material-rates/batch', () => {
     const block = routeBlock("'/:clientId/material-rates/batch'");
     assert.match(block, /requireClientEdit/, 'batch route must require isClientEdit');
     assert.match(block, /loadAndGuardClient\(/, 'batch route must run the client scope-guard');
+  });
+});
+
+// ─── 8. GET /:clientId/material-rates/master-rows (2026-09-24) ────────────
+// Master-catalog rows for the CRM's Add-Material picker — one item per
+// active material x active brand; a No-Brand group (or a group whose
+// brands are all now inactive) never gets fabricated a phantom brand.
+describe('GET /:clientId/material-rates/master-rows', () => {
+  const CLIENT_ID = 44;
+  const ZONAL_ROLE = { role_id: 12, role_name: 'Zonal Field Team', role_status: 1, menu_ids: '' };
+  const allowClients = (...ids) => ({
+    clients: { mode: 'allow', ids }, cities: { mode: 'all', ids: [] },
+    states: { mode: 'all', ids: [] }, verticals: { mode: 'all', ids: [] },
+  });
+
+  let masterRowsFake;
+  let masterRowsServer;
+  let masterRowsBaseUrl;
+  let scopeForMasterRowsTest;
+
+  before(async () => {
+    masterRowsFake = installFakePool([
+      [/FROM tbl_client\b/i, () => [{ client_id: CLIENT_ID, client_name: 'Acme', vertical_id: 3 }]],
+      [/FROM tbl_material_price_group g\s+JOIN tbl_material_master m/i, () => [
+        { group_id: 1, material_id: 10, price: 100, material_name: 'Adapter 5A' },   // branded, one active + one inactive brand
+        { group_id: 2, material_id: 11, price: 50,  material_name: 'Cement Bag' },   // true No Brand
+        { group_id: 3, material_id: 12, price: 75,  material_name: 'Discontinued Fitting' }, // all its brands are inactive
+      ]],
+      [/FROM tbl_material_price_group_brand gb\s+JOIN tbl_brand_master bm/i, () => [
+        { group_id: 1, brand_id: 100, brand_name: 'Philips', brand_status: 1 },
+        { group_id: 1, brand_id: 101, brand_name: 'RetiredBrand', brand_status: 0 },
+        { group_id: 3, brand_id: 102, brand_name: 'AlsoRetired', brand_status: 0 },
+      ]],
+      [/FROM tbl_material_state_price sp\s+JOIN tbl_material_state_price_state/i, () => []],
+    ]);
+
+    const express = require('express');
+    const clientsRouter = require('../routes/admin/clients');
+    const app = express();
+    app.use((req, _res, next) => {
+      req.user = { user_id: 1, user_name: 'Tester' };
+      req.userRole = { ...ZONAL_ROLE };
+      if (scopeForMasterRowsTest !== 'absent') req.scope = scopeForMasterRowsTest;
+      next();
+    });
+    app.use('/clients', clientsRouter);
+    app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
+    await new Promise((resolve) => { masterRowsServer = app.listen(0, resolve); });
+    masterRowsBaseUrl = `http://127.0.0.1:${masterRowsServer.address().port}`;
+  });
+
+  after(async () => {
+    masterRowsFake.restore();
+    if (masterRowsServer) await new Promise((resolve) => masterRowsServer.close(resolve));
+  });
+
+  beforeEach(() => {
+    masterRowsFake.reset();
+    scopeForMasterRowsTest = allowClients(CLIENT_ID);
+  });
+
+  it('one item per active brand, one item for a true No-Brand group, and NOTHING for a group whose brands are all inactive', async () => {
+    const res = await fetch(`${masterRowsBaseUrl}/clients/${CLIENT_ID}/material-rates/master-rows`);
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    const items = body.data.items;
+    assert.deepEqual(
+      items.map((i) => ({ material_id: i.material_id, brand_id: i.brand_id, label: i.label })),
+      [
+        { material_id: 10, brand_id: 100, label: 'Adapter 5A - Philips' },
+        { material_id: 11, brand_id: null, label: 'Cement Bag' },
+      ],
+      'RetiredBrand (inactive) must not appear, and material 12 (all brands inactive) must contribute NOTHING — not a phantom No-Brand row',
+    );
+  });
+
+  it('is a client-view GET (no isClientEdit gate) and is client-scope-guarded', () => {
+    const idx = ROUTES.indexOf("router.get('/:clientId/material-rates/master-rows', ");
+    assert.ok(idx >= 0, 'master-rows route not found');
+    const block = ROUTES.slice(idx, ROUTES.indexOf('\n});', idx));
+    assert.doesNotMatch(block, /requireClientEdit/, 'a read route must not require isClientEdit');
+    assert.match(block, /loadAndGuardClient\(/, 'must run the client scope-guard');
+  });
+
+  it('refuses a client outside the caller\'s scope', async () => {
+    scopeForMasterRowsTest = allowClients(999);
+    const res = await fetch(`${masterRowsBaseUrl}/clients/${CLIENT_ID}/material-rates/master-rows`);
+    assert.equal(res.status, 404);
   });
 });

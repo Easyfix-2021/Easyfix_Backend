@@ -40,6 +40,7 @@ const docsSvc = require('../../services/client-documents.service');
 const clientServicesSvc = require('../../services/client-services.service');
 const rateCardsSvc = require('../../services/client-rate-cards.service');
 const materialRatesSvc = require('../../services/client-material-rates.service');
+const materialSvc = require('../../services/material.service');
 const rateCardUploadSvc = require('../../services/rate-card-bulk-upload.service');
 const lookupSvc = require('../../services/lookup.service');
 const techMappingSvc = require('../../services/client-tech-mapping.service');
@@ -1721,6 +1722,7 @@ router.post(
  *
  * GET    /:clientId/material-rates              → client view (any authed admin)
  * GET    /:clientId/material-rates/options       → client view
+ * GET    /:clientId/material-rates/master-rows   → client view (master catalog, for the CRM Add-Material picker)
  * PUT    /:clientId/material-rates/:materialId   → isClientEdit (full replace; also the Add path)
  * DELETE /:clientId/material-rates/:materialId   → isClientEdit
  * POST   /:clientId/material-rates/:materialId/accept-master → isClientEdit
@@ -1729,12 +1731,19 @@ router.post(
  * gate and loadAndGuardClient scope-guard as the rest of this file.
  */
 
+// Tx Share (2026-09-24) — optional on every group/state entry; omitted/null
+// means "20% of price at write time" (client-material-rates.service.js).
+// precision(2) rounds rather than rejects, matching the house convention for
+// money fields (see validators/branding.validator.js, routes/admin/finance.js).
+const txShareField = Joi.number().min(0).precision(2).optional();
 const clientMaterialStateEntry = Joi.object({
   price: Joi.number().greater(0).required(),
+  tx_share: txShareField,
   state_ids: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
 });
 const clientMaterialGroupEntry = Joi.object({
   price: Joi.number().greater(0).required(),
+  tx_share: txShareField,
   brand_ids: Joi.array().items(Joi.number().integer().positive()).default([]),
   states: Joi.array().items(clientMaterialStateEntry).default([]),
 });
@@ -1779,6 +1788,25 @@ router.get('/:clientId/material-rates/options', async (req, res, next) => {
     if (!(await loadAndGuardClient(req, res))) return;
     const items = await materialRatesSvc.options(req.params.clientId);
     modernOk(res, items);
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /:clientId/material-rates/master-rows?search=&limit=
+ *
+ * Master-catalog rows (one per active material x active brand; No Brand
+ * materials give one row with brand null) for the CRM "Add Material" picker
+ * behind POST /admin/jobs/:id/quotation-lines. Same read-level guard as the
+ * other material-rates GETs above — the client scope only gates which client
+ * page can reach this, the data itself is the shared master, not client-
+ * scoped. See services/material.service.js#masterRows.
+ */
+router.get('/:clientId/material-rates/master-rows', async (req, res, next) => {
+  try {
+    logger.info('List material master-rows · clientId=' + req.params.clientId + ' · search=' + (req.query.search || ''));
+    if (!(await loadAndGuardClient(req, res))) return;
+    const out = await materialSvc.masterRows({ search: req.query.search, limit: req.query.limit });
+    modernOk(res, out);
   } catch (e) { next(e); }
 });
 

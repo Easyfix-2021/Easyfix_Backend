@@ -3255,9 +3255,22 @@ async function list({
      * return nothing for every job that overrides it. Still exactly TWO
      * placeholders / two bound params, and `cu.` remains textually present so
      * the COUNT-join sniffing below still adds the tbl_customer join.
+     *
+     * A phone-shaped term (>= MOBILE_MIN_DIGITS digits once spaces/+/- are
+     * stripped) takes the SAME uncorrelated, prefix-anchored set lookup as the
+     * `q` mobile branch below — see the measurements there. `%t%` on the
+     * joined cu column full-scanned tbl_job + tbl_customer in BOTH the data and
+     * COUNT queries (~3.5s reported, 2026-09-24). Deliberate narrowing: no
+     * mid-number match and no name match for such a term, exactly like `q`.
      */
-    clauses.push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ?)`);
-    params.push(`%${customerQ}%`, `%${customerQ}%`);
+    const mobileTerm = customerQ.replace(/[\s+-]/g, '');
+    if (/^\d+$/.test(mobileTerm) && mobileTerm.length >= MOBILE_MIN_DIGITS) {
+      clauses.push('j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)');
+      params.push(`${mobileTerm}%`);
+    } else {
+      clauses.push(`(${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ?)`);
+      params.push(`%${customerQ}%`, `%${customerQ}%`);
+    }
   }
   // Reopen — direct column on tbl_job, super cheap. Accepts boolean or
   // its URLSearchParams string form (matches `assigned`/`isEscalated`).
