@@ -13,6 +13,7 @@ const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
+let IDENT = { efr_id: 7, efr_name: 'Ravi', current_balance: 100 };
 let HOME_ROWS; let SHARES; let FACTS; let CITIES; let SKILLS; let BEST; let REVIEW;
 function reset() {
   HOME_ROWS = []; SHARES = {}; FACTS = { earned_lifetime: '41250.50', points: '720', pincodes: '122001, 122002,bad,122003' };
@@ -32,7 +33,7 @@ const fake = installFakePool([
   [/FROM tbl_efr_deepskill_mapping/, () => SKILLS],
   [/MAX\(t\.n\) AS best/, () => BEST],
   [/FROM tbl_easyfixer_rating_by_customer r\s+LEFT JOIN tbl_job/, () => REVIEW],
-  [/FROM tbl_easyfixer e/, () => [{ efr_id: 7, efr_name: 'Ravi', current_balance: 100 }]],
+  [/FROM tbl_easyfixer e/, () => [IDENT]],
 ]);
 
 const dashboard = require('../services/mobile-dashboard.service');
@@ -155,6 +156,18 @@ test('the best-day cache is keyed by technician and expires after an hour', asyn
   assert.equal(await fetchBestDay(7, NOW + 61 * 60_000), 3, 'expired → re-read');
   const q = fake.calls.find((c) => /MAX\(t\.n\) AS best/.test(c.sql));
   assert.deepEqual(q.params, [7, '2026-06-26 00:00:00'], '90 IST days back, scoped to his efr_id');
+});
+
+test('the header\'s home location is his home PIN\'s locality, joined in — never the PIN, never a new query', async () => {
+  IDENT = { efr_id: 7, efr_name: 'Ravi', current_balance: 100, home_location: '  DLF Phase 3 ', city_name: 'Gurugram' };
+  fake.reset();
+  const d = await dashboard.getDashboard(7);
+  assert.equal(d.technician.homeLocation, 'DLF Phase 3');
+  const q = fake.calls.find((c) => /FROM tbl_easyfixer e/.test(c.sql));
+  assert.match(q.sql, /LEFT JOIN tbl_pincode hp ON hp\.pincode = e\.efr_pin_no/, 'a LEFT join: no home PIN still loads Home');
+  IDENT = { efr_id: 7, efr_name: 'Ravi', current_balance: 100, home_location: null };
+  assert.equal((await dashboard.getDashboard(7)).technician.homeLocation, null, 'unknown stays null, never ""');
+  IDENT = { efr_id: 7, efr_name: 'Ravi', current_balance: 100 };
 });
 
 /* ─── 3. Header facts ────────────────────────────────────────────────── */

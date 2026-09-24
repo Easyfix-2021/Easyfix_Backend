@@ -386,6 +386,7 @@ async function getDashboard(efrId, opts = {}) {
  *     efr_profile_img?:     string | null,   // omitted on legacy DBs
  *     efr_cityId:           number | null,
  *     city_name:            string | null,   // joined from tbl_city
+ *     home_location:        string | null,   // the home PIN's locality (tbl_pincode.location)
  *     current_balance:      number | null,   // wallet balance
  *     efr_service_category: string | null,   // CSV/pipe-delimited
  *   }
@@ -401,10 +402,11 @@ async function fetchIdentity(efrId) {
     const [[row]] = await pool.query(
       `SELECT e.efr_id, e.efr_name, e.efr_first_name, e.efr_no,
               e.efr_profile_img,
-              e.efr_cityId, c.city_name,
+              e.efr_cityId, c.city_name, hp.location AS home_location,
               e.current_balance, e.efr_service_category
          FROM tbl_easyfixer e
          LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+         LEFT JOIN tbl_pincode hp ON hp.pincode = e.efr_pin_no
         WHERE e.efr_id = ? LIMIT 1`,
       [efrId],
     );
@@ -416,10 +418,11 @@ async function fetchIdentity(efrId) {
       try {
         const [[row]] = await pool.query(
           `SELECT e.efr_id, e.efr_name, e.efr_first_name, e.efr_no,
-                  e.efr_cityId, c.city_name,
+                  e.efr_cityId, c.city_name, hp.location AS home_location, hp.location AS home_location,
                   e.current_balance, e.efr_service_category
              FROM tbl_easyfixer e
              LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+             LEFT JOIN tbl_pincode hp ON hp.pincode = e.efr_pin_no
             WHERE e.efr_id = ? LIMIT 1`,
           [efrId],
         );
@@ -442,6 +445,9 @@ function shapeTechnician(ident) {
     mobile:    ident?.efr_no ?? null,
     photoUrl:  ident?.efr_profile_img || null,
     city:      ident?.city_name ?? null,
+    // Header line "EFR ID 99001 · <home locality>" (owner, 2026-09-24): the
+    // named locality of his home PIN (efr_pin_no), never the PIN itself.
+    homeLocation: ident?.home_location?.trim() || null,
     categories: ident?.efr_service_category
       ? String(ident.efr_service_category).split(/[,|]/).map((s) => s.trim()).filter(Boolean)
       : [],
