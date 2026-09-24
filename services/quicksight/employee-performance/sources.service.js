@@ -256,10 +256,37 @@ async function forEachExportChunk(filters, onChunk) {
 }
 
 /*
+ * prep.py's reason() / themes.py's clean_comment(): the export writes one
+ * physical set of cancel columns for two lifecycle ends and prefixes each
+ * value with which one it is ("Cancel - :<text>"). The MIS engine strips that
+ * prefix before it groups on the value or keyword-matches the comment, so the
+ * prefix must not reach an aggregation here either — "Cancel - :Duplicate" and
+ * "Duplicate" are one reason, not two.
+ *
+ * The regex is prep.py's, character for character: the CANCEL prefix only.
+ * An "Enquiry - :" value keeps its prefix because prep.py keeps it, and
+ * because status 7 is not in any set this file reads.
+ */
+const CANCEL_PREFIX_RE = /^\s*cancel\s*-\s*:\s*/i;
+
+function withoutCancelPrefix(v) {
+  const s = trimmed(v);
+  return s === null ? null : trimmed(s.replace(CANCEL_PREFIX_RE, ''));
+}
+
+/*
  * The columns both job kinds share, from the SHEET row (mapExportRow) with
  * build_data.py's blank rules made explicit as null: blank state / city stay
  * null (compose shows an em dash), and the export's legacy literal 'null'
  * Zonal Manager becomes null (compose shows 'Unassigned').
+ *
+ * The block below `txid` is what the MTD Client Report's eleven sections read
+ * (services/quicksight/mtd-report.service.js) and nothing else does yet. It is
+ * HERE rather than in that service because every one of these values is a
+ * column of the SAME export row the loaders already mapped — re-reading the
+ * job to get its aging or its cancel reason would be a second definition of
+ * data we are already holding, which is exactly the drift this file exists to
+ * prevent. They cost one property each on a row that already has ten.
  */
 function jobFields(m, raw) {
   const zm = trimmed(m.zonalManager);
@@ -281,6 +308,32 @@ function jobFields(m, raw) {
     // Current TX Name is kept raw (build_data.py's sval_raw); only a blank is null.
     tx: m.txName === null || m.txName === undefined || m.txName === '' ? null : String(m.txName),
     txid: m.txId === null || m.txId === undefined ? null : String(m.txId),
+
+    /* ── the MTD Client Report's columns (prep.py FIELDS) ──────────────── */
+
+    // "Job Status" — the export's LABEL, not the code above. The MTD job list
+    // shows this string, the way the workbook's Job Status column does.
+    jobStatus: trimmed(m.status),
+    /*
+     * "Ticket Created Date" as a plain IST day. The MTD report needs the day a
+     * job was RAISED on every set, not just on the ticket-created one: the open
+     * backlog line runs each job from its ticket day to the day it closed, and
+     * the open bucket is every job raised on or before the end of the window.
+     */
+    ticketDate: jobExport.datePart(raw.ticket_created_date_time),
+    /*
+     * "Aging" — the export's own days-open number, which is days from ticket
+     * creation to closure / cancellation and, for a job still open, to `now`.
+     * Every days-open bucket in the MTD report splits on this one value, so it
+     * is taken from the sheet rather than recomputed from two timestamps.
+     */
+    aging: m.aging,
+    // "Cancel/Enquiry Reason" / "Cancel/Enquiry Comment" / "Cancle By" (the
+    // export's own spelling), prefix stripped. Null on any job that was not
+    // cancelled — mapExportRow only fills them for statuses 6 and 7.
+    cancelReason: withoutCancelPrefix(m.cancelReason),
+    cancelComment: withoutCancelPrefix(m.cancelComment),
+    cancelBy: trimmed(m.cancelBy),
   };
 }
 
@@ -366,7 +419,8 @@ async function readFrozenSpocs(jobIds, db = pool) {
  * verticalId / zonalManagerId narrow the read (0 or omitted = every job).
  *
  * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
- *        aging, dueTo, reason, spoc: null, spocUserId, spocName, spocInternal,
+ *        jobStatus, ticketDate, aging, cancelReason, cancelComment, cancelBy,
+ *        dueTo, reason, spoc: null, spocUserId, spocName, spocInternal,
  *        spocSource: 'mapping' }  — resolvePeople() fills `spoc`.
  */
 async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {}) {
@@ -379,8 +433,9 @@ async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {
     for (const raw of chunk) {
       const m = jobExport.mapExportRow(raw, rows.length + 1, { now });
       rows.push({
+        // `aging` arrives from jobFields, which reads the same m.aging this
+        // loader used to set here by hand.
         ...jobFields(m, raw),
-        aging: m.aging,
         dueTo: trimmed(m.pendingDueTo),
         reason: trimmed(m.pendingReason),
         spoc: null,
@@ -414,7 +469,14 @@ async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {
  *
  * Row: { jobId, clientId, date, spoc: null, spocUserId, spocName, spocInternal,
  *        spocSource: 'frozen'|'mapping', charge, margin, client, tat, sda, zm,
- *        vertical, tx, txid, aco: null, acoUserId, acoName, acoInternal }
+ *        vertical, tx, txid, aco: null, acoUserId, acoName, acoInternal,
+ *        city, state, jobStatus, ticketDate, aging }
+ *
+ * This is the one loader that PICKS its columns out of jobFields instead of
+ * spreading it, because its row is also compose()'s first-seen table row. The
+ * last five are the MTD Client Report's: completed jobs are split by city and
+ * by days open there, and the open-backlog line needs the day each one was
+ * raised. They are listed explicitly for the same reason the rest are.
  */
 async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalManagerId } = {}) {
   const started = Date.now();
@@ -460,6 +522,12 @@ async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalMan
           acoUserId: toId(raw.fk_checkout_by),
           acoName: null,
           acoInternal: false,
+          // MTD Client Report — see the row note above.
+          city: f.city,
+          state: f.state,
+          jobStatus: f.jobStatus,
+          ticketDate: f.ticketDate,
+          aging: f.aging,
         },
       });
     }
@@ -523,6 +591,7 @@ async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalMan
  * absence is spelt with null and the key is omitted rather than sent empty.
  *
  * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
+ *        jobStatus, ticketDate, aging, cancelReason, cancelComment, cancelBy,
  *        date, charge, spoc: null, spocUserId, spocName, spocInternal,
  *        spocSource: 'mapping' }
  */
