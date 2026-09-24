@@ -83,7 +83,7 @@ function phase1Ids(sql, params) {
   const afterId = /J\.job_id < \?/.test(sql) ? params[params.length - 2] : Infinity;
 
   const statuses = bound(sql, params, /J\.job_status IN \([?, ]+\)/);
-  const vertical = bound(sql, params, /vm\.vertical_id = \?/);
+  const vertical = bound(sql, params, /vm\.vertical_id IN \([?, ]+\)/);
   const zonal = bound(sql, params, /city\.state_user IN \([?, ]+\)/);
   const dateCol = (sql.match(/J\.(\w*date\w*) >= DATE\(\?\)/) || [])[1] || null;
   const window = dateCol === null ? null : [
@@ -418,8 +418,8 @@ test('the vertical and zonal-manager filters narrow every read, parameterised', 
   assert.deepEqual(vertical.totals, { ticketCreated: 3, inProgress: 0, open: 1, completed: 1, cancelled: 1 });
   assert.deepEqual(vertical.scope, { verticalId: 4, zonalManagerId: null });
   for (const call of phase1Calls()) {
-    assert.match(call.sql, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id = \?\)/);
-    assert.deepEqual(bound(call.sql, call.params, /vm\.vertical_id = \?/), [4], 'the id is bound, never inlined');
+    assert.match(call.sql, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = J\.fk_client_id AND vm\.vertical_id IN \([?, ]+\)\)/);
+    assert.deepEqual(bound(call.sql, call.params, /vm\.vertical_id IN \([?, ]+\)/), [4], 'the id is bound, never inlined');
   }
 
   // Zonal manager 61 drops 203 (city owned by 62) from Completed.
