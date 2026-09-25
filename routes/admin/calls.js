@@ -2263,17 +2263,19 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
                * "No recording" instead of offering a Play that can only fail.
                *
                * The 2026-09-24/25 start-on-answer change (c6d163a, reverted in
-               * e24bb19) claimed the operator leg with recording_id='starting',
-               * then Plivo recorded NOTHING: the account holds zero recordings
-               * between that deploy (13:42 UTC 09-24) and the revert (~05:44
-               * UTC 09-25). Nothing writes 'starting' any more, so it marks
-               * exactly those calls. Deliberately NOT "Plivo lookup came back
-               * empty": that lookup misses web-call recordings filed under
-               * another leg, so it cannot prove absence.
+               * e24bb19) stopped ALL Plivo recording: the account holds ZERO
+               * recordings while that build served Prod — container up
+               * 13:42:28 UTC 09-24, replaced 05:42:40 UTC 09-25, i.e. the IST
+               * wall-clock window below (inserted_time is stored IST; Call
+               * History prints it raw). A time window, not the 'starting'
+               * claim that build left: a call whose customer never joined was
+               * never claimed, yet is just as unrecorded. Deliberately NOT
+               * "Plivo lookup came back empty": that lookup misses web-call
+               * recordings filed under another leg, so it proves nothing.
                */
-              EXISTS (SELECT 1 FROM tbl_plivo_call_log rl
-                       WHERE rl.job_caller_info_id = jci.job_caller_info
-                         AND rl.recording_id = 'starting' AND rl.recording_url IS NULL) AS recording_lost,
+              (jci.provider = 'plivo'
+                AND jci.inserted_time >= '2026-09-24 19:12:28'
+                AND jci.inserted_time <  '2026-09-25 11:12:40') AS recording_lost,
               jci.location,
               jci.provider,
               jci.inserted_time,
