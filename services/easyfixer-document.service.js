@@ -12,16 +12,25 @@ const logger = require('../logger');
 const s3Storage = require('../utils/s3-storage');
 const { publicUrlFor } = require('../utils/file-storage');
 
-async function upsertEasyfixerDocuments(connection, efrId, rows) {
+/*
+ * `fillOnly` (identity documents, owner 2026-09-25): an existing row that
+ * already holds a document is left untouched — only a missing or blank one is
+ * written. Without it a re-upload replaces the stored image in place.
+ */
+async function upsertEasyfixerDocuments(connection, efrId, rows, { fillOnly = false } = {}) {
   for (const [typeId, key] of rows) {
     if (!key) continue;
     const [[existing]] = await connection.query(
-      `SELECT efr_doc_id
+      `SELECT efr_doc_id, efr_document_name
          FROM tbl_easyfixer_document
         WHERE efr_id = ? AND efr_doc_type_id = ?
         LIMIT 1`,
       [efrId, typeId],
     );
+    if (existing && fillOnly && String(existing.efr_document_name ?? '').trim() !== '') {
+      logger.info({ efrId, typeId }, 'Kept the stored identity document; identity is fill-only from the app');
+      continue;
+    }
     if (existing) {
       await connection.query(
         'UPDATE tbl_easyfixer_document SET efr_document_name = ? WHERE efr_doc_id = ?',
