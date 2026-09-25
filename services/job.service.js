@@ -3990,6 +3990,44 @@ async function list({
       for (const r of rows) r.offer_efrs = [];
     }
   }
+
+  /*
+   * COVERAGE — Local / Travel / nothing, for the Booking queue's chip.
+   *
+   *   a PIN, and a technician who serves it   → LOCAL
+   *   a PIN, and nobody who serves it         → TRAVEL  (somebody must travel)
+   *   no PIN at all                           → NO CHIP
+   *
+   * The third case is the one worth spelling out: a job with no pincode is not
+   * "local by default", it is UNANSWERABLE, and a green LOCAL chip on it would
+   * be a guess wearing the clothes of a measurement. The FE shows nothing.
+   *
+   * Computed HERE rather than in SQL: the coverage test is FIND_IN_SET over a
+   * hand-maintained CSV of serviceable pincodes, which can never use an index —
+   * pincode-coverage.service.js explains at length why it loads the supply side
+   * once and intersects in memory instead, and it caches that set. Doing it per
+   * row in the query would re-run the whole supply lookup for every job on the
+   * page. Only for the Booking queue (`bucket`), so no other caller pays for it.
+   *
+   * Fail-soft: a coverage lookup that throws leaves `coverage` null and the
+   * chip simply absent. A wrong chip is worse than no chip — it decides
+   * whether somebody has to travel.
+   */
+  if (bucket && rows.length) {
+    try {
+      const pins = rows.map((r) => r.pin_code).filter(Boolean);
+      const covered = pins.length
+        ? await require('./pincode-coverage.service').getCoveredPincodes(pins)
+        : new Set();
+      for (const r of rows) {
+        const pin = r.pin_code ? String(r.pin_code).trim() : '';
+        r.coverage = pin ? (covered.has(pin) ? 'local' : 'travel') : null;
+      }
+    } catch (e) {
+      logger.warn('Coverage lookup failed (chip renders blank) · ' + ((e && e.message) || e));
+      for (const r of rows) r.coverage = null;
+    }
+  }
   return { rows, total };
 }
 

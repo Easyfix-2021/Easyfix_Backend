@@ -2215,7 +2215,24 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     const primaryLegOnly = hasConfCols
       ? " AND (pcl.conference_id IS NULL OR pcl.participant_role = 'operator')"
       : '';
-    const plivoJoin = `JOIN tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info${primaryLegOnly}`;
+    /*
+     * ⚠ INNER FOR THE ANALYTICS LIST, LEFT FOR ONE JOB — and the difference is
+     * 46% of the call log.
+     *
+     * Transcription and coaching analysis are Plivo-only, so the unified Call
+     * Analysis list genuinely means "calls with a Plivo row"; and unfiltered it
+     * would otherwise scan a ~940k-row shared audit table dominated by legacy
+     * rows. Both arguments are about the WHOLE table.
+     *
+     * Neither applies when the caller asks for ONE JOB. There the inner join
+     * silently dropped every call placed through the older click-to-call path:
+     * measured on Production, 9,737 of 21,347 calls in 30 days — and job
+     * 543019's ⓘ popup listed NONE of its four real calls. A call that
+     * happened and is not shown is worse than one shown with empty analysis
+     * columns, which is all a Kaleyra row lacks. Their audio plays: the
+     * recording route hands back the stored https URL directly.
+     */
+    const plivoJoin = `${jobId ? 'LEFT JOIN' : 'JOIN'} tbl_plivo_call_log pcl ON pcl.job_caller_info_id = jci.job_caller_info${primaryLegOnly}`;
     // leg_id identifies WHICH tbl_plivo_call_log row this call-history row came
     // from, so attachConferenceLegs() can flag it `is_primary` among the legs.
     const confSelect = hasConfCols
