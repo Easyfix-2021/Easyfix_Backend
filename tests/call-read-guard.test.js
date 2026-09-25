@@ -397,21 +397,21 @@ test('the list projects has_recording, never the raw recording URL', async () =>
   assert.doesNotMatch(select, /^\s*jci\.recording,\s*$/m, 'the raw recording URL is back in the list');
 });
 
-test('recording_lost flags ONLY the proven-absent outage rows', async () => {
+test('recording_lost flags ONLY Plivo calls inside the proven outage window', async () => {
   /*
-   * "No recording" up front must never hide audio that exists. The only rows
-   * PROVEN to have none are the 2026-09-24/25 outage calls, which carry
-   * recording_id='starting' with no URL (the Plivo account holds zero
-   * recordings in that window). A blank recording_url alone is the NORMAL
-   * state of a playable web call, so it must not be the test.
+   * "No recording" up front must never hide audio that exists. The Plivo
+   * account holds ZERO recordings while the broken build served Prod
+   * (13:42:28 UTC 09-24 → 05:42:40 UTC 09-25 = the IST window below), so every
+   * Plivo call inserted inside it is proven unrecorded — and nothing outside.
    */
   const src = require('fs').readFileSync(require.resolve('../routes/admin/calls.js'), 'utf8');
   const from = src.indexOf("router.get('/', validate(callListQuery");
   const body = src.slice(from).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   const select = body.slice(body.indexOf('SELECT jci.job_caller_info'), body.indexOf('ORDER BY jci.inserted_time'));
-  const lost = select.slice(select.indexOf('EXISTS'), select.indexOf('AS recording_lost'));
-  assert.ok(select.includes('AS recording_lost'), 'the list must expose recording_lost');
-  assert.match(lost, /recording_id = 'starting'/, 'keyed on the outage marker');
-  assert.match(lost, /recording_url IS NULL/, 'a row that DID get a URL is never lost');
-  assert.match(lost, /job_caller_info_id = jci\.job_caller_info/, 'scoped to this call');
+  const at = select.indexOf('AS recording_lost');
+  assert.notEqual(at, -1, 'the list must expose recording_lost');
+  const lost = select.slice(select.lastIndexOf('(jci.provider', at), at);
+  assert.match(lost, /jci\.provider = 'plivo'/, 'Kaleyra audio is never marked lost');
+  assert.match(lost, /jci\.inserted_time >= '2026-09-24 19:12:28'/, 'window opens when the broken build started (IST)');
+  assert.match(lost, /jci\.inserted_time <\s+'2026-09-25 11:12:40'/, 'and closes, exclusive, when the revert replaced it');
 });
