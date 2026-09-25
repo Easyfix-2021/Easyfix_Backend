@@ -87,7 +87,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
-const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC, recordingCallbackUrl } = require('./plivo.service');
+const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC } = require('./plivo.service');
 const legs = require('./plivo-call-log.service');
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -654,12 +654,6 @@ async function listParticipants(friendlyName) {
  * A few seconds of the operator alone is the correct trade — participants join
  * later and MUST be inside the recording.
  *
- * ⚠ SUPERSEDED 2026-09-24: the answer routes no longer pass
- * recordingCallbackUrl — "a few seconds" was 12 s of ringback + room noise on
- * every recording. startRecordingOnAnswer (below) now starts the same stereo
- * recording on the operator's leg when the first participant JOINS, which also
- * keeps later participants inside it. The option stays for callers/tests.
- *
  * recordSession/maxLength/stereo/fileFormat and the callbackUrl are the same
  * values the bridge uses (maxLength: without it Plivo cuts the recording at 60 s
  * — see RECORD_MAX_SEC; job #538806 was this path), so the EXISTING
@@ -704,78 +698,6 @@ function operatorAnswerXml(friendlyName, opts = {}) {
       + ` callbackUrl="${xmlAttr(opts.recordingCallbackUrl)}" callbackMethod="POST"/>`;
   }
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}<MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
-}
-
-/*
- * startRecordingOnAnswer(conference, pool) — RECORDING STARTS WHEN THE FIRST
- * REMOTE PARTY ANSWERS (2026-09-24). Called by the conference webhook on every
- * non-operator ParticipantJoin; a no-op after the first.
- *
- * Replaces the <Record> the answer routes used to put before <MultiPartyCall>.
- * That element recorded from the moment the OPERATOR joined, so every
- * recording opened with ringback and the operator's room noise (call_1059906:
- * 12 s of it) — audio the customer never heard. There is no <Dial> here for
- * startOnDialAnswer to key on, so the start is driven from the one event that
- * does mean "someone answered": the participant's join callback.
- *
- * Same recording, started later: Plivo's Record API on the OPERATOR's leg,
- * which is the leg <Record recordSession> ran on. `record_channel_type` MUST be
- * sent — the API defaults to MONO, and Call Analytics depends on stereo
- * (ch0 agent / ch1 customer). Same jci-signed callback, so
- * /recording-callback → plivoLog.setRecording() stores it unchanged.
- *
- * ONCE per conference, atomically, with no new column: the operator's row is
- * claimed by writing REC_CLAIM into recording_id while it is NULL. Every
- * reader of recording_id gates on recording_url IS NOT NULL, so the
- * placeholder is invisible; the real id replaces it on success, NULL on
- * failure (so a later join — a technician — can try again). Only calls the
- * answer route flagged recording_requested=1 are claimed, so
- * plivo.recording.enabled keeps its meaning.
- *
- * Fail-soft: recording must never disturb the live call.
- */
-const REC_CLAIM = 'starting';
-async function startRecordingOnAnswer(conference, pool) {
-  if (!conference || !conference.id || !pool) return { ok: false, started: false };
-  const opFilter = "conference_id = ? AND participant_role = 'operator'";
-  const [claim] = await pool.query(
-    `UPDATE tbl_plivo_call_log SET recording_id = ?, updated_on = ?
-      WHERE ${opFilter} AND recording_requested = 1 AND call_uuid IS NOT NULL
-        AND recording_id IS NULL AND recording_url IS NULL`,
-    [REC_CLAIM, new Date(), conference.id]);
-  if (!claim || !claim.affectedRows) return { ok: true, started: false };
-
-  const release = (id) => pool.query(
-    `UPDATE tbl_plivo_call_log SET recording_id = ?, updated_on = ? WHERE ${opFilter} AND recording_id = ?`,
-    [id, new Date(), conference.id, REC_CLAIM]);
-
-  const [[leg] = []] = await pool.query(
-    `SELECT call_uuid, job_caller_info_id FROM tbl_plivo_call_log WHERE ${opFilter} AND recording_id = ? LIMIT 1`,
-    [conference.id, REC_CLAIM]);
-  const cbUrl = leg ? recordingCallbackUrl(leg.job_caller_info_id) : null;
-  if (!leg || !leg.call_uuid || !cbUrl) {
-    await release(null);
-    logger.warn(`⚠ Conference recording NOT started · conf=${conference.id} · no operator leg uuid / callback base`);
-    return { ok: false, started: false };
-  }
-
-  const url = `${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Call/${encodeURIComponent(leg.call_uuid)}/Record/`;
-  const r = await mpcRequest('start-recording', 'POST', url, {
-    file_format: 'mp3',
-    time_limit: RECORD_MAX_SEC,          // the Record API also stops at 60 s when omitted
-    record_channel_type: 'stereo',       // default is mono — see above
-    callback_url: cbUrl,
-    callback_method: 'POST',
-  });
-  if (!r.ok) {
-    await release(null);
-    logger.warn(`⚠ Conference recording NOT started · conf=${conference.id} · jci=${leg.job_caller_info_id} · ${r.error || r.code}`);
-    return { ok: false, started: false };
-  }
-  const recId = (r.json && r.json.recording_id) || REC_CLAIM;
-  if (recId !== REC_CLAIM) await release(String(recId));
-  logger.info(`🎙 Conference recording started on answer · conf=${conference.id} · jci=${leg.job_caller_info_id} · rec=${recId}`);
-  return { ok: true, started: true, recordingId: recId };
 }
 
 // ─────────────────────────── DB: create ────────────────────────────────────
@@ -1615,7 +1537,6 @@ module.exports = {
   listStaleConferences,
   // call control
   operatorAnswerXml,
-  startRecordingOnAnswer,
   // provider read-backs (reconciliation)
   fetchConference,
   listParticipants,
