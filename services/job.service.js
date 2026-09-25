@@ -2968,6 +2968,7 @@ async function list({
   bucket,                    // enum — My Orders -> Booking queue tile (booking-queue.service.js)
   bucketHasRequestTable,     // bool — probed by the caller (see customerRequestTableExists)
   ageDay,                    // enum — Booking-queue day pill: '0' | '1' | '2' | '3plus'
+  withEscalation,            // bool — project the escalation flag for the 🔥 row mark
   customerRescheduled,       // bool — the Booking-queue "Rescheduled by customer" flag
   requestedBefore,           // 'now' or ISO date — Running Late tile
   /*
@@ -3121,7 +3122,17 @@ async function list({
    * the queue could filter by it but never display it — a row would look
    * ordinary right up until somebody clicked the flag chip.
    */
-  const wantsEscalation = wantsManage || filtersEscalated || !!bucket;
+  /*
+   * …and any caller that asks for it outright (2026-09-25). The My Orders
+   * tables show a 🔥 beside the job number in EVERY bucket, and the flag
+   * columns were projected only for the manage view, an escalation FILTER, or
+   * the booking queue — so those tables could not render what ops asked to
+   * see. `withEscalation` is opt-in rather than always-on because the columns
+   * cost a LEFT JOIN resolved through MAX(table_id), which every list that
+   * does not draw the mark should not pay for.
+   */
+  const wantsEscalation = wantsManage || filtersEscalated || !!bucket
+    || withEscalation === true || String(withEscalation) === 'true';
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)

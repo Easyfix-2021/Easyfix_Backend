@@ -186,8 +186,8 @@ test('Rating reuses the escalation row rather than joining that table twice', ()
    * the regression this test exists for, and the assertions below still pin
    * that half to the caller's own request.
    */
-  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated \|\| !!bucket;/,
-    'the manage view — and the booking queue — must force the escalation JOIN on');
+  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated \|\| !!bucket\s*\|\| withEscalation === true/,
+    'the manage view, the booking queue, and any caller that opts in must force the escalation JOIN on');
   assert.match(fragment('manageColumns', true, true), /esc\.customer_rating/,
     'and read the rating off that same alias');
   /*

@@ -281,6 +281,9 @@ const listQuery = Joi.object({
   // the same reason `bucket` does — this schema must not be a second, drifting
   // copy of the vocabulary.
   ageDay: Joi.string().valid(...require('../services/booking-queue.service').DAY_BUCKETS).optional(),
+  // Opt in to the escalation columns — the 🔥 beside a job number. Opt-IN
+  // because they cost a join every list that does not draw it should not pay.
+  withEscalation: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),
   // The Booking-queue "Rescheduled by customer" flag chip. Distinct from
   // auto_rescheduled (our own after-3pm shift) — this is the customer's ask.
   customerRescheduled: Joi.alternatives(Joi.boolean(), Joi.string().valid('true', 'false')).optional(),

@@ -737,6 +737,7 @@ const FILTER_COVERAGE = Object.freeze({
    */
   bucket:              ['ignored',  'needs the customer-request probe + a J-alias bind where() cannot do'],
   ageDay:              ['ignored',  'rides inside the bucket predicate — see bucket'],
+  withEscalation:      ['ignored',  'a projection toggle for a row mark — the sheet has its own columns'],
   customerRescheduled: ['ignored',  'same probe, same alias — see bucket'],
   /*
    * Keyset pagination requires the sort key to BE the cursor, and the cursor

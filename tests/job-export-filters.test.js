@@ -544,6 +544,7 @@ const SAMPLE = {
   // another tile's rows.
   bucket: 'no_response',
   ageDay: '3plus',
+  withEscalation: 'true',
   customerRescheduled: 'true',
   sortBy: 'job_id',
   sortDir: 'asc',
