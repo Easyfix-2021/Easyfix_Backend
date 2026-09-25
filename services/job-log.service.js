@@ -178,6 +178,51 @@ const LOG_FOR = {
   // New, because the legacy stack had no customer-PIN-on-close gate to bypass.
   CUSTOMER_PIN_RESENT: 'customer pin resent',
   COMPLETED_WITHOUT_PIN: 'completed without customer pin',
+  /*
+   * V3 2.2/2.3/2.4/2.6 (2026-09-23). Three facts the legacy stack could not
+   * have had, because none of the things they describe existed: the PIN moved
+   * from gating job START to being collected at ARRIVAL, and the system began
+   * awarding two charges nobody types.
+   *
+   * Each gets its own log_for for the reason stated above 'status change': a
+   * new fact gets a new value. Folding "we paid him the on-time bonus" into
+   * 'status change' would make a decade of status rows ambiguous, and folding
+   * both money events into one value would leave a reader unable to tell an
+   * EasyFix-funded bonus from a client-billed visit charge without parsing
+   * new_data -- which is exactly the kind of overload this module avoids.
+   */
+  CUSTOMER_PIN_VERIFIED: 'customer pin verified',
+  INCENTIVE_AWARDED: 'incentive awarded',
+  VISIT_CHARGE_AWARDED: 'visit charge awarded',
+  /*
+   * V3 Phase 3 (2026-09-24) — the on-site claims and the desk/QC events that
+   * resolve them (design sheets 10-14). Same rule as every value above: a new
+   * fact gets its own log_for, so a reader filters on one value and never has
+   * to parse new_data to tell "he reported additional work" from "the desk
+   * priced it". No `%` or `_` in any of them — the legacy LIKE reader.
+   */
+  ADDITIONAL_WORK_REPORTED: 'additional work reported',
+  ADDITIONAL_WORK_PRICED: 'additional work priced',
+  ADDITIONAL_WORK_RETURNED: 'additional work returned',
+  ADDITIONAL_WORK_APPROVED: 'additional work approved',
+  LEFT_SITE: 'left site',
+  BOOKED_MEANWHILE: 'booked work meanwhile',
+  CANNOT_COMPLETE_REPORTED: 'cannot complete reported',
+  CLAIM_UNDONE: 'claim undone',
+  HELP_REQUESTED: 'help requested',
+  HELP_PICKED_UP: 'help picked up',
+  JOB_VERIFIED: 'job verified',
+  CLIENT_QC: 'client qc',
+  LEDGER_POSTED: 'ledger posted',
+  /*
+   * V3 Phase 4 (2026-09-24) — the customer's signature (the PIN's fallback),
+   * the desk's per-job tools and products-at-site lists, and the desk booking
+   * visit 2 of a revisit. Same rule again: one fact, one value.
+   */
+  SIGNATURE_TAKEN: 'signature taken',
+  TOOLS_SET: 'tools set',
+  SITE_PRODUCTS_CHANGED: 'site products changed',
+  VISIT_TWO_SCHEDULED: 'visit two scheduled',
 };
 
 /*
@@ -191,6 +236,26 @@ const NEW_DATA_TOKEN = {
   [LOG_FOR.REVISIT_REQUIRED]: 'revisit',
   [LOG_FOR.CUSTOMER_PIN_RESENT]: 'pinResent',
   [LOG_FOR.COMPLETED_WITHOUT_PIN]: 'noCustomerPin',
+  [LOG_FOR.CUSTOMER_PIN_VERIFIED]: 'pinVerified',
+  [LOG_FOR.INCENTIVE_AWARDED]: 'onTime',
+  [LOG_FOR.VISIT_CHARGE_AWARDED]: 'visitCharge',
+  [LOG_FOR.ADDITIONAL_WORK_REPORTED]: 'additionalWork',
+  [LOG_FOR.ADDITIONAL_WORK_PRICED]: 'additionalWorkPriced',
+  [LOG_FOR.ADDITIONAL_WORK_RETURNED]: 'additionalWorkReturned',
+  [LOG_FOR.ADDITIONAL_WORK_APPROVED]: 'additionalWorkApproved',
+  [LOG_FOR.LEFT_SITE]: 'leftSite',
+  [LOG_FOR.BOOKED_MEANWHILE]: 'bookedMeanwhile',
+  [LOG_FOR.CANNOT_COMPLETE_REPORTED]: 'cannotComplete',
+  [LOG_FOR.CLAIM_UNDONE]: 'claimUndone',
+  [LOG_FOR.HELP_REQUESTED]: 'help',
+  [LOG_FOR.HELP_PICKED_UP]: 'helpPickedUp',
+  [LOG_FOR.JOB_VERIFIED]: 'verified',
+  [LOG_FOR.CLIENT_QC]: 'clientQc',
+  [LOG_FOR.LEDGER_POSTED]: 'ledgerPosted',
+  [LOG_FOR.SIGNATURE_TAKEN]: 'signature',
+  [LOG_FOR.TOOLS_SET]: 'toolsSet',
+  [LOG_FOR.SITE_PRODUCTS_CHANGED]: 'siteProducts',
+  [LOG_FOR.VISIT_TWO_SCHEDULED]: 'visitTwo',
 };
 
 /*
@@ -210,6 +275,31 @@ const ETA_STATUS = {
   [LOG_FOR.STATUS_CHANGE]: null,
   [LOG_FOR.CUSTOMER_PIN_RESENT]: null,
   [LOG_FOR.COMPLETED_WITHOUT_PIN]: null,
+  // Same reasoning again: eta_status reports on the ETA lifecycle. A PIN check
+  // and a charge award are not ETA events, so they carry no code rather than a
+  // borrowed one.
+  [LOG_FOR.CUSTOMER_PIN_VERIFIED]: null,
+  [LOG_FOR.INCENTIVE_AWARDED]: null,
+  [LOG_FOR.VISIT_CHARGE_AWARDED]: null,
+  // V3 Phase 3: none of these is a legacy ETA code, so none claims one.
+  [LOG_FOR.ADDITIONAL_WORK_REPORTED]: null,
+  [LOG_FOR.ADDITIONAL_WORK_PRICED]: null,
+  [LOG_FOR.ADDITIONAL_WORK_RETURNED]: null,
+  [LOG_FOR.ADDITIONAL_WORK_APPROVED]: null,
+  [LOG_FOR.LEFT_SITE]: null,
+  [LOG_FOR.BOOKED_MEANWHILE]: null,
+  [LOG_FOR.CANNOT_COMPLETE_REPORTED]: null,
+  [LOG_FOR.CLAIM_UNDONE]: null,
+  [LOG_FOR.HELP_REQUESTED]: null,
+  [LOG_FOR.HELP_PICKED_UP]: null,
+  [LOG_FOR.JOB_VERIFIED]: null,
+  [LOG_FOR.CLIENT_QC]: null,
+  [LOG_FOR.LEDGER_POSTED]: null,
+  // V3 Phase 4: none is an ETA event either.
+  [LOG_FOR.SIGNATURE_TAKEN]: null,
+  [LOG_FOR.TOOLS_SET]: null,
+  [LOG_FOR.SITE_PRODUCTS_CHANGED]: null,
+  [LOG_FOR.VISIT_TWO_SCHEDULED]: null,
 };
 
 /*
@@ -623,6 +713,298 @@ async function logCompletedWithoutCustomerPin(jobId, { pinOutstanding = false } 
   });
 }
 
+/*
+ * 'customer pin verified' — the customer's PIN was entered and matched
+ * (V3 2.2 at the door, V3 2.4 when it arrives late).
+ *
+ * WHY IT IS A ROW AND NOT AN INFERENCE. The PIN stopped being a gate in V3: a
+ * technician can work, and close, without one. So "was the customer actually
+ * there when he said he arrived?" is no longer answerable from the job's
+ * status — the status is identical either way. This row is the only place that
+ * question has an answer, which is precisely why the verification queue (V3
+ * 3.6) and the ops desk (3.2) both read it.
+ *
+ * `late` distinguishes the two routes: FALSE is the PIN collected at arrival,
+ * TRUE is the technician entering it afterwards from the order screen. It goes
+ * in old_data because that is where this module already puts a rendered
+ * qualifier (see resolveRevisitReasonText), and because a reader looking at a
+ * late verification needs to know it was late without joining anything.
+ *
+ * THE PIN IS NEVER WRITTEN, for the same reason logCustomerPinResent does not
+ * write it: the signature has nowhere to put it.
+ */
+async function logCustomerPinVerified(jobId, { late = false } = {}, actor, at) {
+  return write({
+    logFor: LOG_FOR.CUSTOMER_PIN_VERIFIED,
+    jobId,
+    oldData: late ? 'Late: yes' : null,
+    newData: `${NEW_DATA_TOKEN[LOG_FOR.CUSTOMER_PIN_VERIFIED]}_${positiveIntOrNull(jobId)}`,
+    actor,
+    at,
+  });
+}
+
+/*
+ * The two SYSTEM-AWARDED charges (V3 2.3 and 2.6), each on its own log_for.
+ *
+ * WHY MONEY EVENTS BELONG IN JOB HISTORY AT ALL. services/job-incentive.service.js
+ * writes a job_material row and a logger.info line. The row is the money; the
+ * log line is invisible on the job and rolls off. When a technician asks "why
+ * was I paid 50 more on that job" — or an operator asks "who authorised billing
+ * this client 250" — the question is asked ON THE JOB, and today the only
+ * honest answer is a SELECT against job_material by a developer.
+ *
+ * THE AMOUNT IS COMPOSED HERE FROM A NUMBER, not passed as text: the callers
+ * hand over the figure job-incentive.service.js already computed, it goes
+ * through intOrNull(), and a non-numeric amount writes no row rather than
+ * smuggling a string into a table this module promises holds none. That keeps
+ * the NO-CALLER-SUPPLIED-FREE-TEXT rule above literally true.
+ *
+ * Both are best-effort like every other write here, and both are called only
+ * when the award actually inserted — `awardOnce` returns true exactly once per
+ * job per reason, so the history cannot double-count a retry that the charge
+ * itself correctly refused.
+ */
+async function logIncentiveAwarded(jobId, { amount = null } = {}, actor, at) {
+  const rupees = intOrNull(amount);
+  if (rupees === null) return null;
+  return write({
+    logFor: LOG_FOR.INCENTIVE_AWARDED,
+    jobId,
+    oldData: `Amount: ${rupees}`,
+    newData: `${NEW_DATA_TOKEN[LOG_FOR.INCENTIVE_AWARDED]}_${positiveIntOrNull(jobId)}`,
+    actor,
+    at,
+  });
+}
+
+async function logVisitChargeAwarded(jobId, { amount = null } = {}, actor, at) {
+  const rupees = intOrNull(amount);
+  if (rupees === null) return null;
+  return write({
+    logFor: LOG_FOR.VISIT_CHARGE_AWARDED,
+    jobId,
+    oldData: `Amount: ${rupees}`,
+    newData: `${NEW_DATA_TOKEN[LOG_FOR.VISIT_CHARGE_AWARDED]}_${positiveIntOrNull(jobId)}`,
+    actor,
+    at,
+  });
+}
+
+/*
+ * ── V3 PHASE 3 WRITERS (2026-09-24) ─────────────────────────────────────────
+ *
+ * Thirteen events, one shape: `(jobId, details, actor, at)`, a log_for of their
+ * own, new_data `<token>_<jobId>`, eta_status NULL. Built by one factory rather
+ * than thirteen copies of logIncentiveAwarded, because the only thing that
+ * varies is how `details` becomes old_data — and that is exactly the part the
+ * NO-CALLER-SUPPLIED-FREE-TEXT rule governs, so it is written once per event
+ * below and nowhere else.
+ *
+ * old_data is composed ONLY from integers (intOrNull) or from a CLOSED
+ * vocabulary. A value outside the vocabulary writes NO row rather than a row
+ * carrying the caller's string: a history table that promises no free text
+ * cannot take "whatever the route happened to pass" on the one field a
+ * reader renders verbatim. `null` from the composer means "refuse".
+ *
+ * Every writer is fail-soft (write() swallows) and must be called AFTER the
+ * caller's commit — the module header explains why.
+ */
+const NO_DETAIL = () => undefined;       // event carries nothing beyond its name
+const oneOf = (allowed, label, v) => (allowed.includes(v) ? `${label}: ${v}` : null);
+const HELP_REASONS_LOGGED = ['gate', 'arguing', 'unsure', 'colour', 'unsafe'];
+const CLAIM_KINDS_LOGGED = ['cant_complete', 'cancel', 'additional_work', 'help'];
+const QC_OUTCOMES_LOGGED = ['passed', 'auto', 'disputed'];
+
+function phase3Writer(logFor, compose) {
+  return async function writer(jobId, details = {}, actor, at) {
+    const oldData = compose(details || {});
+    if (oldData === null) return null;
+    return write({
+      logFor,
+      jobId,
+      oldData: oldData === undefined ? null : oldData,
+      newData: `${NEW_DATA_TOKEN[logFor]}_${positiveIntOrNull(jobId)}`,
+      actor,
+      at,
+    });
+  };
+}
+
+const logAdditionalWorkReported = phase3Writer(LOG_FOR.ADDITIONAL_WORK_REPORTED, NO_DETAIL);
+// Both figures, or no row: a priced event without its price is the one row a
+// reader would open to find the number.
+const logAdditionalWorkPriced = phase3Writer(LOG_FOR.ADDITIONAL_WORK_PRICED, ({ clientAmount, txAmount }) => {
+  const c = intOrNull(clientAmount);
+  const t = intOrNull(txAmount);
+  return c === null || t === null ? null : `Client: ${c} Tx: ${t}`;
+});
+const logAdditionalWorkReturned = phase3Writer(LOG_FOR.ADDITIONAL_WORK_RETURNED, NO_DETAIL);
+const logAdditionalWorkApproved = phase3Writer(LOG_FOR.ADDITIONAL_WORK_APPROVED, NO_DETAIL);
+const logLeftSite = phase3Writer(LOG_FOR.LEFT_SITE, NO_DETAIL);
+const logBookedMeanwhile = phase3Writer(LOG_FOR.BOOKED_MEANWHILE,
+  ({ answer }) => oneOf(['yes', 'no'], 'Answer', answer));
+// The reason ID, never its label: the label lives in action_taken_reason and a
+// reader resolves it, exactly as tbl_job.enum_reason_id is resolved.
+const logCannotCompleteReported = phase3Writer(LOG_FOR.CANNOT_COMPLETE_REPORTED, ({ reasonId }) => {
+  const id = positiveIntOrNull(reasonId);
+  return id === null ? null : `Reason: ${id}`;
+});
+const logClaimUndone = phase3Writer(LOG_FOR.CLAIM_UNDONE,
+  ({ kind }) => oneOf(CLAIM_KINDS_LOGGED, 'Kind', kind));
+const logHelpRequested = phase3Writer(LOG_FOR.HELP_REQUESTED,
+  ({ reason }) => oneOf(HELP_REASONS_LOGGED, 'Reason', reason));
+const logHelpPickedUp = phase3Writer(LOG_FOR.HELP_PICKED_UP, NO_DETAIL);
+const logJobVerified = phase3Writer(LOG_FOR.JOB_VERIFIED, NO_DETAIL);
+const logClientQc = phase3Writer(LOG_FOR.CLIENT_QC,
+  ({ outcome }) => oneOf(QC_OUTCOMES_LOGGED, 'Outcome', outcome));
+const logLedgerPosted = phase3Writer(LOG_FOR.LEDGER_POSTED, NO_DETAIL);
+
+/*
+ * V3 Phase 4 — same factory, same no-free-text rule. The signature's SVG is
+ * never logged (it is the customer's mark, and it lives in tbl_job_signature);
+ * the tools row carries only how many are now set (0 = cleared); the products
+ * row only which way the list moved; visit two only its visit number.
+ */
+const SITE_PRODUCT_CHANGES_LOGGED = ['added', 'removed'];
+const logSignatureTaken = phase3Writer(LOG_FOR.SIGNATURE_TAKEN, NO_DETAIL);
+const logToolsSet = phase3Writer(LOG_FOR.TOOLS_SET, ({ count }) => {
+  const n = intOrNull(count);
+  return n === null || n < 0 ? null : `Count: ${n}`;
+});
+const logSiteProductsChanged = phase3Writer(LOG_FOR.SITE_PRODUCTS_CHANGED,
+  ({ change }) => oneOf(SITE_PRODUCT_CHANGES_LOGGED, 'Change', change));
+const logVisitTwoScheduled = phase3Writer(LOG_FOR.VISIT_TWO_SCHEDULED, ({ visitNumber }) => {
+  const n = positiveIntOrNull(visitNumber);
+  return n === null ? null : `Visit: ${n}`;
+});
+
+/*
+ * ── THE READ SIDE (V3 plan 3.1, 2026-09-23) ─────────────────────────────────
+ *
+ * Until now this module could only WRITE. tbl_job_logs has been accumulating
+ * since 2015 and nothing in the new stack has ever shown a row of it to
+ * anybody: the CRM has five separate history surfaces (reschedule history,
+ * scheduling history, call history, customer history, the Audit & History
+ * card) and none of them is this table. That is what V3 3.1 means by "job
+ * event stream ... gates 3.2-3.7" — the writes already exist, the FEED does
+ * not, and every downstream item (the ops desk's "Pending on" and "Start
+ * proof", the verification queue, the waiting-for groups) is a READER of it.
+ *
+ * ONE ACTOR NAMESPACE COMING BACK OUT, AS IT WENT IN. ACTOR_RULE above splits
+ * an actor across two columns on write: an operator lands in changed_by, a
+ * technician lands in comments as '(efr:N)' with changed_by = 0. A reader that
+ * only joined tbl_user would therefore render every technician action as
+ * nobody. So this resolves BOTH sides and returns a single shaped `actor`, and
+ * the parsing is anchored to the exact string resolveActor() writes rather
+ * than a loose /efr:(\d+)/ that a future comments format could break silently.
+ *
+ * THE QUERY BUDGET IS THREE, NOT ONE-PER-ROW. One SELECT for the rows, one for
+ * whatever operators appear, one for whatever technicians appear — and the last
+ * two are skipped entirely when nobody of that kind acted. A correlated join to
+ * tbl_user would have been one query, but tbl_easyfixer cannot be joined at all
+ * (the efr id is inside a tinytext), and a per-row lookup on a job with 40
+ * events is 40 round trips on a screen an operator opens all day. This backend
+ * serves the CRM, the app and the client dashboard from one MySQL; a read this
+ * casual to write is exactly where that gets spent.
+ *
+ * NEWEST LAST. The table is an append-only history and every existing reader of
+ * it (and the CRM's own scheduling history) reads oldest-first, so a feed that
+ * flipped the order here would disagree with the screen beside it. `limit`
+ * therefore takes the MOST RECENT rows and returns them ascending, which is
+ * what a capped feed has to mean — taking the oldest 200 of 400 would show a
+ * job's first day forever and never its last.
+ */
+const ACTIVITY_LIMIT_DEFAULT = 200;
+const ACTIVITY_LIMIT_MAX = 500;
+
+// Anchored to what resolveActor() writes: 'Changed by New CRM App (efr:123)'.
+const APP_EFR_RE = new RegExp('^' + SOURCE.APP.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ' \\(efr:(\\d+)\\)$');
+
+/*
+ * Which writer produced a row, from `comments` alone.
+ *
+ * 'legacy' is not a failure case — it is 1.3 million rows written by the old
+ * CRM ('Changed by CRM') and the old API ('Changed by Api') before this backend
+ * existed, and a feed that hid them would be missing most of a long job's life.
+ * Anything unrecognised is 'legacy' too rather than 'system', because claiming
+ * a row we cannot attribute was written by US is the one wrong answer.
+ */
+function sourceOf(comments) {
+  const c = String(comments || '');
+  if (APP_EFR_RE.test(c)) return 'app';
+  if (c === SOURCE.CRM) return 'crm';
+  if (c === SOURCE.SYSTEM) return 'system';
+  return 'legacy';
+}
+
+async function listForJob(jobId, { limit = ACTIVITY_LIMIT_DEFAULT } = {}) {
+  const id = positiveIntOrNull(jobId);
+  if (!id) return [];
+  const cap = Math.min(Math.max(positiveIntOrNull(limit) || ACTIVITY_LIMIT_DEFAULT, 1), ACTIVITY_LIMIT_MAX);
+
+  // Ordered DESC so LIMIT keeps the RECENT end, then reversed below.
+  const [rows] = await pool.query(
+    `SELECT job_log_id, log_for, old_data, new_data, eta_status,
+            change_date, changed_by, comments
+       FROM tbl_job_logs
+      WHERE job_id = ?
+      ORDER BY change_date DESC, job_log_id DESC
+      LIMIT ?`,
+    [id, cap],
+  );
+  if (!rows.length) return [];
+
+  const userIds = [...new Set(rows.map((r) => positiveIntOrNull(r.changed_by)).filter(Boolean))];
+  const efrIds = [...new Set(rows
+    .map((r) => (String(r.comments || '').match(APP_EFR_RE) || [])[1])
+    .filter(Boolean)
+    .map(Number))];
+
+  const users = new Map();
+  if (userIds.length) {
+    const [us] = await pool.query(
+      'SELECT user_id, user_name FROM tbl_user WHERE user_id IN (?)', [userIds]);
+    for (const u of us) users.set(Number(u.user_id), u.user_name || null);
+  }
+  const techs = new Map();
+  if (efrIds.length) {
+    const [es] = await pool.query(
+      'SELECT efr_id, efr_name FROM tbl_easyfixer WHERE efr_id IN (?)', [efrIds]);
+    for (const e of es) techs.set(Number(e.efr_id), e.efr_name || null);
+  }
+
+  return rows.reverse().map((r) => {
+    const source = sourceOf(r.comments);
+    const efrId = source === 'app'
+      ? Number((String(r.comments).match(APP_EFR_RE) || [])[1]) : null;
+    const userId = positiveIntOrNull(r.changed_by);
+    return {
+      id: Number(r.job_log_id),
+      event: r.log_for,
+      from: r.old_data,
+      to: r.new_data,
+      etaStatus: r.eta_status,
+      at: r.change_date,
+      source,
+      actor: {
+        kind: source === 'app' ? 'technician' : (source === 'crm' ? 'user' : source),
+        // An id we can join, or null. Never the other namespace's id.
+        userId: source === 'crm' ? userId : null,
+        efrId,
+        // A name when we have one. Never a fabricated placeholder: 'System' is
+        // a real answer, an unresolved id is not.
+        name: source === 'app'
+          ? (techs.get(efrId) || null)
+          : (source === 'crm' ? (users.get(userId) || null) : null),
+      },
+      // The legacy writer's own words, so an operator can see WHICH stack wrote
+      // a row without this module having to translate a decade of provenance.
+      writtenBy: r.comments || null,
+    };
+  });
+}
+
 module.exports = {
   logNewJob,
   logSchedule,
@@ -632,6 +1014,29 @@ module.exports = {
   logStatusChange,
   logCustomerPinResent,
   logCompletedWithoutCustomerPin,
+  logCustomerPinVerified,
+  logIncentiveAwarded,
+  logVisitChargeAwarded,
+  logAdditionalWorkReported,
+  logAdditionalWorkPriced,
+  logAdditionalWorkReturned,
+  logAdditionalWorkApproved,
+  logLeftSite,
+  logBookedMeanwhile,
+  logCannotCompleteReported,
+  logClaimUndone,
+  logHelpRequested,
+  logHelpPickedUp,
+  logJobVerified,
+  logClientQc,
+  logLedgerPosted,
+  logSignatureTaken,
+  logToolsSet,
+  logSiteProductsChanged,
+  logVisitTwoScheduled,
+  listForJob,
+  ACTIVITY_LIMIT_MAX,
+  sourceOf,
   // Exported for tests + for anyone auditing the conventions against production.
   LOG_FOR,
   ETA_STATUS,

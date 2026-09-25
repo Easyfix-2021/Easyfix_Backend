@@ -4,6 +4,8 @@ const Joi = require('joi');
 const validate = require('../../middleware/validate');
 const { modernOk, modernError } = require('../../utils/response');
 const lifecycle = require('../../services/mobile-job-lifecycle.service');
+const claims = require('../../services/mobile-job-claims.service');
+const { MAX_PROOF_IDS } = require('../../services/job-tx-report.service');
 const logger = require('../../logger');
 
 /*
@@ -40,29 +42,48 @@ function handleErr(res, next, e) {
 }
 
 // ─── Cancel REQUEST (legacy actionType 27) ──────────────────────────
-// POST /jobs/:id/cancel { reason, reasonId } → records the technician's ASK.
-// It does NOT cancel the job — ops actions it later from the CRM. See THE
-// REQUEST MODEL in services/mobile-job-lifecycle.service.js.
+// POST /jobs/:id/cancel { reasonId, proofImageIds[], reason? } → records the
+// technician's ASK. It does NOT cancel the job — ops actions it later from the
+// CRM. See THE REQUEST MODEL in services/mobile-job-lifecycle.service.js.
 //
 // `reasonId` comes from GET /shared/lookup/app-cancel-reasons
 // (action_taken_reason, action_type 27, user_type 4).
+//
+// V3 3.6b (design sheet 08c, 2026-09-24): "proof is required, and EasyFix
+// verifies with the customer before anything closes — a cancellation reported
+// by a technician is a claim, not a decision." So:
+//   · proofImageIds is REQUIRED (≥1 'Proof' photo on this job) and checked
+//     BEFORE the ask is recorded, so a bad photo id never leaves a half-ask;
+//   · the remark became optional on the sheet (it always was on the wire);
+//   · he reached → ₹250 visit charge, recorded with the proof on a 'cancel'
+//     tbl_job_tx_report row (mobile-job-claims recordCancelClaim).
+// The job row is read BEFORE lifecycle.cancel() because the request model
+// parks the job at 1, and both the ₹250 test and the undo need the status he
+// was really in.
 router.post(
   '/:id/cancel',
   validate(idParam, 'params'),
   validate(Joi.object({
     reason:   Joi.string().trim().max(500).optional().allow('', null),
     reasonId: Joi.number().integer().positive().required(),
+    proofImageIds: Joi.array().items(Joi.number().integer().positive()).min(1).max(MAX_PROOF_IDS).required(),
   })),
   async (req, res, next) => {
     try {
-      logger.info('Cancel request · jobId=' + req.params.id + ' · reasonId=' + req.body.reasonId);
+      const jobId = Number(req.params.id);
+      logger.info('Cancel request · jobId=' + jobId + ' · reasonId=' + req.body.reasonId);
+      const before = await lifecycle.getOwnedJob(jobId, req.tech.efr_id);
+      await claims.assertProofOnJob(jobId, req.body.proofImageIds);
       const out = await lifecycle.cancel(
-        Number(req.params.id),
+        jobId,
         req.tech.efr_id,
         { reason: req.body.reason || null, reasonId: req.body.reasonId },
       );
-      logger.info('Cancel request recorded · id=' + req.params.id);
-      modernOk(res, out);
+      const claim = await claims.recordCancelClaim(before, req.tech.efr_id, {
+        reasonId: req.body.reasonId, proofImageIds: req.body.proofImageIds,
+      }, req.tech.user_id || req.tech.efr_id);
+      logger.info('Cancel request recorded · id=' + jobId);
+      modernOk(res, { ...out, ...claim });
     } catch (e) { logger.warn('Cancel request failed · jobId=' + req.params.id + ' · ' + e.message); handleErr(res, next, e); }
   },
 );

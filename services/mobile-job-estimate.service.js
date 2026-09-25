@@ -142,7 +142,19 @@ function assertTechLineEditable(state) {
 // mobile estimate flow records refs (caller already uploaded the bytes, or
 // will once multipart ships — see // VERIFY in the route), so this service
 // only stores the canonical key string into tbl_job_image.image.
-const IMAGE_CATEGORIES = new Set(['Booking', 'Completion']);
+const IMAGE_CATEGORIES = new Set(['Booking', 'Completion', 'Proof']);
+
+/*
+ * 'Proof' (V3 3.6a/b, 2026-09-24) — the photo behind a cannot-complete or
+ * cancel claim. Its window is WIDER at the front than a work photo's: a
+ * technician turned away at the door (no entry, product not delivered) has
+ * never checked in, so the job is still at 1 — and "a claim with a photo is
+ * one EasyFix can defend on his behalf" (design sheet 13) only holds if he can
+ * take that photo there. 2 / 20 are the checked-in states. Anything else (a
+ * closed, cancelled or not-yet-his job) is refused: a proof photo only means
+ * something while the claim it proves can still be raised.
+ */
+const PROOF_UPLOAD_STATUSES = new Set([1, 2, 20]);
 
 /*
  * Ownership guard — returns the job row's scope fields IFF the job exists
@@ -818,26 +830,39 @@ async function recordImages(jobId, efrId, { category, refs }) {
     logger.warn('Record images rejected · invalid image category · category=' + category);
     const e = new Error('invalid image category'); e.status = 400; throw e;
   }
-  const jobStage = category === 'Completion' ? 5 : 0;
+  const isProof = category === 'Proof';
+  if (isProof && !PROOF_UPLOAD_STATUSES.has(Number(job.job_status))) {
+    logger.warn('Record images rejected · proof outside its window · jobId=' + jobId + ' · status=' + job.job_status);
+    const e = new Error('proof photos can only be added before or during the visit'); e.status = 409; throw e;
+  }
+  // A proof row is stamped with the stage it was taken AT (1 = at the door,
+  // 2/20 = on site) — the same "stage = the job's status then" meaning the
+  // legacy writers give job_stage — rather than borrowing Booking's 0.
+  const jobStage = category === 'Completion' ? 5 : (isProof ? Number(job.job_status) : 0);
   const cleaned = (Array.isArray(refs) ? refs : [])
     .map((r) => String(r || '').trim())
     .filter(Boolean);
-  if (cleaned.length === 0) return { ok: true, inserted: 0 };
+  if (cleaned.length === 0) return { ok: true, inserted: 0, imageIds: [] };
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     const createdDate = new Date();
+    // imageIds (2026-09-24): a claim names its proof by tbl_job_image id
+    // (POST /jobs/:id/cant-complete { proofImageIds }), and this is the only
+    // place the app can learn those ids. Additive — `inserted` is unchanged.
+    const imageIds = [];
     for (const ref of cleaned) {
-      await conn.query(
+      const [ins] = await conn.query(
         `INSERT INTO tbl_job_image (job_id, image, image_category, job_stage, created_date)
          VALUES (?, ?, ?, ?, ?)`,
         [jobId, ref, persistedCategory(category), jobStage, createdDate],
       );
+      if (ins && ins.insertId) imageIds.push(Number(ins.insertId));
     }
     await conn.commit();
     logger.info('Recorded ' + cleaned.length + ' job images · jobId=' + jobId + ' · category=' + category);
-    return { ok: true, inserted: cleaned.length };
+    return { ok: true, inserted: cleaned.length, imageIds };
   } catch (e) {
     logger.error('Record images failed, rolled back · jobId=' + jobId + ' · ' + e.message);
     await conn.rollback();

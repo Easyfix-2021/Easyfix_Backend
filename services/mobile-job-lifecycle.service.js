@@ -172,7 +172,8 @@ async function hasJobColumn(colName) {
  */
 async function getOwnedJob(jobId, efrId) {
   const [[row]] = await pool.query(
-    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id, otp
+    `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id, otp,
+            checkin_date_time
        FROM tbl_job WHERE job_id = ? LIMIT 1`,
     [jobId],
   );
@@ -1027,6 +1028,10 @@ module.exports = {
   getQuestionnaire,
   submitQuestionnaire,
   getWorkProgress,
+  // The ownership guard, shared with routes/mobile/jobs-phase3.js (V3 Phase 3)
+  // so the claim routes 404 exactly the way cancel / reschedule do.
+  // checkin_date_time rides along for the ₹250 "he reached" test.
+  getOwnedJob,
   // The request model's wire constants — exported so callers and tests read
   // the one definition instead of re-typing a legacy code.
   STATUS_REQUEST_PENDING,

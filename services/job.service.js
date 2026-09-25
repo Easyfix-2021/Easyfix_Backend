@@ -676,7 +676,11 @@ const LIST_COLUMNS = `
    * NOTE: this comment lives INSIDE a template literal and ships to MySQL as a
    * SQL comment -- no backticks in here, they would end the literal.
    */
-  j.fk_address_id, ci.city_name, ad.address, ad.gps_location, ad.pin_code,
+  /*
+   * + ad.locality (V3 2.7, 2026-09-23): the technician list shows the locality
+   *   under the city; off the same tbl_address join, no extra cost.
+   */
+  j.fk_address_id, ci.city_name, ad.address, ad.gps_location, ad.locality, ad.pin_code,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -4391,6 +4395,56 @@ async function resolveSelfie(selfieId, jobId) {
 }
 
 /*
+ * The CUSTOMER'S OWN VIDEO of the fault (V3 plan 2.15, 2026-09-23).
+ *
+ * Nothing new is captured here. Customers have been uploading these for months
+ * — the public booking page (routes/public/job-completion.js) and the WhatsApp
+ * conversation flow both write them to tbl_job_media with category
+ * 'BookingVideo' — and until now the only way to watch one was the CRM's
+ * /api/admin/jobs/videos/:mediaId/file redirect. The person who most needs to
+ * see the fault before choosing what to put in the van could not.
+ *
+ * PRESIGNED ON THE PAYLOAD, not a redirect. The CRM serves a 302 because a
+ * browser <video> tag follows it; the app reads URLs off the job like it
+ * already does for images[].image_url and selfie_url, and a redirect would
+ * need a bearer the media element cannot send.
+ *
+ * COSTS ONE INDEXED SELECT, AND NOTHING ELSE, ON A JOB WITH NO VIDEO. The
+ * presign only happens for rows that exist — the same rule resolveSelfie
+ * follows above, for the same reason: most jobs have none.
+ *
+ * A row whose S3 object has gone is DROPPED rather than returned with a null
+ * url. A video tile that cannot play is worse than no tile.
+ */
+async function resolveJobMedia(jobId) {
+  const s3Storage = require('../utils/s3-storage');
+  const [rows] = await pool.query(
+    `SELECT media_id, s3_key, content_type
+       FROM tbl_job_media
+      WHERE job_id = ?
+      ORDER BY media_id`,
+    [jobId],
+  );
+  if (!rows.length || !s3Storage.isEnabled()) return [];
+  const out = [];
+  for (const r of rows) {
+    const key = String(r.s3_key || '').trim();
+    if (!key) continue;
+    try {
+      if (!(await s3Storage.exists(key))) continue;
+      out.push({
+        mediaId: Number(r.media_id),
+        url: await s3Storage.getPresignedUrl(key),
+        contentType: r.content_type || null,
+      });
+    } catch (e) {
+      logger.warn('Job media presign failed · jobId=' + jobId + ' · mediaId=' + r.media_id + ' · ' + e.message);
+    }
+  }
+  return out;
+}
+
+/*
  * Lightweight existence + status check. Used by setStatus / assign before they
  * mutate — skipping the 7-way join saves ~150-300ms per status change and
  * avoids loading services+images we don't use in those paths.
@@ -6879,6 +6933,22 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     extras = rest;
   }
 
+  /*
+   * bump_visit_number (V3 Phase 4, D7) — the mobile checkout's revisit branch
+   * counts the visit in THIS UPDATE, as SQL arithmetic rather than a value read
+   * earlier, so two writers cannot both land the same number. Skipped when the
+   * job is already at 10: a retried revisit checkout is the same visit.
+   * COALESCE because legacy rows carry NULL for "the first visit".
+   */
+  if (extras && typeof extras === 'object' && 'bump_visit_number' in extras) {
+    if (extras.bump_visit_number === true && Number(existing.job_status) !== STATUS.REVISIT) {
+      sets.push('visit_number = COALESCE(visit_number, 1) + 1');
+    }
+    const rest = { ...extras };
+    delete rest.bump_visit_number;
+    extras = rest;
+  }
+
   // Tier-specific extras — caller passes a map of column→value pairs
   // for transition side-effects that don't generalise (mobile GPS
   // checkin, app_checkout_date_time, etc.). Whitelisted to prevent
@@ -9080,7 +9150,7 @@ module.exports = {
   // The tbl_job_services audit-column probe create() stamps with — exported so
   // the one-list services editor stamps new rows the same way.
   jobServicesCreatedByColumn,
-  list, getById, getByIdCore, resolveSelfie, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
+  list, getById, getByIdCore, resolveSelfie, resolveJobMedia, getStatusCounts, getPendingSchedulingCounts, getPendingStartCounts, getAttentionSummary, create, update, setStatus, assign, reschedule, unassign, acceptOffer, changeOwner,
   /*
    * The job's inherited Project Manager / Zonal Manager display names. Exported
    * because they are DERIVED, not columns — every surface that shows either one

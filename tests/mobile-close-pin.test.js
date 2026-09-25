@@ -30,7 +30,9 @@ const { installFakePool } = require('./helpers/fake-pool');
 
 // Never touch a DB: patch the shared pool singleton BEFORE the router (and the
 // services it pulls in) capture their `pool` reference.
-const fake = installFakePool([]);
+// closeProof (V3 Phase 4): a PIN verified earlier / a signature on file. None by default.
+let PROOF = { pin_verified: 0, signed: 0 };
+const fake = installFakePool([[/AS pin_verified/, () => [PROOF]]]);
 
 // Auth / capability / idempotency layers are not under test — seed
 // require.cache with pass-throughs before the router asks for them.
@@ -92,7 +94,7 @@ after(async () => {
   if (fake.restore) fake.restore();
 });
 
-beforeEach(() => { captured = null; });
+beforeEach(() => { captured = null; PROOF = { pin_verified: 0, signed: 0 }; });
 
 async function checkout(body) {
   const r = await fetch(`${baseUrl}/mobile/jobs/42/checkout`, {
@@ -105,10 +107,11 @@ async function checkout(body) {
 
 // ─── The gate ────────────────────────────────────────────────────────
 
-test('closing WITHOUT the PIN is rejected before any write', async () => {
+test('closing WITHOUT the PIN (and no earlier PIN or signature) is rejected before any write', async () => {
   const res = await checkout({});
-  assert.equal(res.status, 409, 'the PIN is mandatory to close');
-  assert.equal(res.body?.error?.code, 'INVALID_CHECKOUT_PIN');
+  assert.equal(res.status, 409, 'the PIN — or, since V3 Phase 4, a signature — is mandatory to close');
+  assert.equal(res.body?.error?.code, 'PIN_OR_SIGNATURE_REQUIRED');
+  assert.equal(res.body?.error?.pinOnJob, true, 'this job has a PIN, so "Enter PIN now" is offered');
   assert.equal(captured, null, 'no status write may happen on a PIN failure');
 });
 
@@ -120,12 +123,13 @@ test('closing with the WRONG PIN is rejected before any write', async () => {
   assert.equal(captured, null);
 });
 
-test('the missing-PIN message differs from the wrong-PIN one, under one code', async () => {
-  // One code because the app does the same thing either way (prompt + Resend);
-  // two sentences because the technician needs to know which it was.
+test('a missing PIN and a wrong PIN are different codes now', async () => {
+  // V3 Phase 4 (D6): missing offers the signature as well as the PIN, so the
+  // app does something different for it; wrong is still a PIN-field error.
   const missing = await checkout({});
   const wrong = await checkout({ otp: '9999' });
-  assert.equal(missing.body?.error?.code, wrong.body?.error?.code);
+  assert.equal(missing.body?.error?.code, 'PIN_OR_SIGNATURE_REQUIRED');
+  assert.equal(wrong.body?.error?.code, 'INVALID_CHECKOUT_PIN');
   assert.notEqual(missing.body?.error?.message, wrong.body?.error?.message);
 });
 
@@ -147,21 +151,48 @@ test('a revisit close is gated the same way and still routes to REVISIT', async 
 
 // ─── The regression that would strand every old job ──────────────────
 
-test('a job with NO PIN on the row is still closable', async () => {
+test('a job with NO PIN on the row is still closable — by the customer\'s signature', async () => {
   // Most jobs predate the PIN, or never went through the BOOKED-confirm path
-  // that mints one. Enforcing unconditionally makes them uncloseable forever.
+  // that mints one. They must never be uncloseable: since V3 Phase 4 (D6) the
+  // signature closes them; without it the refusal says only a signature can.
   jobService.getById = async () => ({ ...JOB, otp: null });
+  const blocked = await checkout({});
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.body?.error?.code, 'PIN_OR_SIGNATURE_REQUIRED');
+  assert.equal(blocked.body?.error?.pinOnJob, false, 'no PIN on the row → no PIN to offer');
+  assert.equal(captured, null);
+  PROOF = { pin_verified: 0, signed: 1 };
   const res = await checkout({});
-  assert.equal(res.status, 200, 'no PIN on the row → no PIN to demand');
+  assert.equal(res.status, 200, 'signed → closes');
   assert.equal(captured.status, 3);
+  // A PIN-less REVISIT keeps the old rule: nothing to demand.
+  PROOF = { pin_verified: 0, signed: 0 };
+  captured = null;
+  assert.equal((await checkout({ isNextVisit: true })).status, 200);
+  assert.equal(captured.status, 10);
   jobService.getById = async () => ({ ...JOB });
 });
 
 test('an empty-string PIN on the row counts as no PIN, not as a PIN of ""', async () => {
   jobService.getById = async () => ({ ...JOB, otp: '   ' });
   const res = await checkout({});
-  assert.equal(res.status, 200);
+  assert.equal(res.body?.error?.pinOnJob, false, 'treated as a job with no PIN');
+  PROOF = { pin_verified: 0, signed: 1 };
+  assert.equal((await checkout({})).status, 200);
   jobService.getById = async () => ({ ...JOB });
+});
+
+test('a PIN verified EARLIER on the job closes it with no PIN in the body, and spends no guess', async () => {
+  PROOF = { pin_verified: 1, signed: 0 };
+  for (let i = 0; i < 7; i++) {
+    captured = null;
+    const r = await checkoutJob(108, {});
+    assert.equal(r.status, 200, 'D6: "Start PIN was taken" — no second PIN');
+    assert.equal(captured.status, 3);
+  }
+  PROOF = { pin_verified: 0, signed: 0 };
+  assert.equal((await checkoutJob(108, { otp: '0000' })).body.error.attemptsRemaining, 4,
+    'seven proof closes left the whole budget');
 });
 
 // ─── CRM safety: the gate must never migrate into the shared service ─
@@ -234,7 +265,7 @@ test('the lock lifts by itself after 30 minutes', async () => {
 test('a missing PIN is not a guess — it never counts toward the lock', async () => {
   for (let i = 0; i < 10; i++) {
     const r = await checkoutJob(103, {});
-    assert.equal(r.body.error.reason, 'PIN_MISSING');
+    assert.equal(r.body.error.code, 'PIN_OR_SIGNATURE_REQUIRED');
   }
   const r = await checkoutJob(103, { otp: '1234' });
   assert.equal(r.status, 200);

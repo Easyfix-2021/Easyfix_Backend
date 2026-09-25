@@ -39,7 +39,12 @@ const PROOF_AFTER_CATEGORIES = ['completion', 'after', 'checkout'];
 // lowercased form of the `ClientApprovalProof` tbl_job_image category, same
 // convention as 'jobsheet' / 'po' below (uploadJobImage/storeJobImageFile
 // always lowercases `category` on write).
-const DOCUMENT_CATEGORIES = ['feedback', 'po', 'jobsheet', 'questionaire', 'customer signature', 'clientapprovalproof'];
+// 'proof' (V3 3.6a/b, 2026-09-24) — the photo a technician attaches to a
+// cannot-complete or cancel CLAIM (tbl_job_tx_report.proof_image_ids). It is
+// evidence that the work could NOT be done, so it must never land in the
+// before/after pair a completed job is audited on: a "product damaged" photo
+// read as a before photo makes an undone job look started.
+const DOCUMENT_CATEGORIES = ['feedback', 'po', 'jobsheet', 'questionaire', 'customer signature', 'clientapprovalproof', 'proof'];
 
 /** Lowercased, whitespace-normalised category — 'Customer Signature' → 'customer_signature'. */
 function normaliseCategory(value) {
@@ -93,7 +98,10 @@ function isPhotoFile(storedValue) {
  * One vocabulary in the column, two spellings on the wire, and readers keep
  * accepting both — 445k historical rows are not going to be rewritten.
  */
-const WRITE_CATEGORY = { Booking: 'checkin', Completion: 'checkout' };
+const WRITE_CATEGORY = { Booking: 'checkin', Completion: 'checkout', Proof: 'proof' };
+
+/** The claim-proof category as STORED — see DOCUMENT_CATEGORIES. */
+const PROOF_CLAIM_CATEGORY = 'proof';
 
 /**
  * The value to STORE for an app-supplied category. Unknown categories pass
@@ -112,4 +120,5 @@ module.exports = {
   sqlCategoryList,
   isPhotoFile,
   persistedCategory,
+  PROOF_CLAIM_CATEGORY,
 };

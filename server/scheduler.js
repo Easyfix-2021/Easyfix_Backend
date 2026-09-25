@@ -1549,6 +1549,50 @@ You can also run it on demand from Manage Pincodes ("Refresh Status") or with Tr
     logger.info('Serviceable-pincode recompute cron registered (03:45 IST nightly).');
   }
 
+  // ─── Client QC auto-pass + ledger post — every 15 min ────────────────
+  // (Added 2026-09-24, V3 3.8 / 3.11) Default-ON kill switch, like the offer
+  // expiry above: it only ever touches jobs the desk has ALREADY verified, and
+  // with it off a verified job's money never reaches the technician unless the
+  // client clicks — the design's promise is "auto-approves on their timer".
+  const jobVerification = require('../services/job-verification.service');
+  const qcAutoPassJob = registerJob({
+    id: 'job-qc-auto-pass',
+    name: 'Client QC Auto-Pass And Ledger Post',
+    description:
+`What this task does: After EasyFix passes its audit of a finished job, the client gets a window (usually 24 hours, set per client) to check the work. This task closes that window and pays the technician. Step by step:
+  1. Every 15 minutes, the task wakes up automatically.
+  2. It finds up to ${jobVerification.AUTO_PASS_BATCH} audited jobs whose client QC window has run out without the client approving or disputing, and marks them "auto-approved".
+  3. For those, and for any job the client approved whose payment has not gone through yet, it posts the job's completion to the ledger — the technician's wallet, EasyFix and the client's account — exactly as a CRM completion does. Up to ${jobVerification.AUTO_PASS_BATCH} per run, one at a time.
+  4. A job that is already posted is skipped, so running it twice never pays twice. A job that cannot be posted (for example Collected By is not set) is noted on the job and tried again next run.
+  5. It logs how many jobs were due, auto-approved, posted and not posted.
+
+Why this matters: the technician's money reaches his wallet only after the client's quality check. Without this task a client who never clicks would hold his money forever.
+
+Note: runs unless the property "job.qc.auto_pass.enabled" is "false" (checked at server start).`,
+    cron: '*/15 * * * *',
+    runner: async () => {
+      const r = await jobVerification.runQcAutoPass();
+      logger.info(`Client QC auto-pass · due=${r.due || 0} · autoPassed=${r.autoPassed || 0} · posted=${r.posted || 0} · notPosted=${r.notPosted || 0}`
+        + (r.skipped ? ` (skipped: ${r.reason})` : ''));
+      return r;
+    },
+  });
+  const qcAutoPassEnabled = String(getProperty('job.qc.auto_pass.enabled') ?? '').toLowerCase() !== 'false';
+  if (cronDisabled) {
+    qcAutoPassJob.skipReason = 'CRON_DISABLED=true';
+  } else if (!qcAutoPassEnabled) {
+    qcAutoPassJob.skipReason = "property 'job.qc.auto_pass.enabled' is 'false' — set it to 'true' (or remove it) and restart to enable";
+    logger.info("Client QC auto-pass cron SKIPPED — job.qc.auto_pass.enabled=false in easyfix_properties.");
+  } else {
+    qcAutoPassJob.task = cron.schedule(
+      qcAutoPassJob.cron,
+      () => invokeJob(qcAutoPassJob, 'cron'),
+      { timezone: TZ },
+    );
+    qcAutoPassJob.registered = true;
+    logger.info('Client QC auto-pass cron registered (every 15 min IST).');
+  }
+
   // ─── Issue screenshot retention — closed + 1 month ───────────────────
   const issueScreenshotCleanup = require('../services/issue-screenshot-cleanup-cron');
   const issueScreenshotCleanupJob = registerJob({

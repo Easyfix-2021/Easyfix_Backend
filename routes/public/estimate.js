@@ -295,6 +295,11 @@ router.patch('/:token/approve', peekToken, tokenRateLimit, permissionFileUploadO
         [clientContactId, new Date(), jobId],
       ),
     });
+    // The magic link is the THIRD way a client approves (portal, CRM on-behalf,
+    // this). A desk-priced additional-work claim must settle here too, or the
+    // technician is paid nothing for work the client approved from an email
+    // (V3 3.3). Post-commit and fail-soft, same as the portal path.
+    await require('../../services/ops-desk.service').settleAdditionalWork(jobId, true, { user_id: linkedUserId ?? null });
     logger.info({ jobId, clientContactId, rescheduled: result.rescheduled }, 'public-estimate: approved via token link');
     return modernOk(res, {
       approved: true,
@@ -380,7 +385,9 @@ router.patch('/:token/reject', peekToken, tokenRateLimit, async (req, res, next)
           [reason, new Date(), jobId]
         );
         await stampApprovalPendingLines(conn, jobId, false);
-        await jobService.setStatus(jobId, { status: 2 }, { user_id: linkedUserId }, { conn });
+        // Same rule as the portal: see estimateRejectStatus.
+        const rejectTo = await require('../../services/job-estimate-approval').estimateRejectStatus(jobId, conn);
+        await jobService.setStatus(jobId, { status: rejectTo }, { user_id: linkedUserId }, { conn });
         await conn.commit();
       } catch (e) {
         try { await conn.rollback(); } catch { /* connection may already be gone */ }
@@ -427,6 +434,7 @@ router.patch('/:token/reject', peekToken, tokenRateLimit, async (req, res, next)
       }
     })();
 
+    await require('../../services/ops-desk.service').settleAdditionalWork(jobId, false, { user_id: null });
     return modernOk(res, { rejected: true });
   } catch (e) {
     return mapKnownError(res, next, e);

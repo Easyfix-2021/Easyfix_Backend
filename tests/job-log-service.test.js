@@ -500,6 +500,29 @@ test('every exported writer is fail-soft, not just the one we sampled', async ()
     () => jobLog.logStatusChange(42, { from: 0, to: 2 }, { user_id: 7 }),
     () => jobLog.logCustomerPinResent(42, { user_id: 7 }),
     () => jobLog.logCompletedWithoutCustomerPin(42, { pinOutstanding: true }, { user_id: 7 }),
+    // V3 3.1 — the three Phase 2 facts that used to be logger.info lines only.
+    () => jobLog.logCustomerPinVerified(42, { late: true }, { efr_id: 9 }),
+    () => jobLog.logIncentiveAwarded(42, { amount: 50 }, { efr_id: 9 }),
+    () => jobLog.logVisitChargeAwarded(42, { amount: 250 }, { efr_id: 9 }),
+    // V3 Phase 3 — the on-site claims and the desk / QC events that resolve them.
+    () => jobLog.logAdditionalWorkReported(42, {}, { efr_id: 9 }),
+    () => jobLog.logAdditionalWorkPriced(42, { clientAmount: 2000, txAmount: 1000 }, { user_id: 7 }),
+    () => jobLog.logAdditionalWorkReturned(42, {}, { user_id: 7 }),
+    () => jobLog.logAdditionalWorkApproved(42, {}, { user_id: 7 }),
+    () => jobLog.logLeftSite(42, {}, { efr_id: 9 }),
+    () => jobLog.logBookedMeanwhile(42, { answer: 'yes' }, { efr_id: 9 }),
+    () => jobLog.logCannotCompleteReported(42, { reasonId: 262 }, { efr_id: 9 }),
+    () => jobLog.logClaimUndone(42, { kind: 'cant_complete' }, { efr_id: 9 }),
+    () => jobLog.logHelpRequested(42, { reason: 'gate' }, { efr_id: 9 }),
+    () => jobLog.logHelpPickedUp(42, {}, { user_id: 7 }),
+    () => jobLog.logJobVerified(42, {}, { user_id: 7 }),
+    () => jobLog.logClientQc(42, { outcome: 'passed' }, {}),
+    () => jobLog.logLedgerPosted(42, {}, {}),
+    // V3 Phase 4 — signature, tools, products at site, visit two.
+    () => jobLog.logSignatureTaken(42, {}, { efr_id: 9 }),
+    () => jobLog.logToolsSet(42, { count: 3 }, { user_id: 7 }),
+    () => jobLog.logSiteProductsChanged(42, { change: 'added' }, { user_id: 7 }),
+    () => jobLog.logVisitTwoScheduled(42, { visitNumber: 2 }, { user_id: 7 }),
   ];
   for (const w of writers) assert.equal(await w(), null);
   // Every exported writer, not just the ones this list remembered.

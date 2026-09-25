@@ -229,6 +229,22 @@ async function visitChosenReasonId() {
  *       visit/permission step did not land and can tell the user to retry
  *       rather than silently showing a job that looks scheduled but isn't.
  */
+/*
+ * Where a job goes when the client REJECTS its estimate (V3 Phase 4, 4.3).
+ *
+ * Both reject paths (the portal and the magic link) hard-coded 2: "back to the
+ * technician, who is on site". True for every estimate before Phase 4. Not for
+ * additional work priced on a REVISIT: that technician left the site hours ago,
+ * and 2 would put a job he is not working "in progress" under his name.
+ * storePreMaterialStatus already records where the estimate came from; a job
+ * that came from 10 goes back to 10, where the desk decides the booked-only
+ * close or visit 2. Every other job keeps its 2 — nothing existing changes.
+ */
+async function estimateRejectStatus(jobId, conn) {
+  const pre = await require('./material-review-store').getPreMaterialStatus(jobId, conn);
+  return Number(pre) === 10 ? 10 : 2;
+}
+
 async function approveWithVisitSchedule(jobId, actor, opts) {
   const {
     visitDateTime, permissionChoice, permissionFile, technicianId,
@@ -293,6 +309,7 @@ async function approveWithVisitSchedule(jobId, actor, opts) {
 }
 
 module.exports = {
+  estimateRejectStatus,
   isEstimateApprovable, assertEstimateApprovable, ESTIMATE_PENDING_APPROVAL,
   stampApprovalPendingLines,
   approveEstimateLinesAndStatus,

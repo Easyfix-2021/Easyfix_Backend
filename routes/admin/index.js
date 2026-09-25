@@ -90,6 +90,9 @@ router.use('/jobs',          require('./job-magic-link')); // adds /:id/send-mag
 // read is scope-only. Mounted under /jobs; both fall through from jobs.js.
 router.use('/jobs',          require('./job-charges'));
 router.use('/jobs',          require('./job-documents'));
+// V3 Phase 4 — /:id/{tools,site-products,signature,schedule-visit-two}. Two-segment
+// paths, disjoint from the routers above; each route carries its own gate.
+router.use('/jobs',          require('./jobs-phase4'));
 router.use('/customer-requests', require('./customer-requests')); // ops inbox for tbl_job_customer_request (cancel/reschedule signals)
 router.use('/auto-assign',   require('./auto-assign'));
 router.use('/notifications', require('./notifications'));
@@ -208,6 +211,14 @@ router.use('/rewards',           require('./rewards'));
  * isIssueManage, so the admin queue would be invisible rather than empty.
  */
 router.use('/issues',            require('./issues'));
+/*
+ * V3 Phase 3 live-ops desk (2026-09-24): /ops-desk/*, /verification and the
+ * /jobs/:id/{verify,chat,money} trio. Mounted at the root because it spans
+ * three prefixes; every route in it names its full path and carries its own
+ * isJobAppRequestResolve gate. The /jobs/:id/* paths are disjoint from the
+ * /jobs routers above, which fall through to it. See routes/admin/ops-desk.js.
+ */
+router.use('/',                  require('./ops-desk'));
 // router.use('/clients',        require('./clients'));     // later
 // router.use('/users',          require('./users'));       // later
 

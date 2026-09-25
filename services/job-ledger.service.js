@@ -125,7 +125,7 @@ function ledgerMoves(collectedBy, amounts) {
 
 const signed = (move) => (move.type === DEBIT ? -move.amount : move.amount);
 
-async function loadLedgerConfig(conn) {
+async function readLedgerConfig(conn) {
   // Both exactly as legacy reads them: JobDaoImpl.getServiceTaxRate() and
   // getParamList() → param 6. 0 and 0 on QA.
   const [[tax]] = await conn.query('SELECT SUM(rate) AS rate FROM tbl_tax_rate WHERE status = 1');
@@ -134,6 +134,96 @@ async function loadLedgerConfig(conn) {
   );
   return { serviceTaxRate: num(tax && tax.rate), minEasyfixerFee: num(fee && fee.param_weightage) };
 }
+
+/*
+ * ── A CACHED READ, FOR THE READ-ONLY PATHS ONLY (2026-09-23) ──────────────
+ *
+ * WHY NOW. Until today this ran twice per completion and once per CRM audit
+ * dialog — a handful of reads a minute, and caching would have been premature.
+ * technicianSharesForJobs below puts it on the MOBILE JOB LIST, which every
+ * technician's app hits on every foreground and every pull-to-refresh. Two
+ * uncached SELECTs on that path is two SELECTs × every technician × every
+ * refresh, for two values that change perhaps twice a year.
+ *
+ * That matters more here than in most codebases: CRM, the technician app and
+ * the client dashboard are ONE backend against ONE MySQL. Load added on the
+ * app's hottest read does not degrade the app, it degrades all three.
+ *
+ * WHAT IT CACHES. `tbl_tax_rate` (a SUM over active rows) and one weightage
+ * row. Both are ops-authored config, not job data, so a stale read is a
+ * slightly-wrong SHARE for at most one TTL — never a wrong LEDGER POST, because
+ * postCompletionLedger re-reads through this same function and a posted row is
+ * immutable once written.
+ *
+ * WHAT IT MUST NEVER CACHE, AND THIS IS THE WHOLE POINT OF THE SPLIT.
+ * `loadLedgerConfig` — the function computeCompletionAmounts calls, which is
+ * the function a LEDGER POST goes through — is deliberately left uncached. A
+ * completion writes a row that is immutable once written and lands in a real
+ * technician's wallet; paying a rupee out of a tax rate that is up to an hour
+ * stale, to save two SELECTs on a path that runs once per job, is the wrong
+ * trade in the only direction that matters. Money reads fresh. SCREENS read
+ * cached. Nothing in this file may quietly widen the cached one to the other.
+ *
+ * (That distinction was not a design instinct, it was a test result: caching
+ * BOTH made job-completion-ledger.test.js fail, because a module-level cache
+ * served the first case's tax rate to every case after it. A cache that
+ * outlives the value it describes reads exactly the same way in production.)
+ *
+ * SHAPE COPIED, NOT INVENTED: services/properties.service.js has carried
+ * exactly this pattern since 2026-06-03 — TTL, stale-while-refresh so no
+ * request ever waits on the reload, a promise that dedupes concurrent cold
+ * reads, and an explicit flush for ops. Same TTL as that cache for the same
+ * reason.
+ *
+ * THE REFRESH USES `pool`, NEVER THE CALLER'S `conn`. A caller may hand us a
+ * transaction's connection (inLedgerTransaction does), and a background refresh
+ * resolving after that transaction commits would be querying a released
+ * connection. The COLD read is allowed to use `conn` — that one is awaited
+ * inside the caller's own scope, so the connection is still live.
+ */
+const LEDGER_CONFIG_TTL_MS = 60 * 60 * 1000;
+let _cfg = null;              // { serviceTaxRate, minEasyfixerFee } once loaded
+let _cfgAt = 0;               // epoch ms of the last successful read
+let _cfgPromise = null;       // dedupes concurrent COLD reads
+let _cfgRefreshing = false;   // a TTL-driven background refresh is in flight
+
+/** Uncached, always. The ledger-POST path — see the note above. */
+async function loadLedgerConfig(conn) {
+  return readLedgerConfig(conn);
+}
+
+async function cachedLedgerConfig(conn) {
+  if (_cfg && Date.now() - _cfgAt < LEDGER_CONFIG_TTL_MS) return _cfg;
+
+  // Stale but present: serve it now, refresh behind. No request pays the read.
+  if (_cfg) {
+    if (!_cfgRefreshing) {
+      _cfgRefreshing = true;
+      readLedgerConfig(pool)
+        .then((v) => { _cfg = v; _cfgAt = Date.now(); })
+        .catch((err) => {
+          // Keep serving the last good values and retry on the next tick —
+          // a config blip must not fail a completion that can be priced.
+          logger.warn('ledger config refresh failed — serving cached values · ' + (err.code || err.message));
+          _cfgAt = Date.now();
+        })
+        .finally(() => { _cfgRefreshing = false; });
+    }
+    return _cfg;
+  }
+
+  // Cold. One read for however many callers arrive at once.
+  if (!_cfgPromise) {
+    _cfgPromise = readLedgerConfig(conn).then(
+      (v) => { _cfg = v; _cfgAt = Date.now(); _cfgPromise = null; return v; },
+      (err) => { _cfgPromise = null; throw err; },
+    );
+  }
+  return _cfgPromise;
+}
+
+/** Drop the cached tax rate / minimum fee. For ops after editing either table. */
+function flushLedgerConfig() { _cfg = null; _cfgAt = 0; }
 
 // job_material.type → how its charge moves the technician share.
 function materialSign(type) {
@@ -159,7 +249,9 @@ function rateCardLineShares(l, serviceTaxRate, minEasyfixerFee) {
 async function estimateTechnicianShares(conn, jobIds) {
   const out = new Map();
   if (!jobIds.length) return out;
-  const { serviceTaxRate, minEasyfixerFee } = await loadLedgerConfig(conn);
+  // Read-only and on the mobile list's hot path — the cached read, not the
+  // ledger-POST one. See the cache note above for why those are different.
+  const { serviceTaxRate, minEasyfixerFee } = await cachedLedgerConfig(conn);
   const [lines] = await conn.query(
     `SELECT js.job_id, js.total_charge, js.quantity,
             cs.client_fixed, cs.client_variable,
@@ -183,6 +275,56 @@ async function estimateTechnicianShares(conn, jobIds) {
     add(l.job_id, s.easyfixer * num(l.quantity));
   }
   for (const m of materials) add(m.job_id, materialSign(m.type) * num(m.tx_charge));
+  return out;
+}
+
+/*
+ * ── WHAT THE TECHNICIAN EARNS ON THESE JOBS (2026-09-23, V3 plan 2.1 / 2.8) ──
+ *
+ * The one function every technician-facing surface asks. It answers with the
+ * POSTED figure where a completion has written one and an ESTIMATE where it has
+ * not, and it says WHICH — because those are different promises and a screen
+ * that renders them identically is lying about one of them.
+ *
+ * THE QUERY BUDGET IS FIXED, NOT PER JOB. One SELECT for the posted amounts;
+ * estimateTechnicianShares' two batched SELECTs only if something is left over;
+ * the tax rate and minimum fee come from the cache above. So: 1 query when every
+ * job is complete, 3 otherwise, for one job or for two hundred. The mobile list
+ * caps at 200 rows (routes/mobile/index.js), which bounds every `IN (?)` here.
+ *
+ * NO N+1 IS POSSIBLE BY CONSTRUCTION — the signature takes a LIST. Callers that
+ * want one job pass a one-element array rather than calling it in a loop, and
+ * there is no single-job variant to reach for by mistake.
+ *
+ * A JOB WITH NO ANSWER IS ABSENT FROM THE MAP, never zero. estimateTechnician-
+ * Shares already draws that line ("unknown, not zero") and it survives here: a
+ * job with no priced line and no material row has an earning nobody can state,
+ * and "₹0" is a claim. Callers must render absence as absence.
+ *
+ * Posted beats estimated even when they differ, and they can: the rate card may
+ * have moved since the job completed. The ledger row is what the technician was
+ * actually paid, so it wins — an estimate recomputed from today's card would
+ * contradict their own wallet.
+ */
+async function technicianSharesForJobs(conn, jobIds) {
+  const out = new Map();
+  const ids = [...new Set((jobIds || []).map(Number).filter(Number.isSafeInteger))];
+  if (!ids.length) return out;
+
+  // UNIQUE fk_job_id, so this is an index lookup per id and one row each.
+  const [posted] = await conn.query(
+    'SELECT fk_job_id AS job_id, efr_charge FROM tbl_job_transaction WHERE fk_job_id IN (?)', [ids],
+  );
+  for (const r of posted) {
+    out.set(Number(r.job_id), { amount: round2(num(r.efr_charge)), posted: true });
+  }
+
+  const unposted = ids.filter((id) => !out.has(id));
+  if (unposted.length) {
+    for (const [id, amount] of await estimateTechnicianShares(conn, unposted)) {
+      out.set(id, { amount, posted: false });
+    }
+  }
   return out;
 }
 
@@ -546,6 +688,8 @@ module.exports = {
   ledgerMoves,
   computeCompletionAmounts,
   estimateTechnicianShares,
+  technicianSharesForJobs,
+  flushLedgerConfig,
   postCompletionLedger,
   releaseLedgerLock,
   inLedgerTransaction,
