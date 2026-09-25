@@ -297,6 +297,9 @@ test('resolve a cancel claim as revisit: the ask is rejected and the job resched
   state.job = jobRow({ job_status: 1 });
   const r = await post('/ops-desk/reports/21/resolve', { outcome: 'revisit', revisitOn: '2099-01-03 09:00', reasonId: 7 });
   assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.equal(callsLike(/SET is_cancelled_by_app = 0/).length, 1, 'CRM Reject writer cleared the ask');
+  // The CRM Reject writer clears the ask; since 2026-09-25 (owner, Production
+  // 14943e5) the reschedule ALSO clears any cancellation ask, so the clear runs
+  // once or twice — what matters is that it ran and the ask ends cleared.
+  assert.ok(callsLike(/SET is_cancelled_by_app = 0/).length >= 1, 'the cancellation ask is cleared');
   assert.equal(callsLike(/UPDATE tbl_job\s+SET requested_date_time/).length, 1);
 });
