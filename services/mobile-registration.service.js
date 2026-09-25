@@ -355,6 +355,10 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
      */
     dobPresent:                 completion.dobPresent,
     serviceablePincodesPresent: completion.serviceablePincodesPresent,
+    // A home PIN on file (legacy onboarding stored it, never the serviceable
+    // set) — lets the app ask a legacy technician to CONFIRM his areas rather
+    // than show a bare "Pending" (owner, 2026-09-25). Same row, no extra read.
+    homePincodePresent:         present(e.efr_pin_no),
     workAreaComplete:           completion.workAreaComplete,
     panPresent,
     hasSkills,
