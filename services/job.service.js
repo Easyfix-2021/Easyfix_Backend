@@ -3679,194 +3679,13 @@ async function list({
    */
   if (startDate)           { clauses.push(`${dateCol} >= DATE(?)`); params.push(startDate); }
   if (endDate)             { clauses.push(`${dateCol} < DATE(?) + INTERVAL 1 DAY`); params.push(endDate); }
+  /*
+   * One definition, two callers: the grid here and the Booking-queue tiles via
+   * job.searchClause(). See the function for why it is not copied.
+   */
   if (q) {
-    /*
-     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
-     * the numeric job id on the Unconfirmed tab to triage a specific
-     * order. Earlier this clause only matched against text fields
-     * (reference id, client ref, customer name + mobile), so a search
-     * like "12345" returned zero rows even when job_id=12345 was on
-     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
-     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
-     * matching operator expectations.
-     */
-    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
-    // matches, so the two layers agree: job id / reference / client ref /
-    // customer name+mobile PLUS client name, city, technician, and owner. The
-    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
-    // query's alias-detection below auto-adds their joins once they appear here.
-    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
-    // j) — captured at booking, shown in the "Client SPOC" column of the
-    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
-    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
-    // is always present), and since COUNT + data share this where/params the two
-    // OR terms apply to both.
-    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
-    // the row displays (and the CRM's client-side re-filter reads) the job-row
-    // name, so matching the master name alone would return rows the browser then
-    // hides — the precise failure tests/job-search-parity.test.js exists to
-    // prevent. Placeholder count is unchanged (11), so the params.push below
-    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
-    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
-    // shows up in its BE column list — the parity it asserts still holds (both
-    // sides now key on the same effective name), it simply cannot see it.
-    /*
-     * ⚠ A PURELY NUMERIC TERM IS AN IDENTIFIER, NOT A SUBSTRING.
-     *
-     * Reported from production: searching 530280 returned THREE jobs. #530280
-     * was the one wanted; the other two matched because the floating LIKE hit
-     * their PHONE NUMBERS mid-digit — 98453028|06 and 93|530280|25 both contain
-     * "530280". Any 6-digit id has roughly five landing spots inside a 10-digit
-     * mobile, so the false-match rate grows with how many customers exist, not
-     * with how unusual the term is. At 153k jobs an id search nearly always
-     * drags in strangers.
-     *
-     * It was also slow for the same reason: eleven '%term%' predicates cannot
-     * use an index, so every search full-scanned tbl_job and five joined tables.
-     *
-     * So a digits-only term takes a typed path:
-     *   - j.job_id = ?  — a PRIMARY KEY lookup, exact and instant. This is what
-     *     the operator meant, and it is the whole reason the search felt slow.
-     *   - the two reference columns keep a substring match: they are opaque
-     *     client strings (WO1024566, 171-2677513-3675553) where a fragment is a
-     *     legitimate way to search.
-     *   - the mobile matches only a term long enough to BE a phone fragment
-     *     (>= MOBILE_MIN_DIGITS), and is anchored so it cannot match mid-number.
-     *   - name/city/client/owner columns are skipped entirely — a digits-only
-     *     term is never a person's name, and each one was a full scan.
-     * Anything containing a non-digit keeps the original eleven-column search.
-     */
-    const digitsOnly = /^\d+$/.test(q);
-    if (digitsOnly) {
-      const idTerms = ['j.job_id = ?', 'j.job_reference_id LIKE ?', 'j.client_ref_id LIKE ?'];
-      const idParams = [Number(q), `%${q}%`, `%${q}%`];
-      // A phone fragment, not an id. Anchored at the START so "530280" can
-      // never match the middle of 9845302806 — the reported bug.
-      if (q.length >= MOBILE_MIN_DIGITS) {
-        /*
-         * ── THE MOBILE BRANCH IS A SET LOOKUP, NOT A JOINED COLUMN ──
-         * (2026-08-20, measured against the 481k-row table — see the numbers
-         * in the block below.)
-         *
-         * It used to read `cu.customer_mob_no LIKE ?`, i.e. a column of the
-         * OUTER LEFT JOIN. Because it sat inside an OR with three tbl_job
-         * predicates, MySQL could not decide the row until tbl_customer had
-         * been joined, so EXPLAIN showed `cu eq_ref … Using where` and the
-         * server paid ~481k PK probes into tbl_customer for one search —
-         * whether or not any of them could match. That is what made a phone
-         * search the slowest thing on the page (2.0s data + 1.9s count).
-         *
-         * Written as an uncorrelated IN (…), the same rows come back but the
-         * predicate is now pure-`j`: MySQL runs the subquery ONCE as
-         * `range` on the customer_mob_no index (EXPLAIN: `2 SUBQUERY qmob
-         * type=range key=mobile_unique … Using index`) and probes the result.
-         * The prefix anchor is what makes the range possible — it is a
-         * correctness rule first (see above) and an index rule second.
-         *
-         * SAME ROWS, three-valued logic included: customer_id is the PK of
-         * tbl_customer, so `cu.customer_mob_no LIKE 't%'` is true for exactly
-         * the jobs whose fk_customer_id is in that set. A NULL or orphan
-         * fk_customer_id yields NULL/false on both sides (`NULL IN (…)` is
-         * UNKNOWN, `NULL LIKE …` is NULL) and OR-composes identically.
-         * ⚠ This is IN, never NOT IN — the NOT-IN/NULL trap does not apply,
-         * and must not be introduced here by "simplifying" it later.
-         *
-         * SIDE EFFECT, deliberate: the WHERE no longer names `cu.`, so the
-         * COUNT query's alias sniffing below stops adding the tbl_customer
-         * join to it as well. The subquery is self-contained, so COUNT and
-         * the data query still filter on exactly the same predicate — the
-         * totals were verified equal on real data for every term shape.
-         *
-         * Measured, min-of-5 interleaved, q = a real 10-digit mobile:
-         *              data query      COUNT query
-         *   before      2027 ms         1864 ms
-         *   after       1088 ms          865 ms
-         * and unchanged (~31 ms) on the selective tabs, because the plan is
-         * still free to drive from idx_tbl_job_status.
-         */
-        idTerms.push(
-          'j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
-        );
-        idParams.push(`${q}%`);
-      }
-      /*
-       * ═══ WHY THIS IS STILL AN `OR`, AND NOT A UNION OF INDEXED BRANCHES ═══
-       *
-       * The obvious next move — and the one docs/migrations for the
-       * customer_mob_no index proposed — is to stop OR-ing indexable and
-       * non-indexable branches and instead feed the outer query a UNION of
-       * per-branch id lookups:
-       *
-       *   FROM tbl_job j … JOIN (
-       *        SELECT job_id FROM tbl_job WHERE job_id = ?
-       *   UNION SELECT job_id FROM tbl_job WHERE job_reference_id LIKE ?
-       *                                        OR client_ref_id LIKE ?
-       *   UNION SELECT … FROM tbl_customer … JOIN tbl_job …
-       *   ) qs ON qs.job_id = j.job_id
-       *
-       * It was built and MEASURED against the real 481k-row table before
-       * being rejected. Both halves of the premise turn out to be false:
-       *
-       * 1. IT CANNOT MAKE EVERY BRANCH INDEX-USABLE. job_reference_id and
-       *    client_ref_id are matched with a LEADING wildcard, which no index
-       *    shape can serve — not in an OR, not in a UNION branch, not
-       *    anywhere. Moving them into a subquery changes where the scan
-       *    happens, never whether it happens. (Neither column is indexed at
-       *    all today; even a covering index would only turn the clustered
-       *    scan into a narrower index-only one — measured 600 ms → 137 ms for
-       *    an equivalent full scan of a narrow secondary index. Worth doing
-       *    on its own merits; it does not change this conclusion.)
-       *
-       * 2. IT TAKES THE PLAN CHOICE AWAY FROM THE OPTIMISER. The derived
-       *    table has to be materialised before the join, so the UNION shape
-       *    costs one full scan of tbl_job — ~690 ms — NO MATTER WHAT ELSE IS
-       *    IN THE WHERE. The current OR is an ordinary per-row predicate, so
-       *    MySQL is free to drive from whichever filter is selective and
-       *    check the term on the few rows that survive. Quick search almost
-       *    always ships with a tab filter, and 9 of the 12 tabs are tiny
-       *    (status 0=430 rows, 1=432, 10=259, 21=78, 15=66, 2+20=48 …).
-       *
-       *    Endpoint latency, min-of-5 interleaved, real data, q=482507:
-       *                       today (OR)      UNION shape
-       *      no tab ('All')      896 ms          694 ms   ← UNION 1.3× better
-       *      status=5 (332k)    1259 ms          694 ms   ← UNION 1.8× better
-       *      status=0 (430)       33 ms          706 ms   ← UNION 21× WORSE
-       *      status=20 (4)        35 ms          729 ms   ← UNION 21× WORSE
-       *
-       *    A 1.3–1.8× win on two tabs bought with a 21× loss on nine is not a
-       *    trade worth making. Result parity was never the problem — the
-       *    UNION returned identical rows on every term shape tested — the
-       *    physics is.
-       *
-       * 3. `j.job_id IN (SELECT … UNION …)` — the same idea kept in the
-       *    WHERE so the optimiser could still choose — is worse than either:
-       *    MySQL 8.4 refuses to flatten a UNION subquery into a semi-join and
-       *    executes it as a DEPENDENT SUBQUERY, re-running the union per
-       *    outer row. Measured 5.1 s / 10.3 s. Do not resurrect it.
-       *
-       * THE `REF-` REDUNDANCY QUESTION. job_reference_id is normally
-       * `REF-{job_id}` (utils/job-reference.js), which makes it tempting to
-       * drop `j.job_reference_id LIKE ?` for a digits-only term as
-       * "already covered by j.job_id = ?". It is NOT covered, on two
-       * independent grounds:
-       *   • SEMANTICS. On auto rows the branch is effectively
-       *     `CAST(job_id AS CHAR) LIKE '%t%'` — a SUBSTRING match over the id
-       *     digits, strictly wider than equality. Searching "5302" returns
-       *     261 jobs today (453027, 415302, …); equality returns none of them.
-       *   • PROVENANCE. The value is only auto-generated when the caller
-       *     supplies neither `job_reference_id` nor `reuse_client_ref`
-       *     (create(), ~line 3255). On this database 3,768 rows of 481,043
-       *     carry a ref that is NOT `REF-{job_id}`, and a live search proves
-       *     the branch earns its place: q=999998 matches job 298642 even
-       *     though no such job id exists (max id is 482507).
-       * So the branch stays, and with it the one scan nothing can remove.
-       */
-      clauses.push(`(${idTerms.join(' OR ')})`);
-      params.push(...idParams);
-    } else {
-      clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
-      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
-    }
+    const qc = searchClause(q);
+    if (qc.sql) { clauses.push(`(${qc.sql})`); params.push(...qc.params); }
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -5295,6 +5114,228 @@ function normaliseJobImageFilenames(input) {
     if (!out.includes(name)) out.push(name);
   }
   return out;
+}
+
+/*
+ * THE SEARCH BOX, AS SQL — extracted 2026-09-25 so the BOOKING QUEUE'S TILE
+ * COUNTS can apply the very same predicate the grid applies.
+ *
+ * Ops typed a client name and the rows narrowed while every tile above them
+ * kept the number for the whole board, which is the one thing these tiles are
+ * not allowed to do: they are supposed to add up to what is underneath them.
+ *
+ * Copying the clause into the counts query was the alternative, and this file
+ * already records what that costs — the digits-only branch below is a measured
+ * optimisation (2.0s to 1.1s on a phone search) with a correctness rule inside
+ * it (the mobile term is PREFIX-anchored so "530280" cannot match the middle of
+ * 9845302806). A second copy would have been a second place for both to rot.
+ *
+ * Returns the clause, its params, and WHICH aliases it needs — the caller joins
+ * what it does not already have. list() has them all in LIST_JOIN; the counts
+ * query adds only what the term actually touches.
+ */
+function searchClause(q) {
+  const clauses = [];
+  const params = [];
+  if (q) {
+    /*
+     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
+     * the numeric job id on the Unconfirmed tab to triage a specific
+     * order. Earlier this clause only matched against text fields
+     * (reference id, client ref, customer name + mobile), so a search
+     * like "12345" returned zero rows even when job_id=12345 was on
+     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
+     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
+     * matching operator expectations.
+     */
+    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
+    // matches, so the two layers agree: job id / reference / client ref /
+    // customer name+mobile PLUS client name, city, technician, and owner. The
+    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
+    // query's alias-detection below auto-adds their joins once they appear here.
+    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
+    // j) — captured at booking, shown in the "Client SPOC" column of the
+    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
+    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
+    // is always present), and since COUNT + data share this where/params the two
+    // OR terms apply to both.
+    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
+    // the row displays (and the CRM's client-side re-filter reads) the job-row
+    // name, so matching the master name alone would return rows the browser then
+    // hides — the precise failure tests/job-search-parity.test.js exists to
+    // prevent. Placeholder count is unchanged (11), so the params.push below
+    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
+    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
+    // shows up in its BE column list — the parity it asserts still holds (both
+    // sides now key on the same effective name), it simply cannot see it.
+    /*
+     * ⚠ A PURELY NUMERIC TERM IS AN IDENTIFIER, NOT A SUBSTRING.
+     *
+     * Reported from production: searching 530280 returned THREE jobs. #530280
+     * was the one wanted; the other two matched because the floating LIKE hit
+     * their PHONE NUMBERS mid-digit — 98453028|06 and 93|530280|25 both contain
+     * "530280". Any 6-digit id has roughly five landing spots inside a 10-digit
+     * mobile, so the false-match rate grows with how many customers exist, not
+     * with how unusual the term is. At 153k jobs an id search nearly always
+     * drags in strangers.
+     *
+     * It was also slow for the same reason: eleven '%term%' predicates cannot
+     * use an index, so every search full-scanned tbl_job and five joined tables.
+     *
+     * So a digits-only term takes a typed path:
+     *   - j.job_id = ?  — a PRIMARY KEY lookup, exact and instant. This is what
+     *     the operator meant, and it is the whole reason the search felt slow.
+     *   - the two reference columns keep a substring match: they are opaque
+     *     client strings (WO1024566, 171-2677513-3675553) where a fragment is a
+     *     legitimate way to search.
+     *   - the mobile matches only a term long enough to BE a phone fragment
+     *     (>= MOBILE_MIN_DIGITS), and is anchored so it cannot match mid-number.
+     *   - name/city/client/owner columns are skipped entirely — a digits-only
+     *     term is never a person's name, and each one was a full scan.
+     * Anything containing a non-digit keeps the original eleven-column search.
+     */
+    const digitsOnly = /^\d+$/.test(q);
+    if (digitsOnly) {
+      const idTerms = ['j.job_id = ?', 'j.job_reference_id LIKE ?', 'j.client_ref_id LIKE ?'];
+      const idParams = [Number(q), `%${q}%`, `%${q}%`];
+      // A phone fragment, not an id. Anchored at the START so "530280" can
+      // never match the middle of 9845302806 — the reported bug.
+      if (q.length >= MOBILE_MIN_DIGITS) {
+        /*
+         * ── THE MOBILE BRANCH IS A SET LOOKUP, NOT A JOINED COLUMN ──
+         * (2026-08-20, measured against the 481k-row table — see the numbers
+         * in the block below.)
+         *
+         * It used to read `cu.customer_mob_no LIKE ?`, i.e. a column of the
+         * OUTER LEFT JOIN. Because it sat inside an OR with three tbl_job
+         * predicates, MySQL could not decide the row until tbl_customer had
+         * been joined, so EXPLAIN showed `cu eq_ref … Using where` and the
+         * server paid ~481k PK probes into tbl_customer for one search —
+         * whether or not any of them could match. That is what made a phone
+         * search the slowest thing on the page (2.0s data + 1.9s count).
+         *
+         * Written as an uncorrelated IN (…), the same rows come back but the
+         * predicate is now pure-`j`: MySQL runs the subquery ONCE as
+         * `range` on the customer_mob_no index (EXPLAIN: `2 SUBQUERY qmob
+         * type=range key=mobile_unique … Using index`) and probes the result.
+         * The prefix anchor is what makes the range possible — it is a
+         * correctness rule first (see above) and an index rule second.
+         *
+         * SAME ROWS, three-valued logic included: customer_id is the PK of
+         * tbl_customer, so `cu.customer_mob_no LIKE 't%'` is true for exactly
+         * the jobs whose fk_customer_id is in that set. A NULL or orphan
+         * fk_customer_id yields NULL/false on both sides (`NULL IN (…)` is
+         * UNKNOWN, `NULL LIKE …` is NULL) and OR-composes identically.
+         * ⚠ This is IN, never NOT IN — the NOT-IN/NULL trap does not apply,
+         * and must not be introduced here by "simplifying" it later.
+         *
+         * SIDE EFFECT, deliberate: the WHERE no longer names `cu.`, so the
+         * COUNT query's alias sniffing below stops adding the tbl_customer
+         * join to it as well. The subquery is self-contained, so COUNT and
+         * the data query still filter on exactly the same predicate — the
+         * totals were verified equal on real data for every term shape.
+         *
+         * Measured, min-of-5 interleaved, q = a real 10-digit mobile:
+         *              data query      COUNT query
+         *   before      2027 ms         1864 ms
+         *   after       1088 ms          865 ms
+         * and unchanged (~31 ms) on the selective tabs, because the plan is
+         * still free to drive from idx_tbl_job_status.
+         */
+        idTerms.push(
+          'j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
+        );
+        idParams.push(`${q}%`);
+      }
+      /*
+       * ═══ WHY THIS IS STILL AN `OR`, AND NOT A UNION OF INDEXED BRANCHES ═══
+       *
+       * The obvious next move — and the one docs/migrations for the
+       * customer_mob_no index proposed — is to stop OR-ing indexable and
+       * non-indexable branches and instead feed the outer query a UNION of
+       * per-branch id lookups:
+       *
+       *   FROM tbl_job j … JOIN (
+       *        SELECT job_id FROM tbl_job WHERE job_id = ?
+       *   UNION SELECT job_id FROM tbl_job WHERE job_reference_id LIKE ?
+       *                                        OR client_ref_id LIKE ?
+       *   UNION SELECT … FROM tbl_customer … JOIN tbl_job …
+       *   ) qs ON qs.job_id = j.job_id
+       *
+       * It was built and MEASURED against the real 481k-row table before
+       * being rejected. Both halves of the premise turn out to be false:
+       *
+       * 1. IT CANNOT MAKE EVERY BRANCH INDEX-USABLE. job_reference_id and
+       *    client_ref_id are matched with a LEADING wildcard, which no index
+       *    shape can serve — not in an OR, not in a UNION branch, not
+       *    anywhere. Moving them into a subquery changes where the scan
+       *    happens, never whether it happens. (Neither column is indexed at
+       *    all today; even a covering index would only turn the clustered
+       *    scan into a narrower index-only one — measured 600 ms → 137 ms for
+       *    an equivalent full scan of a narrow secondary index. Worth doing
+       *    on its own merits; it does not change this conclusion.)
+       *
+       * 2. IT TAKES THE PLAN CHOICE AWAY FROM THE OPTIMISER. The derived
+       *    table has to be materialised before the join, so the UNION shape
+       *    costs one full scan of tbl_job — ~690 ms — NO MATTER WHAT ELSE IS
+       *    IN THE WHERE. The current OR is an ordinary per-row predicate, so
+       *    MySQL is free to drive from whichever filter is selective and
+       *    check the term on the few rows that survive. Quick search almost
+       *    always ships with a tab filter, and 9 of the 12 tabs are tiny
+       *    (status 0=430 rows, 1=432, 10=259, 21=78, 15=66, 2+20=48 …).
+       *
+       *    Endpoint latency, min-of-5 interleaved, real data, q=482507:
+       *                       today (OR)      UNION shape
+       *      no tab ('All')      896 ms          694 ms   ← UNION 1.3× better
+       *      status=5 (332k)    1259 ms          694 ms   ← UNION 1.8× better
+       *      status=0 (430)       33 ms          706 ms   ← UNION 21× WORSE
+       *      status=20 (4)        35 ms          729 ms   ← UNION 21× WORSE
+       *
+       *    A 1.3–1.8× win on two tabs bought with a 21× loss on nine is not a
+       *    trade worth making. Result parity was never the problem — the
+       *    UNION returned identical rows on every term shape tested — the
+       *    physics is.
+       *
+       * 3. `j.job_id IN (SELECT … UNION …)` — the same idea kept in the
+       *    WHERE so the optimiser could still choose — is worse than either:
+       *    MySQL 8.4 refuses to flatten a UNION subquery into a semi-join and
+       *    executes it as a DEPENDENT SUBQUERY, re-running the union per
+       *    outer row. Measured 5.1 s / 10.3 s. Do not resurrect it.
+       *
+       * THE `REF-` REDUNDANCY QUESTION. job_reference_id is normally
+       * `REF-{job_id}` (utils/job-reference.js), which makes it tempting to
+       * drop `j.job_reference_id LIKE ?` for a digits-only term as
+       * "already covered by j.job_id = ?". It is NOT covered, on two
+       * independent grounds:
+       *   • SEMANTICS. On auto rows the branch is effectively
+       *     `CAST(job_id AS CHAR) LIKE '%t%'` — a SUBSTRING match over the id
+       *     digits, strictly wider than equality. Searching "5302" returns
+       *     261 jobs today (453027, 415302, …); equality returns none of them.
+       *   • PROVENANCE. The value is only auto-generated when the caller
+       *     supplies neither `job_reference_id` nor `reuse_client_ref`
+       *     (create(), ~line 3255). On this database 3,768 rows of 481,043
+       *     carry a ref that is NOT `REF-{job_id}`, and a live search proves
+       *     the branch earns its place: q=999998 matches job 298642 even
+       *     though no such job id exists (max id is 482507).
+       * So the branch stays, and with it the one scan nothing can remove.
+       */
+      // No outer parens here: each caller wraps the clause itself, so the
+      // emitted string stays byte-identical to what the grid emitted before
+      // this was extracted (tests/job-search-numeric-plan.test.js parses it).
+      clauses.push(idTerms.join(' OR '));
+      params.push(...idParams);
+    } else {
+      clauses.push(`CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?`);
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
+  }
+  return {
+    sql: clauses.length ? clauses.join(' AND ') : '',
+    params,
+    // The text branch reads these; the digits-only branch is pure `j` plus a
+    // self-contained subquery, so it needs nothing joined.
+    needsAliases: clauses.length && !/^\d+$/.test(String(q)) ? ['cu', 'cl', 'ci', 'ef', 'ow'] : [],
+  };
 }
 
 // ─── Create ─────────────────────────────────────────────────────────
@@ -9028,6 +9069,9 @@ module.exports = {
   MOBILE_MIN_DIGITS,
   // Same reason: the Job Id box's id-or-reference search, for the export.
   jobIdOrRefPredicate,
+  // The search box as SQL — shared with the Booking-queue tile counts so a
+  // search narrows the tiles and the rows by the same rule.
+  searchClause,
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
   // tbl_job.client_services CSV in sync after the customer's self-submit
