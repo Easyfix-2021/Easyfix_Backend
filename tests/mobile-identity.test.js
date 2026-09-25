@@ -104,8 +104,9 @@ test('atomically persists optional name with identity fields and documents befor
     event.type === 'query' && /^\s*UPDATE tbl_easyfixer/i.test(event.sql)
   ));
   assert.ok(update);
-  assert.match(update.sql, /efr_name\s+= COALESCE/i);
-  assert.match(update.sql, /adhaar_card_number\s+= COALESCE/i);
+  // Fill-only (owner, 2026-09-25): a stored name / valid Aadhaar is kept.
+  assert.match(update.sql, /efr_name\s+= COALESCE\(NULLIF\(TRIM\(efr_name\), ''\), \?\)/i);
+  assert.match(update.sql, /adhaar_card_number\s+= CASE WHEN adhaar_card_number REGEXP/i);
   assert.deepEqual(update.params.slice(0, 4), [
     'Ramesh Kumar', '123456789012', 'ABCDE1234F', null,
   ]);

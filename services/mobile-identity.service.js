@@ -198,16 +198,31 @@ async function saveIdentityDetails(
     await assertActiveAadhaarAvailable(conn, aadhaar, efrId);
     await assertActivePanAvailable(conn, pan, efrId);
 
+    /*
+     * IDENTITY IS FILL-ONLY FROM THE APP (owner, 2026-09-25). An existing
+     * technician's name, Aadhaar, PAN and DOB are never replaced from the phone
+     * — a value is written only where the column is MISSING. `COALESCE(?, col)`
+     * (the old form) keeps a column only when the app sends nothing, so any
+     * value it did send overwrote legacy data. Missing means NULL/blank, and for
+     * Aadhaar/PAN also "not a valid number": legacy Flutter DigiLocker rows
+     * hold masked Aadhaars (XXXXXXXX1234), which the app must still be able to
+     * complete. Corrections to a real value are an ops action in the CRM.
+     */
     await conn.query(
       `UPDATE tbl_easyfixer
-          SET efr_name              = COALESCE(?, efr_name),
-              adhaar_card_number    = COALESCE(?, adhaar_card_number),
-              pan_card_number       = COALESCE(?, pan_card_number),
-              efr_first_name        = COALESCE(?, efr_first_name),
-              efr_last_name         = COALESCE(?, efr_last_name),
-              date_of_birth         = COALESCE(?, date_of_birth),
+          SET efr_name              = COALESCE(NULLIF(TRIM(efr_name), ''), ?),
+              adhaar_card_number    = CASE WHEN adhaar_card_number REGEXP '^[0-9]{12}$'
+                                           THEN adhaar_card_number
+                                           ELSE COALESCE(?, adhaar_card_number) END,
+              pan_card_number       = CASE WHEN UPPER(pan_card_number) REGEXP '^[A-Z]{5}[0-9]{4}[A-Z]$'
+                                           THEN pan_card_number
+                                           ELSE COALESCE(?, pan_card_number) END,
+              efr_first_name        = COALESCE(NULLIF(TRIM(efr_first_name), ''), ?),
+              efr_last_name         = COALESCE(NULLIF(TRIM(efr_last_name), ''), ?),
+              date_of_birth         = COALESCE(date_of_birth, ?),
               have_driving_lisence  = COALESCE(?, have_driving_lisence),
-              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc)
+              efr_identity_details_perc = COALESCE(?, efr_identity_details_perc),
+              update_date           = ?
         WHERE efr_id = ?`,
       [
         name,
@@ -218,17 +233,20 @@ async function saveIdentityDetails(
         body.dob || null,
         drivingLicence,
         identityComplete ? 100 : null,
+        new Date(),
         efrId,
       ],
     );
 
     const docs = body.docs || {};
+    // Identity documents are fill-only too: a stored Aadhaar/PAN/licence
+    // image is kept; a new one is written only where none exists.
     await upsertEasyfixerDocuments(conn, efrId, [
       [13, docs.aadhaarFront],
       [14, docs.aadhaarBack],
       [3, docs.pan],
       [12, docs.drivingLicence],
-    ]);
+    ], { fillOnly: true });
 
     await conn.commit();
     transactionStarted = false;

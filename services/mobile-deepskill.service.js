@@ -310,12 +310,15 @@ async function applySkills(efrId, payload) {
   // An empty selectedOptions array contributes NO pairs for that skill,
   // which naturally drives the delete of any existing mappings for it.
   const desired = new Map();
+  // Deep skills the app actually sent — the only ones it can have edited.
+  const sentDeepSkillIds = new Set();
   for (const st of (payload.serviceTypes || [])) {
     const serviceTypeId = Number(st.serviceTypeId);
     if (!Number.isInteger(serviceTypeId) || serviceTypeId <= 0) continue;
     for (const ds of (st.deepSkills || [])) {
       const deepSkillId = Number(ds.deepSkillId);
       if (!Number.isInteger(deepSkillId) || deepSkillId <= 0) continue;
+      sentDeepSkillIds.add(deepSkillId);
       for (const optId of (ds.selectedOptions || [])) {
         const optionId = Number(optId);
         if (!Number.isInteger(optionId) || optionId <= 0) continue;
@@ -344,11 +347,40 @@ async function applySkills(efrId, payload) {
       [efrId, categoryId],
     );
     const existing = new Map();
+    // Active options by OPTION id alone — the same identity getHierarchy uses to
+    // show a skill as selected. A legacy row can hold the right option under a
+    // different service type / parent; it is the same skill to the technician.
+    const activeOptionIds = new Set();
     for (const r of existingRows) {
       existing.set(
         `${Number(r.service_type_id)}:${Number(r.deep_skill_id)}:${Number(r.option_id)}`,
         r,
       );
+      activeOptionIds.add(Number(r.option_id));
+    }
+    const desiredOptionIds = new Set(Array.from(desired.values(), (p) => p.optionId));
+
+    /*
+     * NEVER REMOVE WHAT THE APP DID NOT SHOW HIM (owner, 2026-09-25). A row may
+     * be soft-deleted only when its option is a CURRENTLY VISIBLE option of a
+     * deep skill this request sent, and he left it unselected. Before this, the
+     * diff was keyed on (service type, deep skill, option), so a legacy row for
+     * a skill he still had selected — or any row under a hidden/inactive option
+     * — failed to match and was deleted, then re-inserted under the new key:
+     * "existing entry deleted and new inserted" on an unchanged skill.
+     */
+    const deletableOptionIds = new Set();
+    if (sentDeepSkillIds.size) {
+      const ids = Array.from(sentDeepSkillIds);
+      const [visibleOptions] = await conn.query(
+        `SELECT id FROM tbl_deepskill_options
+          WHERE deepskill_id IN (${ids.map(() => '?').join(',')}) AND status = 1`,
+        ids,
+      );
+      for (const o of visibleOptions) {
+        const optionId = Number(o.id);
+        if (!desiredOptionIds.has(optionId)) deletableOptionIds.add(optionId);
+      }
     }
 
     // Diff: toAdd = desired - existing ; toDelete = existing - desired.
@@ -357,7 +389,8 @@ async function applySkills(efrId, payload) {
     let totalExistingMappings = 0;
 
     for (const [key, pair] of desired) {
-      if (existing.has(key)) {
+      // Already held — exactly, or as the same option under a legacy key.
+      if (existing.has(key) || activeOptionIds.has(pair.optionId)) {
         totalExistingMappings += 1;
         continue;
       }
@@ -388,9 +421,10 @@ async function applySkills(efrId, payload) {
       totalNewMappingsAdded += 1;
     }
 
-    // Soft-delete any active pair not in the desired set.
+    // Soft-delete only what he could see and deselected (see above).
     for (const [key, row] of existing) {
       if (desired.has(key)) continue;
+      if (!deletableOptionIds.has(Number(row.option_id))) continue;
       await conn.query(
         `UPDATE tbl_efr_deepskill_mapping
             SET is_repairing = 0
