@@ -370,6 +370,7 @@ const EXPECTED = {
      * not got it.
      */
     'profile_crm_activation_by',
+    'auto_activation_date', // the I-Card's member-since fallback
     'scheduled_reactivation_date',
     /*
      * The v5.1 technician lifecycle (services/easyfixer-lifecycle.service.js +
