@@ -552,14 +552,18 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
   const effectiveLocation = keepStoredHome ? null : location;
 
   await runner.query(
+    // The name is identity: FILL-ONLY from the app (owner, 2026-09-25) — an
+    // existing technician's stored name is never replaced by a registration
+    // or Work Area save. The address stays editable.
     `UPDATE tbl_easyfixer
-        SET efr_name        = COALESCE(?, efr_name),
-            efr_first_name  = COALESCE(?, efr_first_name),
-            efr_last_name   = COALESCE(?, efr_last_name),
+        SET efr_name        = COALESCE(NULLIF(TRIM(efr_name), ''), ?),
+            efr_first_name  = COALESCE(NULLIF(TRIM(efr_first_name), ''), ?),
+            efr_last_name   = COALESCE(NULLIF(TRIM(efr_last_name), ''), ?),
             efr_pin_no      = COALESCE(?, efr_pin_no),
             efr_cityId      = COALESCE(?, efr_cityId),
             efr_address     = COALESCE(?, efr_address),
-            efr_personal_details_perc = 100
+            efr_personal_details_perc = 100,
+            update_date     = ?
       WHERE efr_id = ?`,
     [
       fullName || null,
@@ -568,6 +572,7 @@ async function persistPersonalDetails(efrId, body, runner, location = null) {
       keepStoredHome ? null : incomingHome,
       effectiveLocation?.cityId ?? null,
       addressLine,
+      new Date(),
       efrId,
     ],
   );

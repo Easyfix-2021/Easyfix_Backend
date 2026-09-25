@@ -1304,10 +1304,12 @@ router.post('/profile/personal-details', validate(Joi.object({
     await conn.query('SELECT GET_LOCK(?, 10)', [lockKey]);
     await conn.beginTransaction();
     await conn.query(
+      // Name and DOB are identity: FILL-ONLY from the app (owner, 2026-09-25).
       `UPDATE tbl_easyfixer SET
-         efr_first_name       = COALESCE(?, efr_first_name),
-         efr_last_name        = COALESCE(?, efr_last_name),
-         date_of_birth        = COALESCE(?, date_of_birth),
+         efr_first_name       = COALESCE(NULLIF(TRIM(efr_first_name), ''), ?),
+         efr_last_name        = COALESCE(NULLIF(TRIM(efr_last_name), ''), ?),
+         date_of_birth        = COALESCE(date_of_birth, ?),
+         update_date          = ?,
          efr_marital_status   = COALESCE(?, efr_marital_status),
          efr_children         = COALESCE(?, efr_children),
          efr_email            = COALESCE(?, efr_email),
@@ -1318,7 +1320,7 @@ router.post('/profile/personal-details', validate(Joi.object({
          efr_personal_details_perc = COALESCE(?, efr_personal_details_perc)
        WHERE efr_id = ?`,
       [
-        b.firstName || null, b.lastName || null, b.dateOfBirth || null, marital,
+        b.firstName || null, b.lastName || null, b.dateOfBirth || null, new Date(), marital,
         children === null || Number.isNaN(children) ? null : children,
         b.email || null, b.emergencyContactNumber || null,
         about === undefined ? null : about, health, accidental,
@@ -1403,9 +1405,10 @@ router.post('/profile/professional-details', validate(Joi.object({
          use_whatsapp  = COALESCE(?, use_whatsapp),
          have_bike     = COALESCE(?, have_bike),
          efr_professional_details_perc = CASE WHEN COALESCE(?, experience_id) IS NOT NULL
-                                              THEN 100 ELSE efr_professional_details_perc END
+                                              THEN 100 ELSE efr_professional_details_perc END,
+         update_date   = ?
        WHERE efr_id = ?`,
-      [b.experienceId || null, toolsCsv, useWhatsapp, haveBike, b.experienceId || null, efrId]);
+      [b.experienceId || null, toolsCsv, useWhatsapp, haveBike, b.experienceId || null, new Date(), efrId]);
 
     // Per-tool photos → tbl_easyfixer_document type 8, one row per tool with the
     // tool id stamped in efr_doc_text (schema-safe; no tool↔doc junction needed).
@@ -1419,14 +1422,25 @@ router.post('/profile/professional-details', validate(Joi.object({
       if (desiredIds.length) {
         const ph = desiredIds.map(() => '?').join(',');
         await conn.query(
+          /*
+           * Only photos STAMPED with a tool id the technician just deselected.
+           * A legacy (Flutter-era) tool photo carries no tool id — the app never
+           * showed it, so it can never be "deselected" — and must survive
+           * (owner, 2026-09-25: no deleting what the app did not show him).
+           */
           `DELETE FROM tbl_easyfixer_document
             WHERE efr_id = ? AND efr_doc_type_id = 8
-              AND (efr_doc_text IS NULL OR efr_doc_text NOT IN (${ph}))`,
+              AND efr_doc_text IS NOT NULL AND TRIM(efr_doc_text) <> ''
+              AND efr_doc_text NOT IN (${ph})`,
           // efr_doc_text is VARCHAR (we store String(toolId)) — bind STRINGS so
           // the NOT IN is a string-vs-string compare, not an implicit numeric cast.
           [efrId, ...desiredIds.map(String)]);
       } else {
-        await conn.query('DELETE FROM tbl_easyfixer_document WHERE efr_id = ? AND efr_doc_type_id = 8', [efrId]);
+        await conn.query(
+          `DELETE FROM tbl_easyfixer_document
+            WHERE efr_id = ? AND efr_doc_type_id = 8
+              AND efr_doc_text IS NOT NULL AND TRIM(efr_doc_text) <> ''`,
+          [efrId]);
       }
       for (const tp of b.tools) {
         if (!tp || !tp.photoKey) continue;
