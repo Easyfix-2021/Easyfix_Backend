@@ -2258,6 +2258,22 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
               jci.caller_status,
               jci.reciever_status AS receiver_status,
               (jci.recording IS NOT NULL AND jci.recording <> '') AS has_recording,
+              /*
+               * recording_lost — audio is PROVEN not to exist, so the UI says
+               * "No recording" instead of offering a Play that can only fail.
+               *
+               * The 2026-09-24/25 start-on-answer change (c6d163a, reverted in
+               * e24bb19) claimed the operator leg with recording_id='starting',
+               * then Plivo recorded NOTHING: the account holds zero recordings
+               * between that deploy (13:42 UTC 09-24) and the revert (~05:44
+               * UTC 09-25). Nothing writes 'starting' any more, so it marks
+               * exactly those calls. Deliberately NOT "Plivo lookup came back
+               * empty": that lookup misses web-call recordings filed under
+               * another leg, so it cannot prove absence.
+               */
+              EXISTS (SELECT 1 FROM tbl_plivo_call_log rl
+                       WHERE rl.job_caller_info_id = jci.job_caller_info
+                         AND rl.recording_id = 'starting' AND rl.recording_url IS NULL) AS recording_lost,
               jci.location,
               jci.provider,
               jci.inserted_time,
