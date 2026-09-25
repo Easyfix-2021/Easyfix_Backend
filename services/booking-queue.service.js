@@ -593,6 +593,7 @@ function istToday(now = new Date()) {
  */
 async function counts({
   now = new Date(), scopeSql = '', scopeParams = [], scopeJoins = '',
+  searchSql = '', searchParams = [], searchJoins = '',
   ownerId, hasRequestTable = true, db = pool,
 } = {}) {
   const responded = respondedSql('j', hasRequestTable);
@@ -608,10 +609,16 @@ async function counts({
   const where = [];
   const whereParams = [];
   if (scopeSql) { where.push(`(${scopeSql})`); whereParams.push(...scopeParams); }
+  /*
+   * The page's search box, as the GRID applies it — same builder, so a term
+   * that narrows the rows narrows the tiles above them by exactly the same
+   * rule. Without this the strip stops summing to the list beneath it.
+   */
+  if (searchSql) { where.push(`(${searchSql})`); whereParams.push(...searchParams); }
   if (Number.isFinite(Number(ownerId))) { where.push('j.job_owner = ?'); whereParams.push(Number(ownerId)); }
 
   const scope = where.length ? ` AND ${where.join(' AND ')}` : '';
-  const joins = scopeJoins ? ` ${scopeJoins}` : '';
+  const joins = `${scopeJoins ? ` ${scopeJoins}` : ''}${searchJoins || ''}`;
 
   /*
    * ONE PASS over the open book. Every tile, the answer split, the Today/Old

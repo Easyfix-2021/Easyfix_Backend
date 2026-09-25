@@ -774,7 +774,29 @@ router.get('/booking-queue', async (req, res, next) => {
       { scope, allowedStages: req.allowedStages, hasVerticalCol }, 'j',
     );
 
+    /*
+     * THE SEARCH NARROWS THE TILES TOO (ops, 2026-09-25). Typing a client name
+     * narrowed the rows while every tile kept the whole board's number, so the
+     * strip stopped adding up to the list under it — the one thing these
+     * counts exist to do.
+     *
+     * The predicate is job.searchClause(), the SAME builder the grid's own
+     * WHERE uses, plus the joins that clause needs and this query does not
+     * otherwise have.
+     */
+    const search = job.searchClause(req.query.q);
+    const searchJoins = search.needsAliases.length ? `
+      LEFT JOIN tbl_customer  cu ON cu.customer_id   = j.fk_customer_id
+      LEFT JOIN tbl_client    cl ON cl.client_id     = j.fk_client_id
+      LEFT JOIN tbl_address   adq ON adq.address_id  = j.fk_address_id
+      LEFT JOIN tbl_city      ci ON ci.city_id       = adq.city_id
+      LEFT JOIN tbl_easyfixer ef ON ef.efr_id        = j.fk_easyfixter_id
+      LEFT JOIN tbl_user      ow ON ow.user_id       = j.job_owner` : '';
+
     const counts = await bookingQueue.counts({
+      searchSql: search.sql,
+      searchParams: search.params,
+      searchJoins,
       ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
       scopeSql: frag.clauses.join(' AND '),
       scopeParams: frag.params,
