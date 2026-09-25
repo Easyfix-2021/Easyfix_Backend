@@ -1970,8 +1970,12 @@ async function resolveCustomerRequests(jobId, runner = pool) {
  * than blanket, because the two asks are not interchangeable:
  *   · cancel (setStatus → 6): grants a cancellation ask and moots a reschedule
  *     ask (there is no appointment left to argue about) → BOTH.
- *   · reschedule: answers the appointment question only. A "please kill this
- *     order" ask survives a new appointment and must stay on ops's queue.
+ *   · reschedule: answers the appointment question AND the cancellation one
+ *     → BOTH (owner, 2026-09-25). The cancel ask used to survive a new
+ *     appointment; it no longer does, because a rescheduled job is handed
+ *     onward and the incoming technician must not inherit the outgoing one's
+ *     banner. See the call site in reschedule() for the full reasoning and the
+ *     cost.
  *   · assign / reassign: the ask belonged to the PREVIOUS technician, who is
  *     now off the job — the mobile writers pin `AND fk_easyfixter_id = ?`, so
  *     leaving the flag set would show the incoming technician a banner for an
@@ -8705,8 +8709,27 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   await resolveCustomerRequests(jobId);
   // The Approve half of a technician's RESCHEDULE ask: the appointment question
   // is now answered, whether ops took the technician's proposed slot or another
-  // one. A cancellation ask is NOT answered by a new appointment, so it stays.
-  await resolveAppRequests(jobId, ['reschedule']);
+  // one.
+  //
+  // The CANCELLATION ask is cleared here TOO (owner, 2026-09-25). It used to
+  // survive a reschedule, on the reasoning that "please kill this order" is a
+  // different question from "when". But a rescheduled job gets handed onward —
+  // usually to a DIFFERENT technician, via the offer flow — and this flag is
+  // what buildAppRequest() renders as the app's "Cancellation Requested"
+  // banner. Left set, the incoming technician opens a job they have just
+  // accepted and sees the OUTGOING technician's ask, with the app's own
+  // Cancel / Reschedule link hidden behind hasPendingRequest — so they can
+  // neither act on the banner nor raise a request of their own. Legacy did
+  // exactly this: saveRescheduleJob nulled is_cancelled_by_app,
+  // job_cancel_reason_id_by_easyfixer, is_rescheduled_by_app and
+  // reschedule_reason_id in the one reschedule UPDATE (EasyFix_CRM
+  // JobDaoImpl.java:4172).
+  //
+  // The cost, accepted deliberately: a cancellation ask ops has NOT yet
+  // answered drops off My Orders -> Technician Requests the moment anybody
+  // reschedules the job. Rescheduling counts as an ops answer under this rule.
+  // The technician's own tbl_job_comment (comment_on = 9) stays as the record.
+  await resolveAppRequests(jobId, ['cancel', 'reschedule']);
   return getById(jobId);
 }
 
