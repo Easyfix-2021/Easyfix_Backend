@@ -361,6 +361,15 @@ const EXPECTED = {
     'efr_manager_id', 'skill_rating', 'tool_rating',
     'inactive_comment', 'inactive_reason', 'send_back_to_tx_reason_crm',
     'last_inactive_date_time', 'profile_activation_date_time',
+    /*
+     * Who activated the profile — a denormalised NAME, not a user id. The
+     * Manage Easyfixers XLSX prints it as the legacy report's "Activated By"
+     * column (routes/admin/easyfixers.js, via easyfixer.service.js
+     * exportExtras). Named by a live query and guarded by nothing, so it is
+     * listed here rather than left to 500 the download on a deploy that has
+     * not got it.
+     */
+    'profile_crm_activation_by',
     'scheduled_reactivation_date',
     /*
      * The v5.1 technician lifecycle (services/easyfixer-lifecycle.service.js +
