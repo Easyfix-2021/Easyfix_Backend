@@ -71,6 +71,10 @@ function present(v) {
 // ─── Identity + flags fetch ─────────────────────────────────────────
 async function fetchGateRow(efrId) {
   const lifecycleProjection = await lifecycleService.readProjection('e');
+  // profileCompletion.fromRow() reads dob_present + serviceable_pincodes_present;
+  // without them here every status reported the DOB missing and the Work Area
+  // incomplete (regressed 4c78898, 2026-09-02; found on QA 2026-09-25).
+  const completionSql = profileCompletion.sqlPredicates({ technicianAlias: 'e', userAlias: 'u' });
   const [[row]] = await pool.query(
     `SELECT e.efr_id,
             e.efr_first_name, e.efr_name, e.efr_no,
@@ -94,7 +98,9 @@ async function fetchGateRow(efrId) {
             ${lifecycleProjection},
             u.personal_details_filled       AS user_personal_details_filled,
             u.is_personal_detail_filled      AS user_is_personal_detail_filled,
-            u.is_released                    AS user_is_released
+            u.is_released                    AS user_is_released,
+            ${completionSql.dobPresent}       AS dob_present,
+            ${completionSql.serviceablePincodesPresent} AS serviceable_pincodes_present
        FROM tbl_easyfixer e
        LEFT JOIN tbl_user u ON u.user_id = e.user_id
       WHERE e.efr_id = ?

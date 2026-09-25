@@ -166,3 +166,33 @@ test('verified technician with skills and training unlocks jobs without PAN', as
     + '  mandatory-content half of the training gate, added deliberately in\n'
     + '  2026-09-10 — see the budget note above.');
 });
+
+/*
+ * THE STATUS ROW MUST CARRY dob_present AND serviceable_pincodes_present
+ * (QA, 2026-09-25). profileCompletion.fromRow() reads both, but fetchGateRow
+ * never selected them — so since 4c78898 (2026-09-02) every status call
+ * reported the DOB missing and the Work Area incomplete, whatever was stored,
+ * and Gate 1 could never complete from this endpoint. The SQL is asserted,
+ * not just the flags: a fake row can carry any column the query never asks for.
+ */
+test('the status query computes dob_present and serviceable_pincodes_present, and the flags reach the response', async () => {
+  await primeLmsProbe();
+  fake.reset();
+  gateRow.dob_present = 1;
+  gateRow.serviceable_pincodes_present = 1;
+  try {
+    const status = await registration.getStatus(8379, {
+      status: 'ACTIVE', jobsAllowed: true, capabilities: { receiveNewJobs: true, claimMoney: true },
+    });
+    const gate = fake.calls.find((c) => /FROM tbl_easyfixer e[\s\S]*LEFT JOIN tbl_user u/i.test(c.sql));
+    assert.ok(gate, 'positive control: the status row query ran');
+    assert.match(gate.sql, /AS dob_present/, 'the status row must compute dob_present');
+    assert.match(gate.sql, /AS serviceable_pincodes_present/, 'the status row must compute serviceable_pincodes_present');
+    assert.equal(status.flags.dobPresent, true);
+    assert.equal(status.flags.serviceablePincodesPresent, true);
+    assert.equal(status.flags.workAreaComplete, true);
+  } finally {
+    delete gateRow.dob_present;
+    delete gateRow.serviceable_pincodes_present;
+  }
+});
