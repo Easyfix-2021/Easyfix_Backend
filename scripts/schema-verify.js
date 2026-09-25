@@ -361,6 +361,7 @@ const EXPECTED = {
     'efr_manager_id', 'skill_rating', 'tool_rating',
     'inactive_comment', 'inactive_reason', 'send_back_to_tx_reason_crm',
     'last_inactive_date_time', 'profile_activation_date_time',
+    'auto_activation_date', // the I-Card's member-since fallback
     'scheduled_reactivation_date',
     /*
      * The v5.1 technician lifecycle (services/easyfixer-lifecycle.service.js +

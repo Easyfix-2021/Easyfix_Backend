@@ -187,6 +187,20 @@ test('earned, points, work area and skills', async () => {
   assert.deepEqual(await fetchSkills(7), { primary: 'Carpentry', count: 2 });
 });
 
+test('the PIN chip counts the home PIN with the serviceable set, once (owner, 2026-09-25)', async () => {
+  // "4 PIN" over a Work Area screen listing 5: the home PIN is saved to
+  // efr_pin_no, not the serviceable CSV, and coverage is already the union.
+  FACTS = { earned_lifetime: 0, points: 0, pincodes: '492001,852201,854105,122003', home_pin: '110024' };
+  assert.equal((await fetchTechFacts(7)).workArea.pinCount, 5);
+  FACTS = { earned_lifetime: 0, points: 0, pincodes: '110024,110062', home_pin: '110062' };
+  assert.equal((await fetchTechFacts(7)).workArea.pinCount, 2, 'a home PIN already in the set is not double-counted');
+  FACTS = { earned_lifetime: 0, points: 0, pincodes: null, home_pin: '110024' };
+  assert.equal((await fetchTechFacts(7)).workArea.pinCount, 1, 'home alone is one PIN');
+  FACTS = { earned_lifetime: 0, points: 0, pincodes: null, home_pin: null };
+  assert.equal((await fetchTechFacts(7)).workArea.pinCount, 0);
+  reset();
+});
+
 test('working hours: the company property, else 10:00-20:00; working today = attendance present', () => {
   const orig = properties.getProperty;
   try {

@@ -742,11 +742,16 @@ async function fetchTechFacts(efrId) {
             FROM tbl_job j JOIN tbl_job_transaction t ON t.fk_job_id = j.job_id
            WHERE j.fk_easyfixter_id = ? AND j.job_status IN (3, 5)) AS earned_lifetime,
          (SELECT COALESCE(SUM(delta), 0) FROM reward_points_ledger WHERE easyfixer_id = ?) AS points,
-         (SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1) AS pincodes`,
-      [efrId, efrId, efrId],
+         (SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ? LIMIT 1) AS pincodes,
+         (SELECT efr_pin_no FROM tbl_easyfixer WHERE efr_id = ?) AS home_pin`,
+      [efrId, efrId, efrId, efrId],
     );
-    // Same parse as getServiceablePincodes, so the chip and the PIN screen agree.
-    const pins = [...new Set(String(row?.pincodes || '').split(',').map((p) => p.trim())
+    // The home PIN counts too: the Work Area screen lists it as the first
+    // selected PIN, and coverage is already "serviceable set ∪ efr_pin_no"
+    // (pincodeService.recomputeServiceableStatus). Without it the chip read
+    // "4 PIN" over a screen showing 5 (owner, 2026-09-25).
+    const pins = [...new Set([row?.home_pin, ...String(row?.pincodes || '').split(',')]
+      .map((p) => String(p ?? '').trim())
       .filter((p) => /^[0-9]{6}$/.test(p)))];
     let cities = [];
     if (pins.length) {
@@ -778,19 +783,24 @@ async function fetchTechFacts(efrId) {
  * on) and how many categories he has in all. The chip opens deep skills, so it
  * reads the same rows.
  */
+async function fetchSkillCategories(efrId) {
+  const [rows] = await pool.query(
+    `SELECT sc.service_catg_name AS name, COUNT(*) AS n
+       FROM tbl_efr_deepskill_mapping m
+       JOIN tbl_service_catg sc ON sc.service_catg_id = m.category_id
+      WHERE m.easyfixer_id = ? AND m.is_repairing = 1
+      GROUP BY sc.service_catg_id, sc.service_catg_name
+      ORDER BY n DESC, sc.service_catg_name
+      LIMIT 50`,
+    [efrId],
+  );
+  return rows.map((r) => r.name).filter(Boolean);
+}
+
 async function fetchSkills(efrId) {
   try {
-    const [rows] = await pool.query(
-      `SELECT sc.service_catg_name AS name, COUNT(*) AS n
-         FROM tbl_efr_deepskill_mapping m
-         JOIN tbl_service_catg sc ON sc.service_catg_id = m.category_id
-        WHERE m.easyfixer_id = ? AND m.is_repairing = 1
-        GROUP BY sc.service_catg_id, sc.service_catg_name
-        ORDER BY n DESC, sc.service_catg_name
-        LIMIT 50`,
-      [efrId],
-    );
-    return { primary: rows[0]?.name ?? null, count: rows.length };
+    const names = await fetchSkillCategories(efrId);
+    return { primary: names[0] ?? null, count: names.length };
   } catch (e) {
     logger.warn({ err: e.message, efrId }, 'fetchSkills failed');
     return { primary: null, count: 0 };
@@ -1106,7 +1116,7 @@ function mapJobForMobile(j) {
  * JS; these are the JS half, and they are the half that silently drops a job.
  */
 module.exports = {
-  getDashboard, fetchIdentity,
+  getDashboard, fetchIdentity, fetchSkillCategories,
   _internals: {
     istDayOf, dedupeById, isStarted, isTodaysWork, workDateOf, fetchDateCounts, ACTIVE_STATUSES,
     // V3 Phase 4 — asserted without a database in tests/v4-a-dashboard.test.js.

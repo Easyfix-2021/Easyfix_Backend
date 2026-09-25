@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const verification = require('./technician-verification.service');
+const dashboard = require('./mobile-dashboard.service');
 const s3Storage = require('../utils/s3-storage');
 const { writeBuffer } = require('../utils/file-storage');
 // LMS completion -> lifecycle wire; see maybeAdvanceTrainingLifecycle below.
@@ -380,7 +381,7 @@ async function getICard(efrId) {
       `SELECT e.efr_id, e.efr_name, e.efr_no,
               e.efr_service_category, e.efr_cityId, c.city_name,
               e.health_insurance, e.accidental_insurance,
-              e.profile_activation_date_time
+              COALESCE(e.profile_activation_date_time, e.auto_activation_date, e.insert_date) AS member_since
          FROM tbl_easyfixer e
          LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
         WHERE e.efr_id = ?
@@ -406,17 +407,29 @@ async function getICard(efrId) {
     logger.warn({ err: e.message, efrId }, 'getICard rating read failed');
   }
 
+  // Skills picked in the new app live in tbl_efr_deepskill_mapping, not the
+  // legacy efr_service_category CSV, so the card showed none for them. Same
+  // rows as the Home skills chip; the legacy column stays the fallback.
+  let skills = [];
+  try {
+    skills = await dashboard.fetchSkillCategories(efrId);
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'getICard skills read failed');
+  }
+
   const hasInsurance = Boolean(row.health_insurance) || Boolean(row.accidental_insurance);
   logger.info('Returning I-Card · rating=' + rating);
   return {
     id: row.efr_id ?? efrId,
     name: row.efr_name ?? null,
     mobile: row.efr_no ?? null,
-    serviceCategoryList: splitCategories(row.efr_service_category),
+    serviceCategoryList: skills.length ? skills : splitCategories(row.efr_service_category),
     city: row.city_name ?? null,
     vaccinated: false, // VERIFY: no vaccination column confirmed on tbl_easyfixer
     insurance: hasInsurance,
-    memberSince: row.profile_activation_date_time ?? null, // VERIFY: activation date as "member since"
+    // Activation date; an account activated outside the CRM flow has none, so
+    // fall back to auto-activation, then the row's creation.
+    memberSince: row.member_since ?? null,
     rating,
     logos: [],
     /*
