@@ -889,8 +889,23 @@ const JOB_OPEN_REASON_PICK = `
  * which silently omits a column that does not exist, while naming one that does
  * not exist 500s the whole jobs list.
  */
-function manageColumns(want, hasJobOffer) {
+function manageColumns(want, hasJobOffer, hasEnquiryCols) {
   if (!want) return '';
+  /*
+   * ── Cancelled / Enquiry ("Failed Orders") reason text ────────────────────
+   *
+   * Probe-gated on the same terms getByIdCore gates its own enquiry_reason_name:
+   * enquiry_reason_id / enquiry_comment are NOT on every deploy, and naming an
+   * absent column does not blank a cell — it 500s the whole jobs list. The NULL
+   * branch keeps the SAME two aliases, so the row SHAPE never changes between
+   * deploys (the invariant tests/manage-jobs-columns.test.js pins for
+   * tbl_job_offer, and now for these).
+   */
+  const enquiryReason = hasEnquiryCols
+    ? `(SELECT atre.action_desc FROM action_taken_reason atre
+        WHERE atre.id = j.enquiry_reason_id LIMIT 1) AS enquiry_reason_name,
+  j.enquiry_comment AS enquiry_comment`
+    : `NULL AS enquiry_reason_name, NULL AS enquiry_comment`;
   /*
    * The five offer aggregates feed jobCurrentStatus' status-0 arm. NULL-aliased
    * when tbl_job_offer is not migrated in, mirroring offerColumns' own
@@ -941,6 +956,36 @@ function manageColumns(want, hasJobOffer) {
   (SELECT LEFT(jc.comments, 300) FROM tbl_job_comment jc
     WHERE jc.job_id = j.job_id
     ORDER BY jc.created_on DESC, jc.comment_id DESC LIMIT 1) AS last_comment,
+  /*
+   * ── WHY A CANCELLED / FAILED ROW WAS CANCELLED (2026-09-25, ops) ─────────
+   *
+   * The Remark cell above renders the latest COMMENT, and a job closed from the
+   * cancel dialog usually has none: the operator picks a reason off
+   * action_taken_reason and types nothing else. So the one column an operator
+   * reads a Failed Order for was an em-dash on exactly those rows. Legacy did
+   * print it: atr.action_desc AS reason_remarks (JobDaoImpl:1689), the
+   * "reason remarks" ops asked for by name.
+   *
+   * TWO columns, because the two terminal statuses hang off two different FKs,
+   * and the XLSX sheet's own "Cancel/Enquiry Reason" already makes exactly this
+   * split (job-export.service.js atr2 / atr3):
+   *     status 6 Cancelled → j.cancel_reason_id   (+ j.cancel_comment)
+   *     status 7 Enquiry   → j.enquiry_reason_id  (+ j.enquiry_comment)
+   * The FE picks by job_status, so the grid cell and the sheet cell can never
+   * name different reasons for the same job.
+   *
+   * ⚠ NOT JOB_OPEN_REASON_PICK — that answers a DIFFERENT question ("who is
+   * this job still open on"), and on a cancelled job whose remarks_date_time is
+   * the later of the two timestamps it resolves to the pending reason, not the
+   * cancellation. Open Due to keeps reading that row; this does not.
+   *
+   * Scalar subqueries on action_taken_reason's PRIMARY KEY: two point lookups,
+   * and nothing joined that could fan a job out into several rows.
+   */
+  (SELECT atrc.action_desc FROM action_taken_reason atrc
+    WHERE atrc.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
+  j.cancel_comment AS cancel_comment,
+  ${enquiryReason},
   /*
    * ── Bucket / Bucket Status inputs ──
    * Not rendered themselves. These are the ~24 fields the two legacy label
@@ -2931,6 +2976,12 @@ async function list({
    */
   const wantsManage = String(view || '') === 'manage';
   /*
+   * Probe for the enquiry trio ONLY for this view — cached per process, and the
+   * eleven other callers of list() have no column that reads it. Feeds
+   * manageColumns' Cancelled/Enquiry reason pair; see the note there.
+   */
+  const hasEnquiryCols = wantsManage ? await hasEnquiryColumns() : false;
+  /*
    * TWO QUESTIONS, TWO FLAGS — they were one, and that shipped a regression.
    *
    * filtersEscalated — did the CALLER ask for escalated jobs only? Drives the
@@ -2958,7 +3009,7 @@ async function list({
     + JOB_AGE_COLUMNS()
     + materialStateColumns()
     + escalationColumns(wantsEscalation)
-    + manageColumns(wantsManage, hasJobOffer);
+    + manageColumns(wantsManage, hasJobOffer, hasEnquiryCols);
   const listJoin = LIST_JOIN + escalationJoin(wantsEscalation) + manageJoin(wantsManage);
 
   // Apply RBAC scope FIRST so any explicit clientId/cityId filter
