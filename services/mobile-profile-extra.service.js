@@ -95,9 +95,13 @@ function splitCategories(raw) {
  */
 async function updateName(efrId, name) {
   logger.info('Update technician name');
+  // FILL-ONLY (owner, 2026-09-25): the name is identity; the app may set it
+  // when missing but never replace a stored one — ops corrects it in the CRM.
   await pool.query(
-    'UPDATE tbl_easyfixer SET efr_name = ? WHERE efr_id = ?',
-    [name, efrId],
+    `UPDATE tbl_easyfixer
+        SET efr_name = COALESCE(NULLIF(TRIM(efr_name), ''), ?), update_date = ?
+      WHERE efr_id = ?`,
+    [name, new Date(), efrId],
   );
   logger.info('Technician name updated · efrId=' + efrId);
   return { ok: true };
