@@ -90,7 +90,7 @@ before(async () => {
   app.use('/', deskRouter);
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => res.status(500).json({ error: String(err && err.message) }));
-  await new Promise((r) => { server = app.listen(0, r); });
+  await new Promise((r) => { server = app.listen(0, '127.0.0.1', r); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
 after(() => { if (server) server.close(); fake.restore(); });
