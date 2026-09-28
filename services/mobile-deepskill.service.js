@@ -33,10 +33,11 @@ const logger = require('../logger');
  *
  * ─── Deep-skill service-type discriminator ──────────────────────────
  *
- * `tbl_service_type.display = 2` marks DEEP-SKILL service types
- * (confirmed 2026-06-15). `service_type_status`: 1=active, 0=inactive,
- * 3=deleted. The hierarchy read restricts to display=2 + status=1 so
- * only deep-skill types surface, matching the CRM deep-skill picker.
+ * `tbl_service_type.display`: 0=CRM-only, 1=All, 2=Tx-app only
+ * (lookup.service.js). `service_type_status`: 1=active, 0=inactive,
+ * 3=deleted. The hierarchy read takes display IN (1, 2) + status=1: every
+ * type the Tx app may see. It read `display = 2` alone until 2026-09-28,
+ * which hid 123 of QA's 142 active deep skills — they hang off "All" types.
  */
 
 // ─── GET hierarchy ──────────────────────────────────────────────────
@@ -75,13 +76,13 @@ async function getHierarchy(efrId, categoryId) {
     throw err;
   }
 
-  // 2) Service types under the category — deep-skill types only
-  //    (display = 2) and active (service_type_status = 1).
+  // 2) Service types under the category the Tx app may see
+  //    (display 1=All or 2=Tx-app; 0 is CRM-only) and active.
   const [serviceTypes] = await pool.query(
     `SELECT service_type_id, service_type_name
        FROM tbl_service_type
       WHERE service_catg_id = ?
-        AND display = 2
+        AND display IN (1, 2)
         AND service_type_status = 1
       ORDER BY service_type_name ASC`,
     [categoryId],
@@ -172,8 +173,10 @@ async function getHierarchy(efrId, categoryId) {
     skillsByType.set(d.service_type_id, arr);
   }
 
-  // 9) Assemble service-type nodes with roll-up counts.
-  const serviceTypeNodes = serviceTypes.map((st) => {
+  // 9) Assemble service-type nodes with roll-up counts — only types that have
+  //    a deep skill to pick (as the profile-update link does); an "All" type
+  //    with none would render as an empty group.
+  const serviceTypeNodes = serviceTypes.filter((st) => skillsByType.has(st.service_type_id)).map((st) => {
     const skills = skillsByType.get(st.service_type_id) || [];
     const selectedSkillCount = skills.filter((s) => s.isDeepSkillSelected).length;
     return {
