@@ -38,7 +38,7 @@ function inFilter(col, values, params) {
 }
 
 // ─── Cities / States ─────────────────────────────────────────────────
-async function cities({ stateId, q, ids, limit = 500, includeInactive = false } = {}) {
+async function cities({ stateId, q, ids, limit = 500, includeInactive = false, withPincodes = false } = {}) {
   // Preselect resolve: fetch specific cities by id (the async CitySelect uses
   // this to show a saved job's city name without preloading the whole table).
   // NOT status-filtered — a preselected/legacy city must still resolve its name
@@ -53,6 +53,7 @@ async function cities({ stateId, q, ids, limit = 500, includeInactive = false } 
     logger.info(`Lookup cities · ids=[${ids.join(',')}] · found=${rows.length}`);
     return rows;
   }
+  if (withPincodes) return citiesWithPincodes({ stateId, q, limit });
   const clauses = [];
   const params = [];
   if (!includeInactive) clauses.push('city_status = 1');
@@ -72,6 +73,58 @@ async function cities({ stateId, q, ids, limit = 500, includeInactive = false } 
   );
   logger.info(`Found ${rows.length} cities`);
   return rows;
+}
+
+/*
+ * The Tx app's Work Area city search. tbl_city also holds thousands of
+ * post-office "cities" that own one PIN each (QA: "Air Force Gurgaon",
+ * "Gurgaon Road"), and the plain lookup sorts alphabetically with a cap, so
+ * "Gur" listed those and could cut the real city off the end. Here: only
+ * cities that own an active PIN, a name that STARTS with q ranks first, then
+ * the most PINs — so the real city leads — with the count and state to tell
+ * look-alikes apart.
+ */
+function cityNameVariants(q) {
+  // Lazy: pincode.service is heavy and nothing else here needs it.
+  const { CITY_ALIAS } = require('./pincode.service'); // eslint-disable-line global-require
+  const lq = String(q).trim().toLowerCase();
+  const out = new Set([lq]);
+  for (const [alias, canonical] of Object.entries(CITY_ALIAS)) {
+    if (alias === lq) out.add(canonical);
+    if (canonical === lq) out.add(alias);
+  }
+  return [...out];
+}
+
+async function citiesWithPincodes({ stateId, q, limit = 20 } = {}) {
+  // No p.pincode_status filter: that column is "already covered by a
+  // technician" (refresh-status), not "a valid PIN" — filtering it would hide
+  // exactly the uncovered areas a technician should be able to pick.
+  const clauses = ['c.city_status = 1'];
+  const params = [];
+  if (stateId != null) { clauses.push('c.state_id = ?'); params.push(stateId); }
+  // A renamed city answers to either name, both ways ("Gurgaon" ⇄ "Gurugram").
+  const names = q ? cityNameVariants(q) : [];
+  if (names.length) {
+    clauses.push(`(${names.map(() => 'c.city_name LIKE ?').join(' OR ')})`);
+    params.push(...names.map((n) => `%${n}%`));
+  }
+  const prefix = names.length ? `(${names.map(() => 'c.city_name LIKE ?').join(' OR ')}) DESC,` : '';
+  params.push(...names.map((n) => `${n}%`));
+  params.push(Math.min(Number(limit) || 20, 100));
+  const [rows] = await pool.query(
+    `SELECT c.city_id, c.city_name, c.state_id, s.state_name, COUNT(*) AS pincode_count
+       FROM tbl_city c
+       JOIN tbl_pincode p ON p.city_id = c.city_id
+       LEFT JOIN tbl_state s ON s.state_id = c.state_id
+      WHERE ${clauses.join(' AND ')}
+      GROUP BY c.city_id, c.city_name, c.state_id, s.state_name
+      ORDER BY ${prefix} pincode_count DESC, c.city_name ASC
+      LIMIT ?`,
+    params,
+  );
+  logger.info(`Lookup cities with pincodes · q=${q ?? '—'} · found=${rows.length}`);
+  return rows.map((r) => ({ ...r, pincode_count: Number(r.pincode_count) }));
 }
 
 async function states() {

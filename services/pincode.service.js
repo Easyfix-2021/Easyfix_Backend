@@ -1530,6 +1530,7 @@ async function suggestZonesForLocation({ cityId = null, lat = null, lng = null, 
 
 module.exports = {
   STATUS,
+  CITY_ALIAS, // lookup.service citiesWithPincodes: "Gurgaon" also finds "Gurugram"
   // Exported for tests: forwarding is invisible in every return value (the
   // caller gets the same { city_id, created } shape either way), so it has to
   // be driven directly as well as through the resolvers.
