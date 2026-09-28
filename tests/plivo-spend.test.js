@@ -34,7 +34,12 @@ beforeEach(() => {
   failOn = null;
   // 200 calls this month, $0.01 each, newest first — long enough that a full
   // walk needs TWO waves, so an incremental refresh is distinguishable from it.
-  calls = Array.from({ length: 200 }, (_, i) => ({ call_uuid: `c${i}`, total_amount: '0.01000', end_time: plivoTs(NOW - (i + 1) * 60_000) }));
+  // Every odd leg is the operator's browser leg (from the SIP endpoint, which
+  // Plivo files as inbound); the even ones are the customer PSTN legs.
+  calls = Array.from({ length: 200 }, (_, i) => ({
+    call_uuid: `c${i}`, total_amount: '0.01000', end_time: plivoTs(NOW - (i + 1) * 60_000),
+    from_number: i % 2 ? 'sip:exweb1_ACCT@phone.plivo.com' : '+918031340062',
+  }));
   // 30 transcriptions this month ($0.0095) then 30 from August that must not count.
   transcriptions = [
     ...Array.from({ length: 30 }, (_, i) => ({ transcription_id: `t${i}`, transcription_cost: '0.00950', add_time: plivoTs(NOW - (i + 1) * 60_000) })),
@@ -62,7 +67,10 @@ test('istMonth: 00:30 IST on the 1st is already the new month, starting 18:30 UT
 test('a cold refresh sums every call and only THIS month\'s transcriptions', async () => {
   await spend.refresh(NOW);
   const s = spend.getMonthSpend(NOW);
-  assert.deepEqual(s.calls, { usd: 2, count: 200, ready: true, estimate: false, estimateReasons: [] });
+  assert.deepEqual(s.calls, {
+    usd: 2, count: 200, ready: true, estimate: false, estimateReasons: [],
+    agent: { usd: 1, count: 100 }, customer: { usd: 1, count: 100 },
+  });
   assert.deepEqual(s.transcriptions, { usd: 0.285, count: 30, ready: true, estimate: false, estimateReasons: [] });
   assert.equal(s.month, '2026-09');
   assert.equal(s.error, null);
@@ -105,5 +113,8 @@ test('a failed page reports the error, and the next refresh walks the whole list
   await spend.refresh(NOW + 120_000);
   s = spend.getMonthSpend(NOW + 120_000);
   assert.equal(s.error, null);
-  assert.deepEqual(s.calls, { usd: 2, count: 200, ready: true, estimate: false, estimateReasons: [] });
+  assert.deepEqual(s.calls, {
+    usd: 2, count: 200, ready: true, estimate: false, estimateReasons: [],
+    agent: { usd: 1, count: 100 }, customer: { usd: 1, count: 100 },
+  });
 });
