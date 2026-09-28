@@ -17,7 +17,8 @@ const { installFakePool } = require('./helpers/fake-pool');
 // null-dimension rule waves every caller through with no scope setup needed.
 const fake = installFakePool([
   [/FROM tbl_efr_advance_payment a[\s\S]*LEFT JOIN/i, () => [{ advance_id: 1, client_id: null, efr_id: 5, vertical_id: null, city_id: null }]],
-  [/SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id/i, () => [{ adv_status: 0 }]],
+  // 1 = Initiated (legacy ladder) — the only state ops-approve accepts.
+  [/SELECT adv_status FROM tbl_efr_advance_payment WHERE advance_id/i, () => [{ adv_status: 1 }]],
   [/^\s*UPDATE tbl_efr_advance_payment/i, () => ({ affectedRows: 1 })],
 ]);
 
@@ -43,7 +44,7 @@ test('ops-approve stamps ops_action_on + updated_on with the SAME bound Date, ne
   const upd = fake.calls.find((c) => /UPDATE tbl_efr_advance_payment/.test(c.sql));
   assert.ok(upd, 'the ops-approve UPDATE ran');
   assert.doesNotMatch(upd.sql, /NOW\(\)/, 'ops_action_on/updated_on must not be SQL NOW()');
-  // SET adv_status = 1, ops_action_on = ?, ops_action_by = ?, ops_remarks = ?, updated_on = ?, updated_by = ?
+  // SET adv_status = 2, ops_action_on = ?, ops_action_by = ?, ops_remarks = ?, updated_on = ?, updated_by = ?
   assert.ok(upd.params[0] instanceof Date, 'ops_action_on is the first bound value');
   assert.ok(upd.params[3] instanceof Date, 'updated_on is the fourth bound value');
   assert.equal(upd.params[0].getTime(), upd.params[3].getTime(), 'paired columns share one instant');
