@@ -141,30 +141,109 @@ const EXPORT_HARD_CAP = 10000;
  * If a mobile column is ever wanted back here, it must be masked in the sheet
  * too; do not simply re-add the raw key.
  */
+/*
+ * ─── THE SHEET'S SHAPE, AND WHY IT IS THIS ONE (2026-09-25) ────────────────
+ *
+ * Ops asked for the download to go back to the legacy "EasyFixerReport" sheet
+ * (EasyFix_CRM EasyfixerServiceImpl.getAllEasyfixerReport): its twenty columns,
+ * in its order, with its headers — including the typo in "CLients Mapped" and
+ * the trailing space in "City Mapped User ", which are kept VERBATIM because
+ * operators' own pivots key off the header text.
+ *
+ * Two complaints, both fixed here:
+ *   1. Service Category printed IDS. tbl_easyfixer stores it (and Service Type)
+ *      as a CSV of ids; the grid resolves them to names client-side and the
+ *      sheet never did. Both now arrive as names — easyfixer.service.js
+ *      exportExtras.
+ *   2. Columns the legacy sheet had were simply missing: today's and tomorrow's
+ *      attendance, the 30-day attendance score, open appointments, district,
+ *      PIN, master name, who activated the profile, "Tx used Temp".
+ *
+ * The eleven columns the CURRENT sheet has and legacy did not (Email, Service
+ * Type, Profile %, earnings, rating, the magic-link audit pair, …) are APPENDED
+ * after the legacy twenty rather than dropped: nobody asked to lose them, and a
+ * download nobody has to ask twice for is the point.
+ *
+ * `align` / `numFmt` per column mirror the legacy report's own cell styles —
+ * centred everywhere except the two long free-text columns, #,##0 on counts,
+ * MM/DD/YYYY on the activation date.
+ */
 const EXPORT_COLUMNS = [
-  { header: 'Easyfixer ID',           key: 'efr_id',                       width: 14 },
-  { header: 'Name',                   key: 'efr_name',                     width: 28 },
-  { header: 'Email',                  key: 'efr_email',                    width: 30 },
-  { header: 'City',                   key: 'city_name',                    width: 20 },
-  { header: 'State',                  key: 'state_name',                   width: 18 },
-  { header: 'User Mapped To City',    key: 'user_mapped_to_city',          width: 22 },
-  { header: 'EF Account',             key: 'ef_account',                   width: 14 },
-  { header: 'Service Category',       key: 'efr_service_category',         width: 22 },
-  { header: 'Service Type',           key: 'efr_service_type',             width: 22 },
-  { header: 'Profile %',              key: 'efr_profile_perc',             width: 11 },
-  { header: 'Verified',               key: 'is_technician_verified',       width: 10 },
-  { header: 'A/C Balance',            key: 'current_balance',              width: 14 },
-  { header: 'Clients Mapped',         key: 'clients_mapped',               width: 15 },
-  { header: 'Total Earnings',         key: 'total_earnings',               width: 16 },
-  { header: 'Job Count',              key: 'job_count',                    width: 12 },
-  { header: 'DeepSkills Mapped',      key: 'options_mapped_count',         width: 15 },
-  { header: 'Serviceable Pincodes',   key: 'serviceable_pincodes_csv',     width: 40 },
-  { header: 'Avg Rating',             key: 'avg_rating',                   width: 12 },
-  { header: 'Last Link Sent',         key: 'profile_update_sent_at',       width: 22 },
-  { header: 'Profile Link Send Count',key: 'profile_update_send_count',    width: 18 },
-  { header: 'Profile Activated On',   key: 'profile_activation_date_time', width: 22 },
-  { header: 'Status',                 key: 'efr_status',                   width: 10 },
+  // ── The legacy twenty, in the legacy order ──
+  { header: 'Id',                            key: 'efr_id',                       width: 10 },
+  { header: 'Name',                          key: 'efr_name',                     width: 25 },
+  { header: 'Service Category',              key: 'service_category_names',       width: 28, align: 'left' },
+  { header: 'Today Attendance',              key: 'attendance_today',             width: 17 },
+  { header: 'Tomorrow Attendance',           key: 'attendance_tomorrow',          width: 17 },
+  { header: 'Appointment In App',            key: 'open_job_count',               width: 17, numFmt: '#,##0' },
+  { header: 'Current Balance',               key: 'current_balance',              width: 17 },
+  { header: 'Attendance Score % in 30 days', key: 'attendance_score',             width: 17 },
+  { header: 'City',                          key: 'city_name',                    width: 17 },
+  { header: 'District',                      key: 'home_district',                width: 28 },
+  { header: 'Efer PIN',                      key: 'efr_pin_no',                   width: 17 },
+  { header: 'State',                         key: 'state_name',                   width: 17 },
+  // Trailing space is legacy's, deliberately kept — see the block comment.
+  { header: 'City Mapped User ',             key: 'user_mapped_to_city',          width: 17 },
+  { header: 'Account Type',                  key: 'ef_account',                   width: 17 },
+  { header: 'Master Name',                   key: 'master_name',                  width: 20 },
+  // "CLients" is legacy's typo, kept verbatim.
+  { header: 'CLients Mapped',                key: 'clients_mapped',               width: 17, numFmt: '#,##0' },
+  { header: 'Current Status',                key: 'efr_status_label',             width: 17 },
+  { header: 'Activation Date',               key: 'profile_activation_date_time', width: 17, numFmt: 'MM/DD/YYYY' },
+  { header: 'Activated By',                  key: 'profile_activated_by',         width: 20 },
+  { header: 'Tx used Temp',                  key: 'tx_used_temp',                 width: 14 },
+  // ── The current sheet's own columns, kept ──
+  /*
+   * STILL NO MOBILE COLUMN, deliberately.
+   *
+   * `efr_no` is in utils/mask-mobile.js MOBILE_FIELDS, which masks it in every
+   * JSON response — including for operators, and even when the
+   * `ui.customer.number.visible` flag is ON. A technician's number is treated
+   * as always-secret in this system.
+   *
+   * The xlsx never got that treatment: masking hooks res.json, and a binary
+   * response never calls it. So the download was handing out in a spreadsheet
+   * the one field the UI refuses to show on screen — and a spreadsheet leaves
+   * the building. Operators who need to reach a technician use the
+   * click-to-call control on the list, which dials by efr_id and never exposes
+   * the number.
+   *
+   * If a mobile column is ever wanted back here, it must be masked in the sheet
+   * too; do not simply re-add the raw key.
+   */
+  { header: 'Email',                   key: 'efr_email',                 width: 30, align: 'left' },
+  { header: 'Service Type',            key: 'service_type_names',        width: 28, align: 'left' },
+  { header: 'Profile %',               key: 'efr_profile_perc',          width: 11 },
+  { header: 'Verified',                key: 'is_technician_verified',    width: 10 },
+  { header: 'Total Earnings',          key: 'total_earnings',            width: 16, numFmt: '#,##0' },
+  { header: 'Job Count',               key: 'job_count',                 width: 12, numFmt: '#,##0' },
+  { header: 'DeepSkills Mapped',       key: 'options_mapped_count',      width: 15, numFmt: '#,##0' },
+  { header: 'Serviceable Pincodes',    key: 'serviceable_pincodes_csv',  width: 40, align: 'left' },
+  { header: 'Avg Rating',              key: 'avg_rating',                width: 12 },
+  { header: 'Last Link Sent',          key: 'profile_update_sent_at',    width: 22 },
+  { header: 'Profile Link Send Count', key: 'profile_update_send_count', width: 18, numFmt: '#,##0' },
+  { header: 'Status',                  key: 'efr_status',                width: 10 },
 ];
+
+/*
+ * ── The legacy report's LOOK, reproduced ───────────────────────────────────
+ *
+ * Read off the reference file's own styles.xml rather than guessed: SansSerif
+ * 10 throughout, a bold header row, and a medium black box around every cell
+ * (DynamicReports' pen1Point). exceljs wants 8-digit ARGB, hence the FF prefix.
+ *
+ * NO FILL ON THE HEADER (ops, 2026-09-25). The legacy sheet painted it
+ * bright green — POI's Color.GREEN, 00FF00 — and that is the one thing from
+ * the reference we do NOT reproduce: it was asked to go. The header is still
+ * distinguishable by its bold weight, taller wrapped row and border box, so
+ * nothing about reading the sheet depends on the colour. Do not add a fill
+ * back here without asking.
+ */
+const SHEET_FONT   = { name: 'SansSerif', size: 10, color: { argb: 'FF000000' } };
+const HEADER_FONT  = { ...SHEET_FONT, bold: true };
+const MEDIUM_EDGE  = { style: 'medium', color: { argb: 'FF000000' } };
+const CELL_BORDER  = { top: MEDIUM_EDGE, left: MEDIUM_EDGE, bottom: MEDIUM_EDGE, right: MEDIUM_EDGE };
+const HEADER_ROW_HEIGHT = 34;
 
 /*
  * Format a DATETIME / Date value for XLSX export. Aggregates() returns
@@ -180,6 +259,43 @@ function formatDateTimeForXlsx(v) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/*
+ * A real Date for a date-formatted cell (Activation Date), so the column sorts
+ * and filters as a date in Excel instead of as text. Invalid / missing → null,
+ * which exceljs writes as an empty cell — legacy printed nothing there too.
+ */
+function toDateCell(v) {
+  if (v == null) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/*
+ * "Attendance Score % in 30 days" — legacy's exact string: the raw count of
+ * days marked in parentheses, then the percentage of 30 to two decimals, e.g.
+ * "(18) 60.00". Zero days renders empty, as it did there (EasyfixerDaoImpl's
+ * `if (attMonthCount > 0)`), rather than a misleading "0.00".
+ */
+function attendanceScore(daysMarked) {
+  const n = Number(daysMarked) || 0;
+  if (n <= 0) return '';
+  return `(${n}) ${((n / 30) * 100).toFixed(2)}`;
+}
+
+/*
+ * aggregates() / attendance() cap their id list at 1000 and DROP the rest, so a
+ * download of more than 1000 technicians used to come back with those columns
+ * empty from row 1001 on. Chunked here instead.
+ */
+async function inChunks(ids, fn) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += easyfixer.EXPORT_ID_CHUNK) {
+    const part = await fn(ids.slice(i, i + easyfixer.EXPORT_ID_CHUNK));
+    out.push(...(part.rows || []));
+  }
+  return out;
+}
+
 router.get('/download', validate(listQuery, 'query'), async (req, res, next) => {
   try {
     logger.info('Export easyfixers XLSX · status=' + (req.query.status ?? 'all') + ' q=' + (req.query.q || ''));
@@ -190,46 +306,77 @@ router.get('/download', validate(listQuery, 'query'), async (req, res, next) => 
     });
 
     /*
-     * Merge in the aggregation + attendance columns server-side for the
-     * download path (2026-06-08). The list query was split into a fast
-     * base + two side endpoints to fix the 20+s page-load perf — but the
-     * XLSX export still wants the full picture (Earnings / Job Count /
-     * Clients Mapped / Rating + today's attendance). Fire both side
-     * endpoints in parallel with the just-fetched efr_ids, then merge by
-     * efr_id into each row before adding to the sheet.
-     *
-     * For a 10k-row download (the EXPORT_HARD_CAP) the aggregates query
-     * still runs in ~1-2s thanks to the new covering indexes; the
-     * attendance query is even cheaper. Total download time stays
-     * dominated by the base list, not the merge.
+     * Merge in the aggregation + attendance + legacy-report columns server-side
+     * for the download path (2026-06-08, extended 2026-09-25). The list query
+     * was split into a fast base + side endpoints to fix the 20+s page load —
+     * but the XLSX still wants the full picture. All three run in parallel and
+     * merge by efr_id; each is CHUNKED at 1000 ids (see inChunks), because the
+     * two side endpoints cap there and used to drop everything past row 1000.
      */
     const efrIds = rows.map((r) => r.efr_id);
-    const [aggResp, attResp] = await Promise.all([
-      efrIds.length ? easyfixer.aggregates(efrIds, { scope }) : Promise.resolve({ rows: [] }),
-      efrIds.length ? easyfixer.attendance(efrIds, { scope }) : Promise.resolve({ rows: [] }),
+    const [aggRows, attRows, extras] = await Promise.all([
+      inChunks(efrIds, (ids) => easyfixer.aggregates(ids, { scope })),
+      inChunks(efrIds, (ids) => easyfixer.attendance(ids, { scope })),
+      // Chunks internally, and answers { rows: [] } for an empty id list.
+      easyfixer.exportExtras(efrIds, { scope }),
     ]);
-    const aggByEfr = new Map((aggResp.rows || []).map((r) => [r.efr_id, r]));
-    const attByEfr = new Map((attResp.rows || []).map((r) => [r.efr_id, r]));
+    const aggByEfr = new Map(aggRows.map((r) => [r.efr_id, r]));
+    const attByEfr = new Map(attRows.map((r) => [r.efr_id, r]));
+    const extraByEfr = new Map((extras.rows || []).map((r) => [r.efr_id, r]));
 
     const wb = new ExcelJS.Workbook();
-    const sheet = wb.addWorksheet('Easyfixers');
-    sheet.columns = EXPORT_COLUMNS;
-    sheet.getRow(1).font = { bold: true };
+    const sheet = wb.addWorksheet('Report');
+    /*
+     * Column style is set on the COLUMN, not per cell: exceljs copies it onto
+     * each cell as the row is added, so a 10 000-row sheet does not pay for
+     * 320 000 style objects written one at a time.
+     */
+    sheet.columns = EXPORT_COLUMNS.map((c) => ({
+      header: c.header,
+      key: c.key,
+      width: c.width,
+      style: {
+        font: SHEET_FONT,
+        border: CELL_BORDER,
+        alignment: { horizontal: c.align || 'center', vertical: 'top', wrapText: false },
+        ...(c.numFmt ? { numFmt: c.numFmt } : {}),
+      },
+    }));
     for (const r of rows) {
       const agg = aggByEfr.get(r.efr_id) || {};
       const att = attByEfr.get(r.efr_id) || {};
+      const ex = extraByEfr.get(r.efr_id) || {};
       sheet.addRow({
         ...r,
         ...agg,
         ...att,
+        ...ex,
+        // "Tx used Temp" — legacy printed "Yes" or nothing at all, never "No".
+        tx_used_temp: Number(ex.is_eligible_for_offline_orders) === 1 ? 'Yes' : '',
+        attendance_score: attendanceScore(ex.attendance_30_days),
+        // Legacy's fallback for a technician with no attendance row at all; the
+        // query already returns it, this only covers an older/absent extras row.
+        attendance_today: ex.attendance_today ?? 'No-Information',
+        attendance_tomorrow: ex.attendance_tomorrow ?? 'No-Information',
         is_technician_verified: r.is_technician_verified ? 'Yes' : 'No',
         efr_status: r.efr_status === 1 ? 'Active' : 'Inactive',
+        // A real date cell (MM/DD/YYYY), the way the legacy sheet carried it.
+        profile_activation_date_time: toDateCell(r.profile_activation_date_time),
         // Format the magic-link timestamp inline — agg.profile_update_sent_at
         // is a Date | string | null per mysql2's DATETIME handling.
         profile_update_sent_at: formatDateTimeForXlsx(agg.profile_update_sent_at),
         profile_update_send_count: agg.profile_update_send_count ?? 0,
       });
     }
+
+    // The header row carries bold + wrapping on top of the column style. No
+    // fill: the cells keep the workbook default (no colour) — see SHEET_FONT.
+    const header = sheet.getRow(1);
+    header.font = HEADER_FONT;
+    header.alignment = { horizontal: 'center', vertical: 'top', wrapText: true };
+    header.height = HEADER_ROW_HEIGHT;
+    header.eachCell((cell) => { cell.border = CELL_BORDER; });
+    header.commit();
 
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     const buffer = await wb.xlsx.writeBuffer();
