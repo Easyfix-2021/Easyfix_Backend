@@ -309,7 +309,7 @@ function buildAdminApp(actions) {
 
 async function listenOn(app) {
   const server = await new Promise((resolve) => {
-    const s = app.listen(0, () => resolve(s));
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });
   return { server, baseUrl: `http://127.0.0.1:${server.address().port}` };
 }
@@ -371,7 +371,7 @@ test('POST /jobs/:id/material-request with a repeated Idempotency-Key creates on
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => res.status(err.status || 500).json({ error: err.message }));
 
-  const server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   try {
     const post = () => fetch(`${baseUrl}/jobs/900/material-request`, {

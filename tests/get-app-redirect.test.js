@@ -16,7 +16,11 @@ const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebK
 const DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36';
 
 async function get(path, ua) {
-  const server = express().use('/', router).listen(0);
+  // Bound to the host we fetch: a wildcard bind can share a port with another
+  // process's 127.0.0.1 listener, which then answers this request instead.
+  // With a host the bind is async, so wait for it before reading the port.
+  const server = express().use('/', router).listen(0, '127.0.0.1');
+  await new Promise((resolve) => server.once('listening', resolve));
   try {
     const { port } = server.address();
     return await fetch(`http://127.0.0.1:${port}${path}`, { headers: { 'user-agent': ua }, redirect: 'manual' });

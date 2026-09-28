@@ -991,7 +991,7 @@ before(async () => {
   app.use(express.json());
   app.use((req, _res, next) => { lastReq = req; req.user = { ...actingUser }; next(); });
   app.use('/api/admin/field-rekey', fieldRekeyRouter);
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}/api/admin/field-rekey`;
 });
 

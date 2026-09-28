@@ -407,7 +407,7 @@ describe('GET /:clientId/material-rates/download', () => {
     });
     app.use('/clients', clientsRouter);
     app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
-    await new Promise((resolve) => { downloadServer = app.listen(0, resolve); });
+    await new Promise((resolve) => { downloadServer = app.listen(0, '127.0.0.1', resolve); });
     downloadBaseUrl = `http://127.0.0.1:${downloadServer.address().port}`;
   });
 
@@ -522,7 +522,7 @@ describe('POST /:clientId/material-rates/batch', () => {
     });
     app.use('/clients', clientsRouter);
     app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
-    await new Promise((resolve) => { batchServer = app.listen(0, resolve); });
+    await new Promise((resolve) => { batchServer = app.listen(0, '127.0.0.1', resolve); });
     batchBaseUrl = `http://127.0.0.1:${batchServer.address().port}`;
   });
 
@@ -664,7 +664,7 @@ describe('GET /:clientId/material-rates/master-rows', () => {
     });
     app.use('/clients', clientsRouter);
     app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
-    await new Promise((resolve) => { masterRowsServer = app.listen(0, resolve); });
+    await new Promise((resolve) => { masterRowsServer = app.listen(0, '127.0.0.1', resolve); });
     masterRowsBaseUrl = `http://127.0.0.1:${masterRowsServer.address().port}`;
   });
 

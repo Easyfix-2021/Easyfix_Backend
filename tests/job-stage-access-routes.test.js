@@ -121,7 +121,7 @@ before(async () => {
     res.status(err && err.__stop ? 599 : 500).json({ stopped: !!(err && err.__stop) });
   });
 
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 

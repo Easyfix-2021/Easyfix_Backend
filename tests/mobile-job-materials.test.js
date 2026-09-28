@@ -347,7 +347,7 @@ test('POST /jobs/:id/quotation with a repeated Idempotency-Key creates only one 
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => res.status(err.status || 500).json({ error: err.message }));
 
-  const server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });
+  const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   try {
     const post = () => fetch(`${baseUrl}/jobs/200/quotation`, {
