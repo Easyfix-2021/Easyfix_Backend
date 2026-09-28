@@ -1165,16 +1165,22 @@ async function listServiceablePincodes(efrId) {
   logger.info('Found ' + pins.length + ' serviceable pincodes');
   const placeholders = pins.map(() => '?').join(',');
   const [items] = await pool.query(
+    // zonal_manager_name: a city's zonal manager is its STATE's, stored on
+    // tbl_city.state_user (services/city.service.js says the same, and joins it
+    // the same way). Carried here so the CRM can group a technician's coverage
+    // by city and name who owns it without a second round-trip.
     `SELECT p.pincode_id,
             p.pincode,
             p.location           AS location,
             p.city_id,
             c.city_name,
             c.state_id,
-            s.state_name
+            s.state_name,
+            zm.user_name         AS zonal_manager_name
        FROM tbl_pincode p
        LEFT JOIN tbl_city  c ON c.city_id  = p.city_id
        LEFT JOIN tbl_state s ON s.state_id = c.state_id
+       LEFT JOIN tbl_user  zm ON zm.user_id = c.state_user
       WHERE p.pincode IN (${placeholders})
       ORDER BY p.pincode ASC`,
     pins
