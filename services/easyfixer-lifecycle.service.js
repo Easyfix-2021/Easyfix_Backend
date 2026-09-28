@@ -48,8 +48,10 @@ const LEGACY_WORK_BLOCKED = new Set([
 ]);
 const REAPPLY_FROM = new Set(['INACTIVE', 'DORMANT', 'APPLICATION_REJECTED']);
 // A rejected profile stays on the "Profile Rejected" wall for this many days
-// after the rejection; only then does re-application open.
-const REJECTION_COOLDOWN_DAYS = 90;
+// after the rejection; only then does re-application open. 90 -> 30 on
+// 2026-09-28 at Priyanka's call: a denied lead waits a month, not a quarter.
+// The 409 message interpolates this constant, so it cannot drift from it.
+const REJECTION_COOLDOWN_DAYS = 30;
 
 /** ISO instant re-application opens, or null when no cooldown applies. */
 function reapplyAvailableAt(status, changedAt) {

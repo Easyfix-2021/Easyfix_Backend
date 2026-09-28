@@ -625,16 +625,16 @@ test('technician re-application is allowed only from documented states', () => {
   );
 });
 
-test('a rejected profile cannot re-apply for 90 days after the rejection', () => {
+test('a rejected profile cannot re-apply for 30 days after the rejection', () => {
   const day = 86400000;
-  const recent = new Date(Date.now() - 89 * day).toISOString();
-  const old = new Date(Date.now() - 91 * day).toISOString();
+  const recent = new Date(Date.now() - 29 * day).toISOString();
+  const old = new Date(Date.now() - 31 * day).toISOString();
   for (const changedAt of [recent, undefined]) {
     assert.throws(
       () => assertTransition({ status: 'APPLICATION_REJECTED', changedAt }, 'REAPPLIED', {
         source: 'APP', reason: 'Please review',
       }),
-      /90 days after profile rejection/,
+      /30 days after profile rejection/,
     );
   }
   assert.equal(capabilitiesForStatus('APPLICATION_REJECTED', recent).reapply, false);
@@ -650,7 +650,7 @@ test('a rejected profile cannot re-apply for 90 days after the rejection', () =>
   assert.equal(snapshot.canReapply, false);
   assert.equal(
     Date.parse(snapshot.reapplyAvailableAt) - Date.parse(recent),
-    90 * day,
+    30 * day,
   );
 });
 
