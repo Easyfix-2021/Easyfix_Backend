@@ -47,7 +47,9 @@ const fake = installFakePool(
     [/SHOW COLUMNS FROM tbl_vertical_mapping LIKE 'inserted_on'/, () => (scenario.hasInsertedOn ? [{ Field: 'inserted_on' }] : [])],
     [/SHOW COLUMNS/i, []],
     [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
-    [/SELECT customer_id FROM tbl_customer WHERE customer_id/, [{ customer_id: 7 }]],
+    // Reads customer_name too since 2026-09-24 (the booking name is written
+    // back to the customer master), so match the table and key, not the list.
+    [/FROM tbl_customer WHERE customer_id/, [{ customer_id: 7 }]],
     // The head lookup. Ordered before the tbl_user route because its SQL joins
     // tbl_user too and the fake takes the FIRST matching route.
     [HEAD_LOOKUP, () => {
