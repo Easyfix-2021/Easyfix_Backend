@@ -736,7 +736,4 @@ async function runQaDbRefresh({ dryRun = false } = {}) {
 module.exports = {
   runQaDbRefresh, assertSafeToRun,
   cancelRun,
-  // Shared with services/qa-geo-refresh.service.js (location-tables-only
-  // refresh) so both jobs use ONE set of guards, replica config and recipients.
-  src, dst, recipients,
 };
