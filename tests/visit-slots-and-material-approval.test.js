@@ -334,7 +334,7 @@ app.use((err, _req, res, _next) => res.status(err.status || 500).json({ success:
 
 let server, baseUrl;
 before(async () => {
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 after(async () => {
@@ -472,7 +472,7 @@ test('on-behalf: 403 without isJobMaterialReview', async () => {
     next();
   });
   appNoAction.use('/jobs', require('../routes/admin/jobs'));
-  const s = await new Promise((resolve) => { const srv = appNoAction.listen(0, () => resolve(srv)); });
+  const s = await new Promise((resolve) => { const srv = appNoAction.listen(0, '127.0.0.1', () => resolve(srv)); });
   try {
     const res = await fetch(`http://127.0.0.1:${s.address().port}/jobs/${JOB_ID}/client-approval-on-behalf`, { method: 'POST', body: new FormData() });
     assert.equal(res.status, 403);

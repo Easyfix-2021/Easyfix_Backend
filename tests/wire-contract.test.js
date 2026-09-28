@@ -187,7 +187,7 @@ function feSortKeys(srcDir) {
       // one would trip the unreadable-header assertion below on a line that
       // ships no sort key at all.
       if (/^\s*(?:\/\/|\*|\/\*|\{\/\*)/.test(line)) return;
-      if (line.includes('<SortHeader')) headers.push({ file, lineNo: i + 1, line });
+      if (line.includes('<SortHeader')) headers.push({ file, src, lineNo: i + 1, line });
     });
   }
 
@@ -204,19 +204,40 @@ function feSortKeys(srcDir) {
      */
     assert.ok(m, `could not read the col= prop of a <SortHeader> at ${rel(h.file)}:${h.lineNo} `
       + `— has its shape changed?\n  ${h.line.trim()}`);
-    let key = m[1] ?? m[2];
-    if (key === undefined) {
-      const seen = consts.get(m[3]);
-      assert.ok(seen, `${rel(h.file)}:${h.lineNo} sorts by the identifier ${m[3]}, which is not `
+    const resolve = (ident) => {
+      const seen = consts.get(ident);
+      assert.ok(seen, `${rel(h.file)}:${h.lineNo} sorts by the identifier ${ident}, which is not `
         + 'an exported string const anywhere under the CRM src/ — the key it resolves to cannot '
         + 'be checked against SORTABLE_COLUMNS.');
-      assert.equal(seen.size, 1, `${rel(h.file)}:${h.lineNo} sorts by ${m[3]}, but that name is `
+      assert.equal(seen.size, 1, `${rel(h.file)}:${h.lineNo} sorts by ${ident}, but that name is `
         + `exported with ${seen.size} different values under src/ (${[...seen].join(', ')}) — `
         + 'which one reaches the wire is a guess.');
-      [key] = seen;
+      return [...seen][0];
+    };
+    /*
+     * A header rendered per column: `const key = SORT_KEY[c]; ... col={key}`
+     * (BookingQueueTable.tsx). The browser can send ANY value of that map, so
+     * every value is a key this header ships — each a literal or an exported
+     * const. Resolved in the header's own file only: the map is module-local.
+     */
+    let found;
+    if (m[1] ?? m[2]) found = [m[1] ?? m[2]];
+    else {
+      const lookup = h.src.match(new RegExp(`\\bconst ${m[3]}\\s*=\\s*([A-Za-z_$][\\w$]*)\\[`));
+      const body = lookup && h.src.match(new RegExp(`\\bconst ${lookup[1]}\\b[^=]*=\\s*\\{([^}]*)\\}`));
+      if (lookup) {
+        assert.ok(body, `${rel(h.file)}:${h.lineNo} sorts by ${m[3]} = ${lookup[1]}[…], but no `
+          + `object literal \`const ${lookup[1]} = { … }\` was found in that file to read it from.`);
+        found = [...body[1].matchAll(/^\s*[\w$]+\s*:\s*(?:'([^']*)'|([A-Za-z_$][\w$]*))\s*,?\s*$/gm)]
+          .map((v) => v[1] ?? resolve(v[2]));
+        assert.ok(found.length, `${rel(h.file)}:${h.lineNo}: read no values out of ${lookup[1]} — `
+          + 'has its shape changed?');
+      } else found = [resolve(m[3])];
     }
-    if (!keys.has(key)) keys.set(key, []);
-    keys.get(key).push(`${rel(h.file)}:${h.lineNo}`);
+    for (const key of found) {
+      if (!keys.has(key)) keys.set(key, []);
+      keys.get(key).push(`${rel(h.file)}:${h.lineNo}`);
+    }
     files.add(h.file);
   }
   /*

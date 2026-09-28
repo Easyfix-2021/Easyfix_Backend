@@ -243,7 +243,7 @@ before(async () => {
   app.use('/jobs', jobsRouter);
   // eslint-disable-next-line no-unused-vars
   app.use((err, _req, res, _next) => { res.status(500).json({ error: String(err && err.message) }); });
-  await new Promise((resolve) => { adminServer = app.listen(0, resolve); });
+  await new Promise((resolve) => { adminServer = app.listen(0, '127.0.0.1', resolve); });
   adminBaseUrl = `http://127.0.0.1:${adminServer.address().port}`;
 });
 

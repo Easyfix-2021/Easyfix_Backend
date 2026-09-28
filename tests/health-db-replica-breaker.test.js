@@ -52,7 +52,7 @@ let base;
 before(async () => {
   const app = express();
   app.use('/api', router);
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
 

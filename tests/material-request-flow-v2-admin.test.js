@@ -185,7 +185,7 @@ express1.use('/quotations', require('../routes/admin/quotations'));
 express1.use((err, _req, res, _next) => res.status(500).json({ error: String(err && err.message) }));
 
 let quotationsServer, quotationsBaseUrl;
-before(async () => { await new Promise((resolve) => { quotationsServer = express1.listen(0, resolve); }); quotationsBaseUrl = `http://127.0.0.1:${quotationsServer.address().port}`; });
+before(async () => { await new Promise((resolve) => { quotationsServer = express1.listen(0, '127.0.0.1', resolve); }); quotationsBaseUrl = `http://127.0.0.1:${quotationsServer.address().port}`; });
 after(() => { if (quotationsServer) quotationsServer.close(); });
 
 test('GET /admin/quotations?jobId= — each row carries `state`', async () => {
@@ -270,7 +270,7 @@ express2.use('/jobs', require('../routes/admin/jobs'));
 express2.use((err, _req, res, _next) => res.status(500).json({ error: String(err && err.message) }));
 
 let jobsServer, jobsBaseUrl;
-before(async () => { await new Promise((resolve) => { jobsServer = express2.listen(0, resolve); }); jobsBaseUrl = `http://127.0.0.1:${jobsServer.address().port}`; });
+before(async () => { await new Promise((resolve) => { jobsServer = express2.listen(0, '127.0.0.1', resolve); }); jobsBaseUrl = `http://127.0.0.1:${jobsServer.address().port}`; });
 after(() => { if (jobsServer) jobsServer.close(); });
 
 async function addLine(body) {
@@ -337,7 +337,7 @@ test('CRM add line requires isJobMaterialReview — 403 without it', async () =>
     next();
   });
   app.use('/jobs', require('../routes/admin/jobs'));
-  const srv = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });
+  const srv = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   try {
     const res = await fetch(`http://127.0.0.1:${srv.address().port}/jobs/${JOB_ID}/quotation-lines`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ materialId: 10, quantity: 1, approvedAmount: 500 }),
@@ -354,7 +354,7 @@ const express3 = express();
 express3.use(express.json());
 express3.use('/aux', require('../routes/admin/auxiliary'));
 let auxServer, auxBaseUrl;
-before(async () => { await new Promise((resolve) => { auxServer = express3.listen(0, resolve); }); auxBaseUrl = `http://127.0.0.1:${auxServer.address().port}`; });
+before(async () => { await new Promise((resolve) => { auxServer = express3.listen(0, '127.0.0.1', resolve); }); auxBaseUrl = `http://127.0.0.1:${auxServer.address().port}`; });
 after(() => { if (auxServer) auxServer.close(); });
 
 test('GET /admin/aux/materials/job/:jobId excludes Travel/Penalty/Incentive typed rows', async () => {
