@@ -148,9 +148,9 @@ test('technicians NOT in TRAINING_PENDING activate exactly as before, with no tr
 });
 
 test('the automatic post-training exit still advances TRAINING_PENDING -> UNDER_VERIFICATION', async () => {
-  // finalizeTrainingCompletion is driven by lms.isTrainingComplete (assigned
-  // courses). It is not an activation, so the rule must not intercept it —
-  // even while the mandatory set reads incomplete.
+  // finalizeTrainingCompletion moves unconditionally — its CALLER
+  // (lms.settleTrainingCompletion) decides on the mandatory definition. It is
+  // not an activation, so the activation rule must not intercept it.
   trainingDone = null;
   const result = await lifecycle.finalizeTrainingCompletion(77);
   assert.equal(result.changed, true);
@@ -158,4 +158,29 @@ test('the automatic post-training exit still advances TRAINING_PENDING -> UNDER_
   assert.equal(result.transitionedFrom, 'TRAINING_PENDING');
   assert.equal(trainingLookups, 0);
   assert.equal(lifecycleWrites().length, 1);
+});
+
+/*
+ * Gate 1 decides entry into TRAINING_PENDING on the SAME definition (owner,
+ * 2026-09-28). It used lms.isTrainingComplete (ASSIGNED courses): with no
+ * mandatory course assigned a registrant skipped TRAINING_PENDING, and the
+ * activation rule above never got to run.
+ */
+test('Gate 1: mandatory training outstanding → TRAINING_PENDING, even with no course assigned', async () => {
+  const lms = require('../services/lms.service');
+  const saved = { assign: lms.assignMandatoryCourses, complete: lms.isTrainingComplete };
+  lms.assignMandatoryCourses = async () => ({ assigned: 0 });
+  lms.isTrainingComplete = async () => { throw new Error('Gate 1 must not ask the assigned-courses question'); };
+  try {
+    for (const [done, expected] of [[null, 'TRAINING_PENDING'], ['2026-09-25 12:00:00', 'UNDER_VERIFICATION']]) {
+      row = baseRow({ lifecycle_status: 'REGISTRATION_INCOMPLETE' });
+      calls = [];
+      trainingDone = done;
+      const result = await lifecycle.finalizeMobileRegistrationGate1(77);
+      assert.equal(result.lifecycle.status, expected, `completedAt=${done}`);
+    }
+  } finally {
+    lms.assignMandatoryCourses = saved.assign;
+    lms.isTrainingComplete = saved.complete;
+  }
 });
