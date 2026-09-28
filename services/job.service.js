@@ -1,6 +1,7 @@
 const { pool } = require('../db');
 const logger = require('../logger');
 const clientRequest = require('./client-request.service');
+const bookingQueue = require('./booking-queue.service');
 const { isAbsentAnswer } = require('../utils/schema-absent-error');
 // Job-OTP generator — shared with the auth flow so we're not
 // duplicating the cryptographically-safe 4-digit primitive. See
@@ -665,7 +666,17 @@ const LIST_COLUMNS = `
    */
   ef.efr_no AS easyfixer_mobile,
   j.job_owner, ow.user_name AS owner_name,
-  j.fk_address_id, ci.city_name, ad.address, ad.gps_location,
+  /*
+   * ad.pin_code joins the BASE list (2026-09-21, ops: "add PIN under city").
+   * It was only in manageColumns() -- the view=manage projection -- so the two
+   * My Orders queues, which never ask for that view, rendered the city with an
+   * always-undefined PIN under it and the line silently never appeared. The
+   * tbl_address join below is unconditional for this query, so this costs no
+   * extra join and no extra row.
+   * NOTE: this comment lives INSIDE a template literal and ships to MySQL as a
+   * SQL comment -- no backticks in here, they would end the literal.
+   */
+  j.fk_address_id, ci.city_name, ad.address, ad.gps_location, ad.pin_code,
   /*
    * service_count — count of ACTIVE rows on tbl_job_services for this
    * job. Powers the FE "Booked but no services" pill (added
@@ -921,7 +932,8 @@ function manageColumns(want, hasJobOffer, hasEnquiryCols) {
     : `, NULL AS offer_total, NULL AS offer_pending, NULL AS offer_accepted`
       + `, NULL AS offer_rejected, NULL AS offer_expired`;
   return `,
-  ad.pin_code,
+  /* ad.pin_code moved to LIST_COLUMNS on 2026-09-21 -- manageColumns is always
+     appended to it, so naming it here too would select the same column twice. */
   ef.efr_manager_id,
   /*
    * Master / Under Master / Individual. The relationship is tbl_easyfixer's own
@@ -2859,6 +2871,11 @@ async function list({
   quotationStatus,           // enum — 'approved' | 'rejected'
   section,                   // enum — My Orders -> Unconfirmed section (client-request.service.js)
   sectionIds,                // {cancel,retry} action_taken_reason ids, resolved by the caller
+  bucket,                    // enum — My Orders -> Booking queue tile (booking-queue.service.js)
+  bucketHasRequestTable,     // bool — probed by the caller (see customerRequestTableExists)
+  ageDay,                    // enum — Booking-queue day pill: '0' | '1' | '2' | '3plus'
+  withEscalation,            // bool — project the escalation flag for the 🔥 row mark
+  customerRescheduled,       // bool — the Booking-queue "Rescheduled by customer" flag
   requestedBefore,           // 'now' or ISO date — Running Late tile
   /*
    * `noServices` (2026-05-28) — Booked-No-Services tile drill-down.
@@ -3004,10 +3021,35 @@ async function list({
    */
   const filtersEscalated = isEscalated !== undefined && isEscalated !== ''
     && isEscalated !== false && String(isEscalated) !== 'false' && String(isEscalated) !== '0';
-  const wantsEscalation = wantsManage || filtersEscalated;
+  /*
+   * …and the Booking queue, which shows a 🔥 on every escalated row whichever
+   * bucket it sits in (ops, 2026-09-24). Without this the flag columns are only
+   * projected for the manage view or when the caller FILTERS on escalation, so
+   * the queue could filter by it but never display it — a row would look
+   * ordinary right up until somebody clicked the flag chip.
+   */
+  /*
+   * …and any caller that asks for it outright (2026-09-25). The My Orders
+   * tables show a 🔥 beside the job number in EVERY bucket, and the flag
+   * columns were projected only for the manage view, an escalation FILTER, or
+   * the booking queue — so those tables could not render what ops asked to
+   * see. `withEscalation` is opt-in rather than always-on because the columns
+   * cost a LEFT JOIN resolved through MAX(table_id), which every list that
+   * does not draw the mark should not pay for.
+   */
+  const wantsEscalation = wantsManage || filtersEscalated || !!bucket
+    || withEscalation === true || String(withEscalation) === 'true';
   const listColumns =
     LIST_COLUMNS + pendingRequestColumns(hasCustomerRequestTable, hasPreferredSlotColumn) + offerColumns(hasJobOffer, offerExpiry)
     + magicLinkDeliveryColumns(hasMagicLinkDeliveryCols)
+    /*
+     * Booking-queue attempt facts (attempts_count, last attempt, transferred_at),
+     * ONLY when a bucket is in play. They are correlated subqueries over the
+     * comment and call logs, and every other caller of this list would pay for
+     * columns it never renders. Same expressions the transfer rule uses, so a
+     * row's "2 of 3" and the tile it sits in cannot disagree.
+     */
+    + (bucket ? bookingQueue.attemptColumns('j') : '')
     // Job Age (ageDays + ageSecs) — unconditional; every column it touches is a
     // long-standing tbl_job column, so there is nothing to existence-probe.
     + JOB_AGE_COLUMNS()
@@ -3375,6 +3417,54 @@ async function list({
     else { clauses.push('1=0'); }   // unknown section: empty, never unfiltered
   }
 
+  /*
+   * `bucket` — one of the five Booking-queue tiles. Same arrangement as
+   * `section` above and for the same reason: the predicate lives beside the
+   * counts that use it (booking-queue.service.js), so the tile and the grid
+   * beneath it can never describe different populations, and it is applied as
+   * an ordinary clause so it composes with search, city, client, sort and
+   * paging rather than needing an endpoint of its own.
+   *
+   * It carries no bound parameters — every test is a column comparison or a
+   * correlated EXISTS.
+   */
+  if (bucket) {
+    /*
+     * `ageDay` composes INSIDE the bucket predicate rather than as a clause of
+     * its own, so the grid gets exactly the rows the day pill counted — one
+     * definition of "Day 2 of No response", not a bucket filter and an age
+     * filter that each look right separately.
+     */
+    const sql = bookingQueue.bucketPredicate(bucket, {
+      hasRequestTable: bucketHasRequestTable !== false,
+      day: ageDay || undefined,
+    });
+    if (sql) clauses.push(`(${sql})`);
+    else clauses.push('1=0');       // unknown bucket or pill: empty, never unfiltered
+  } else if (ageDay) {
+    // A pill without a bucket is not a thing the page can send, and answering
+    // it as "the whole board" would be a quietly wrong list.
+    clauses.push('1=0');
+  }
+
+  /*
+   * `customerRescheduled` — the Booking-queue flag chip. The CUSTOMER moved
+   * their own appointment, which is a different fact from tbl_job's
+   * auto_rescheduled (our after-3pm shift) and from an ops reschedule, so it
+   * reads the request the customer actually raised.
+   *
+   * Gated on the same table probe the bucket uses: where the table is absent
+   * the flag matches nothing rather than 500ing the list, so the chip shows an
+   * empty result instead of taking the page down.
+   */
+  if (customerRescheduled === true || customerRescheduled === 'true') {
+    if (bucketHasRequestTable === false) clauses.push('1=0');
+    else {
+      clauses.push(`EXISTS (SELECT 1 FROM tbl_job_customer_request cr_flag
+         WHERE cr_flag.job_id = j.job_id AND cr_flag.request_type = 'reschedule')`);
+    }
+  }
+
   if (quotationStatus === 'approved') {
     clauses.push(
       'EXISTS (SELECT 1 FROM quotation_details qd WHERE qd.job_id = j.job_id AND qd.status = 1 AND qd.action_on IS NOT NULL)',
@@ -3489,194 +3579,13 @@ async function list({
    */
   if (startDate)           { clauses.push(`${dateCol} >= DATE(?)`); params.push(startDate); }
   if (endDate)             { clauses.push(`${dateCol} < DATE(?) + INTERVAL 1 DAY`); params.push(endDate); }
+  /*
+   * One definition, two callers: the grid here and the Booking-queue tiles via
+   * job.searchClause(). See the function for why it is not copied.
+   */
   if (q) {
-    /*
-     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
-     * the numeric job id on the Unconfirmed tab to triage a specific
-     * order. Earlier this clause only matched against text fields
-     * (reference id, client ref, customer name + mobile), so a search
-     * like "12345" returned zero rows even when job_id=12345 was on
-     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
-     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
-     * matching operator expectations.
-     */
-    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
-    // matches, so the two layers agree: job id / reference / client ref /
-    // customer name+mobile PLUS client name, city, technician, and owner. The
-    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
-    // query's alias-detection below auto-adds their joins once they appear here.
-    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
-    // j) — captured at booking, shown in the "Client SPOC" column of the
-    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
-    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
-    // is always present), and since COUNT + data share this where/params the two
-    // OR terms apply to both.
-    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
-    // the row displays (and the CRM's client-side re-filter reads) the job-row
-    // name, so matching the master name alone would return rows the browser then
-    // hides — the precise failure tests/job-search-parity.test.js exists to
-    // prevent. Placeholder count is unchanged (11), so the params.push below
-    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
-    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
-    // shows up in its BE column list — the parity it asserts still holds (both
-    // sides now key on the same effective name), it simply cannot see it.
-    /*
-     * ⚠ A PURELY NUMERIC TERM IS AN IDENTIFIER, NOT A SUBSTRING.
-     *
-     * Reported from production: searching 530280 returned THREE jobs. #530280
-     * was the one wanted; the other two matched because the floating LIKE hit
-     * their PHONE NUMBERS mid-digit — 98453028|06 and 93|530280|25 both contain
-     * "530280". Any 6-digit id has roughly five landing spots inside a 10-digit
-     * mobile, so the false-match rate grows with how many customers exist, not
-     * with how unusual the term is. At 153k jobs an id search nearly always
-     * drags in strangers.
-     *
-     * It was also slow for the same reason: eleven '%term%' predicates cannot
-     * use an index, so every search full-scanned tbl_job and five joined tables.
-     *
-     * So a digits-only term takes a typed path:
-     *   - j.job_id = ?  — a PRIMARY KEY lookup, exact and instant. This is what
-     *     the operator meant, and it is the whole reason the search felt slow.
-     *   - the two reference columns keep a substring match: they are opaque
-     *     client strings (WO1024566, 171-2677513-3675553) where a fragment is a
-     *     legitimate way to search.
-     *   - the mobile matches only a term long enough to BE a phone fragment
-     *     (>= MOBILE_MIN_DIGITS), and is anchored so it cannot match mid-number.
-     *   - name/city/client/owner columns are skipped entirely — a digits-only
-     *     term is never a person's name, and each one was a full scan.
-     * Anything containing a non-digit keeps the original eleven-column search.
-     */
-    const digitsOnly = /^\d+$/.test(q);
-    if (digitsOnly) {
-      const idTerms = ['j.job_id = ?', 'j.job_reference_id LIKE ?', 'j.client_ref_id LIKE ?'];
-      const idParams = [Number(q), `%${q}%`, `%${q}%`];
-      // A phone fragment, not an id. Anchored at the START so "530280" can
-      // never match the middle of 9845302806 — the reported bug.
-      if (q.length >= MOBILE_MIN_DIGITS) {
-        /*
-         * ── THE MOBILE BRANCH IS A SET LOOKUP, NOT A JOINED COLUMN ──
-         * (2026-08-20, measured against the 481k-row table — see the numbers
-         * in the block below.)
-         *
-         * It used to read `cu.customer_mob_no LIKE ?`, i.e. a column of the
-         * OUTER LEFT JOIN. Because it sat inside an OR with three tbl_job
-         * predicates, MySQL could not decide the row until tbl_customer had
-         * been joined, so EXPLAIN showed `cu eq_ref … Using where` and the
-         * server paid ~481k PK probes into tbl_customer for one search —
-         * whether or not any of them could match. That is what made a phone
-         * search the slowest thing on the page (2.0s data + 1.9s count).
-         *
-         * Written as an uncorrelated IN (…), the same rows come back but the
-         * predicate is now pure-`j`: MySQL runs the subquery ONCE as
-         * `range` on the customer_mob_no index (EXPLAIN: `2 SUBQUERY qmob
-         * type=range key=mobile_unique … Using index`) and probes the result.
-         * The prefix anchor is what makes the range possible — it is a
-         * correctness rule first (see above) and an index rule second.
-         *
-         * SAME ROWS, three-valued logic included: customer_id is the PK of
-         * tbl_customer, so `cu.customer_mob_no LIKE 't%'` is true for exactly
-         * the jobs whose fk_customer_id is in that set. A NULL or orphan
-         * fk_customer_id yields NULL/false on both sides (`NULL IN (…)` is
-         * UNKNOWN, `NULL LIKE …` is NULL) and OR-composes identically.
-         * ⚠ This is IN, never NOT IN — the NOT-IN/NULL trap does not apply,
-         * and must not be introduced here by "simplifying" it later.
-         *
-         * SIDE EFFECT, deliberate: the WHERE no longer names `cu.`, so the
-         * COUNT query's alias sniffing below stops adding the tbl_customer
-         * join to it as well. The subquery is self-contained, so COUNT and
-         * the data query still filter on exactly the same predicate — the
-         * totals were verified equal on real data for every term shape.
-         *
-         * Measured, min-of-5 interleaved, q = a real 10-digit mobile:
-         *              data query      COUNT query
-         *   before      2027 ms         1864 ms
-         *   after       1088 ms          865 ms
-         * and unchanged (~31 ms) on the selective tabs, because the plan is
-         * still free to drive from idx_tbl_job_status.
-         */
-        idTerms.push(
-          'j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
-        );
-        idParams.push(`${q}%`);
-      }
-      /*
-       * ═══ WHY THIS IS STILL AN `OR`, AND NOT A UNION OF INDEXED BRANCHES ═══
-       *
-       * The obvious next move — and the one docs/migrations for the
-       * customer_mob_no index proposed — is to stop OR-ing indexable and
-       * non-indexable branches and instead feed the outer query a UNION of
-       * per-branch id lookups:
-       *
-       *   FROM tbl_job j … JOIN (
-       *        SELECT job_id FROM tbl_job WHERE job_id = ?
-       *   UNION SELECT job_id FROM tbl_job WHERE job_reference_id LIKE ?
-       *                                        OR client_ref_id LIKE ?
-       *   UNION SELECT … FROM tbl_customer … JOIN tbl_job …
-       *   ) qs ON qs.job_id = j.job_id
-       *
-       * It was built and MEASURED against the real 481k-row table before
-       * being rejected. Both halves of the premise turn out to be false:
-       *
-       * 1. IT CANNOT MAKE EVERY BRANCH INDEX-USABLE. job_reference_id and
-       *    client_ref_id are matched with a LEADING wildcard, which no index
-       *    shape can serve — not in an OR, not in a UNION branch, not
-       *    anywhere. Moving them into a subquery changes where the scan
-       *    happens, never whether it happens. (Neither column is indexed at
-       *    all today; even a covering index would only turn the clustered
-       *    scan into a narrower index-only one — measured 600 ms → 137 ms for
-       *    an equivalent full scan of a narrow secondary index. Worth doing
-       *    on its own merits; it does not change this conclusion.)
-       *
-       * 2. IT TAKES THE PLAN CHOICE AWAY FROM THE OPTIMISER. The derived
-       *    table has to be materialised before the join, so the UNION shape
-       *    costs one full scan of tbl_job — ~690 ms — NO MATTER WHAT ELSE IS
-       *    IN THE WHERE. The current OR is an ordinary per-row predicate, so
-       *    MySQL is free to drive from whichever filter is selective and
-       *    check the term on the few rows that survive. Quick search almost
-       *    always ships with a tab filter, and 9 of the 12 tabs are tiny
-       *    (status 0=430 rows, 1=432, 10=259, 21=78, 15=66, 2+20=48 …).
-       *
-       *    Endpoint latency, min-of-5 interleaved, real data, q=482507:
-       *                       today (OR)      UNION shape
-       *      no tab ('All')      896 ms          694 ms   ← UNION 1.3× better
-       *      status=5 (332k)    1259 ms          694 ms   ← UNION 1.8× better
-       *      status=0 (430)       33 ms          706 ms   ← UNION 21× WORSE
-       *      status=20 (4)        35 ms          729 ms   ← UNION 21× WORSE
-       *
-       *    A 1.3–1.8× win on two tabs bought with a 21× loss on nine is not a
-       *    trade worth making. Result parity was never the problem — the
-       *    UNION returned identical rows on every term shape tested — the
-       *    physics is.
-       *
-       * 3. `j.job_id IN (SELECT … UNION …)` — the same idea kept in the
-       *    WHERE so the optimiser could still choose — is worse than either:
-       *    MySQL 8.4 refuses to flatten a UNION subquery into a semi-join and
-       *    executes it as a DEPENDENT SUBQUERY, re-running the union per
-       *    outer row. Measured 5.1 s / 10.3 s. Do not resurrect it.
-       *
-       * THE `REF-` REDUNDANCY QUESTION. job_reference_id is normally
-       * `REF-{job_id}` (utils/job-reference.js), which makes it tempting to
-       * drop `j.job_reference_id LIKE ?` for a digits-only term as
-       * "already covered by j.job_id = ?". It is NOT covered, on two
-       * independent grounds:
-       *   • SEMANTICS. On auto rows the branch is effectively
-       *     `CAST(job_id AS CHAR) LIKE '%t%'` — a SUBSTRING match over the id
-       *     digits, strictly wider than equality. Searching "5302" returns
-       *     261 jobs today (453027, 415302, …); equality returns none of them.
-       *   • PROVENANCE. The value is only auto-generated when the caller
-       *     supplies neither `job_reference_id` nor `reuse_client_ref`
-       *     (create(), ~line 3255). On this database 3,768 rows of 481,043
-       *     carry a ref that is NOT `REF-{job_id}`, and a live search proves
-       *     the branch earns its place: q=999998 matches job 298642 even
-       *     though no such job id exists (max id is 482507).
-       * So the branch stays, and with it the one scan nothing can remove.
-       */
-      clauses.push(`(${idTerms.join(' OR ')})`);
-      params.push(...idParams);
-    } else {
-      clauses.push(`(CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?)`);
-      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
-    }
+    const qc = searchClause(q);
+    if (qc.sql) { clauses.push(`(${qc.sql})`); params.push(...qc.params); }
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -3860,6 +3769,44 @@ async function list({
       }
     } else {
       for (const r of rows) r.offer_efrs = [];
+    }
+  }
+
+  /*
+   * COVERAGE — Local / Travel / nothing, for the Booking queue's chip.
+   *
+   *   a PIN, and a technician who serves it   → LOCAL
+   *   a PIN, and nobody who serves it         → TRAVEL  (somebody must travel)
+   *   no PIN at all                           → NO CHIP
+   *
+   * The third case is the one worth spelling out: a job with no pincode is not
+   * "local by default", it is UNANSWERABLE, and a green LOCAL chip on it would
+   * be a guess wearing the clothes of a measurement. The FE shows nothing.
+   *
+   * Computed HERE rather than in SQL: the coverage test is FIND_IN_SET over a
+   * hand-maintained CSV of serviceable pincodes, which can never use an index —
+   * pincode-coverage.service.js explains at length why it loads the supply side
+   * once and intersects in memory instead, and it caches that set. Doing it per
+   * row in the query would re-run the whole supply lookup for every job on the
+   * page. Only for the Booking queue (`bucket`), so no other caller pays for it.
+   *
+   * Fail-soft: a coverage lookup that throws leaves `coverage` null and the
+   * chip simply absent. A wrong chip is worse than no chip — it decides
+   * whether somebody has to travel.
+   */
+  if (bucket && rows.length) {
+    try {
+      const pins = rows.map((r) => r.pin_code).filter(Boolean);
+      const covered = pins.length
+        ? await require('./pincode-coverage.service').getCoveredPincodes(pins)
+        : new Set();
+      for (const r of rows) {
+        const pin = r.pin_code ? String(r.pin_code).trim() : '';
+        r.coverage = pin ? (covered.has(pin) ? 'local' : 'travel') : null;
+      }
+    } catch (e) {
+      logger.warn('Coverage lookup failed (chip renders blank) · ' + ((e && e.message) || e));
+      for (const r of rows) r.coverage = null;
     }
   }
   return { rows, total };
@@ -4536,6 +4483,77 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages } = 
 }
 
 /*
+ * The row-level scope (RBAC clients/cities/states/verticals + Job Stage
+ * Access) as a reusable WHERE fragment plus the JOINs it needs.
+ *
+ * Lifted out of getAttentionSummary, which owned the only copy, when the
+ * Booking-queue tiles needed the SAME fragment. A second copy would have been
+ * a second answer to "which jobs may this user see", and the one place that
+ * must never happen is a count sitting directly above the list it describes.
+ *
+ * Pure: everything it reads is an argument, so it is callable from any query
+ * in this file and from services/booking-queue.service.js through the route.
+ */
+function jobScopeFragment({ scope, allowedStages, hasVerticalCol = false } = {}, jobAlias = 'j') {
+  const clauses = [];
+  const params = [];
+  if (scope) {
+    const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
+    if (
+      (c  && c.mode  === 'none') ||
+      (ci && ci.mode === 'none') ||
+      (st && st.mode === 'none') ||
+      (v  && v.mode  === 'none')
+    ) {
+      clauses.push('1=0');
+    }
+    if (c && c.mode === 'allow' && c.ids.length) {
+      clauses.push(`${jobAlias}.fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
+      params.push(...c.ids);
+    }
+    if (ci && ci.mode === 'allow' && ci.ids.length) {
+      clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
+      params.push(...ci.ids);
+    }
+    // States filter (2026-06-03) — kept in sync with getStatusCounts.
+    // Joins tbl_city via the address's city_id to read state_id.
+    if (st && st.mode === 'allow' && st.ids.length) {
+      clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
+      params.push(...st.ids);
+    }
+    if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
+      clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
+      params.push(...v.ids);
+    }
+  }
+  // Job Stage Access — intersect every tile's own status predicate with the
+  // caller's visible-status union so the tiles respect the same restriction
+  // as the list + counts. References only the job alias → no extra join.
+  if (allowedStages && allowedStages.mode === 'list') {
+    const visible = [...stageVisibleStatuses(allowedStages.stages)];
+    if (visible.length === 0) {
+      clauses.push('1=0');
+    } else {
+      clauses.push(`${jobAlias}.job_status IN (${visible.map(() => '?').join(',')})`);
+      params.push(...visible);
+    }
+  }
+  // Same JOIN strategy as getStatusCounts: tbl_address needed
+  // whenever cities OR states filter is on; tbl_city only for states;
+  // tbl_client only for verticals. Each is LEFT JOIN so missing FKs
+  // don't drop the row from the count.
+  const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
+  const needsCt = scope?.states?.mode === 'allow';
+  const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
+  const joins = [
+    needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
+    needsCt ? `LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id`                : '',
+    needsCl ? `LEFT JOIN tbl_client  cl ON cl.client_id  = ${jobAlias}.fk_client_id`  : '',
+  ].filter(Boolean).join(' ');
+  return { clauses, params, joins };
+}
+
+/*
  * Attention summary — drives the dashboard's "Orders Needing Immediate
  * Attention" card (replaces the old Recent Jobs widget).
  *
@@ -4564,63 +4582,9 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
 
   // Build the scope clauses + needed joins ONCE — reused across all
   // five queries so we don't double-scan tbl_address / tbl_client.
+  // One definition, shared with the Booking-queue tiles — see jobScopeFragment.
   function buildScopeFragment(jobAlias = 'j') {
-    const clauses = [];
-    const params = [];
-    if (scope) {
-      const c = scope.clients, ci = scope.cities, st = scope.states, v = scope.verticals;
-      if (
-        (c  && c.mode  === 'none') ||
-        (ci && ci.mode === 'none') ||
-        (st && st.mode === 'none') ||
-        (v  && v.mode  === 'none')
-      ) {
-        clauses.push('1=0');
-      }
-      if (c && c.mode === 'allow' && c.ids.length) {
-        clauses.push(`${jobAlias}.fk_client_id IN (${c.ids.map(() => '?').join(',')})`);
-        params.push(...c.ids);
-      }
-      if (ci && ci.mode === 'allow' && ci.ids.length) {
-        clauses.push(`ad.city_id IN (${ci.ids.map(() => '?').join(',')})`);
-        params.push(...ci.ids);
-      }
-      // States filter (2026-06-03) — kept in sync with getStatusCounts.
-      // Joins tbl_city via the address's city_id to read state_id.
-      if (st && st.mode === 'allow' && st.ids.length) {
-        clauses.push(`ct.state_id IN (${st.ids.map(() => '?').join(',')})`);
-        params.push(...st.ids);
-      }
-      if (v && v.mode === 'allow' && v.ids.length && hasVerticalCol) {
-        clauses.push(`cl.vertical_id IN (${v.ids.map(() => '?').join(',')})`);
-        params.push(...v.ids);
-      }
-    }
-    // Job Stage Access — intersect every tile's own status predicate with the
-    // caller's visible-status union so the tiles respect the same restriction
-    // as the list + counts. References only the job alias → no extra join.
-    if (allowedStages && allowedStages.mode === 'list') {
-      const visible = [...stageVisibleStatuses(allowedStages.stages)];
-      if (visible.length === 0) {
-        clauses.push('1=0');
-      } else {
-        clauses.push(`${jobAlias}.job_status IN (${visible.map(() => '?').join(',')})`);
-        params.push(...visible);
-      }
-    }
-    // Same JOIN strategy as getStatusCounts: tbl_address needed
-    // whenever cities OR states filter is on; tbl_city only for states;
-    // tbl_client only for verticals. Each is LEFT JOIN so missing FKs
-    // don't drop the row from the count.
-    const needsAd = scope?.cities?.mode === 'allow' || scope?.states?.mode === 'allow';
-    const needsCt = scope?.states?.mode === 'allow';
-    const needsCl = scope?.verticals?.mode === 'allow' && hasVerticalCol;
-    const joins = [
-      needsAd ? `LEFT JOIN tbl_address ad ON ad.address_id = ${jobAlias}.fk_address_id` : '',
-      needsCt ? `LEFT JOIN tbl_city    ct ON ct.city_id    = ad.city_id`                : '',
-      needsCl ? `LEFT JOIN tbl_client  cl ON cl.client_id  = ${jobAlias}.fk_client_id`  : '',
-    ].filter(Boolean).join(' ');
-    return { clauses, params, joins };
+    return jobScopeFragment({ scope, allowedStages, hasVerticalCol }, jobAlias);
   }
 
   // Helper: run a count safely. On any error, log + return 0 so the
@@ -4797,10 +4761,39 @@ async function getAttentionSummary({ scope, allowedStages } = {}) {
 }
 
 // ─── Customer + Address helpers (used by create) ───────────────────
+/*
+ * The name typed on a booking also becomes the CUSTOMER-MASTER name.
+ *
+ * Decided 2026-09-24 (Priyanka): Book New Call and Confirm & Schedule show the
+ * master name, and whatever the operator leaves in that box is the customer's
+ * name from then on — not just this job's. tbl_job.job_customer_name still
+ * records what was typed FOR THIS JOB (see JOB_CUSTOMER_NAME_EXPR above); this
+ * additionally keeps tbl_customer in step, so Manage Customers, the customer
+ * lookup and every other job that shares this mobile show the corrected name.
+ *
+ * ⚠ The master row is keyed on the MOBILE NUMBER and shared by every job that
+ * number ever booked, so this renames the customer everywhere. Blank names are
+ * ignored, and a name that only differs by case or spacing writes nothing.
+ */
+async function syncCustomerName(conn, existingRow, typedName, actor) {
+  const next = String(typedName ?? '').trim();
+  if (!next) return;
+  const current = String(existingRow?.customer_name ?? '').trim();
+  if (current.toLowerCase() === next.toLowerCase() && current === next) return;
+  // customer_name / update_date / updated_by — all three on the verified column
+  // list in scripts/schema-verify.js, so the rename carries who did it.
+  await conn.query(
+    'UPDATE tbl_customer SET customer_name = ?, update_date = ?, updated_by = ? WHERE customer_id = ?',
+    [next, new Date(), actor?.user_id || null, existingRow.customer_id]
+  );
+  logger.info('Customer master name updated from a booking · customerId=' + existingRow.customer_id
+    + ' · "' + current + '" -> "' + next + '"');
+}
+
 async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_no, customer_email }, actor) {
   if (customer_id) {
     const [[found]] = await conn.query(
-      'SELECT customer_id FROM tbl_customer WHERE customer_id = ? LIMIT 1',
+      'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_id = ? LIMIT 1',
       [customer_id]
     );
     if (!found) {
@@ -4808,14 +4801,18 @@ async function upsertCustomer(conn, { customer_id, customer_name, customer_mob_n
       err.status = 400;
       throw err;
     }
+    await syncCustomerName(conn, found, customer_name, actor);
     return customer_id;
   }
   // Lookup by mobile — reuse existing
   const [[existing]] = await conn.query(
-    'SELECT customer_id FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
+    'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_mob_no = ? LIMIT 1',
     [customer_mob_no]
   );
-  if (existing) return existing.customer_id;
+  if (existing) {
+    await syncCustomerName(conn, existing, customer_name, actor);
+    return existing.customer_id;
+  }
 
   const [ins] = await conn.query(
     `INSERT INTO tbl_customer (customer_name, customer_mob_no, customer_email, is_active, created_by, insert_date, update_date)
@@ -4982,6 +4979,228 @@ function normaliseJobImageFilenames(input) {
     if (!out.includes(name)) out.push(name);
   }
   return out;
+}
+
+/*
+ * THE SEARCH BOX, AS SQL — extracted 2026-09-25 so the BOOKING QUEUE'S TILE
+ * COUNTS can apply the very same predicate the grid applies.
+ *
+ * Ops typed a client name and the rows narrowed while every tile above them
+ * kept the number for the whole board, which is the one thing these tiles are
+ * not allowed to do: they are supposed to add up to what is underneath them.
+ *
+ * Copying the clause into the counts query was the alternative, and this file
+ * already records what that costs — the digits-only branch below is a measured
+ * optimisation (2.0s to 1.1s on a phone search) with a correctness rule inside
+ * it (the mobile term is PREFIX-anchored so "530280" cannot match the middle of
+ * 9845302806). A second copy would have been a second place for both to rot.
+ *
+ * Returns the clause, its params, and WHICH aliases it needs — the caller joins
+ * what it does not already have. list() has them all in LIST_JOIN; the counts
+ * query adds only what the term actually touches.
+ */
+function searchClause(q) {
+  const clauses = [];
+  const params = [];
+  if (q) {
+    /*
+     * `j.job_id` added (2026-06-10 fix) — operators routinely search by
+     * the numeric job id on the Unconfirmed tab to triage a specific
+     * order. Earlier this clause only matched against text fields
+     * (reference id, client ref, customer name + mobile), so a search
+     * like "12345" returned zero rows even when job_id=12345 was on
+     * the very page being viewed. Now job_id is a CAST AS CHAR + LIKE
+     * so partial numeric matches (e.g. "1234" → 12340..12349) work,
+     * matching operator expectations.
+     */
+    // Search covers every field the client-side filter (job-tabs.ts filterJobRows)
+    // matches, so the two layers agree: job id / reference / client ref /
+    // customer name+mobile PLUS client name, city, technician, and owner. The
+    // cl/ci/ef/ow aliases are already in the data-query LIST_JOIN, and the COUNT
+    // query's alias-detection below auto-adds their joins once they appear here.
+    // client_spoc_name / client_spoc are denormalised snapshots ON tbl_job (alias
+    // j) — captured at booking, shown in the "Client SPOC" column of the
+    // Unconfirmed + Pending-to-Scheduling tabs. They were displayed but NOT
+    // searchable; added here so a SPOC-name search matches. No new JOIN (alias j
+    // is always present), and since COUNT + data share this where/params the two
+    // OR terms apply to both.
+    // The customer-name term is JOB_CUSTOMER_NAME_EXPR, not `cu.customer_name`:
+    // the row displays (and the CRM's client-side re-filter reads) the job-row
+    // name, so matching the master name alone would return rows the browser then
+    // hides — the precise failure tests/job-search-parity.test.js exists to
+    // prevent. Placeholder count is unchanged (11), so the params.push below
+    // still binds exactly one value per LIKE. NOTE: that test's source-scraping
+    // regex only detects bare `alias.col LIKE ?` terms, so this one no longer
+    // shows up in its BE column list — the parity it asserts still holds (both
+    // sides now key on the same effective name), it simply cannot see it.
+    /*
+     * ⚠ A PURELY NUMERIC TERM IS AN IDENTIFIER, NOT A SUBSTRING.
+     *
+     * Reported from production: searching 530280 returned THREE jobs. #530280
+     * was the one wanted; the other two matched because the floating LIKE hit
+     * their PHONE NUMBERS mid-digit — 98453028|06 and 93|530280|25 both contain
+     * "530280". Any 6-digit id has roughly five landing spots inside a 10-digit
+     * mobile, so the false-match rate grows with how many customers exist, not
+     * with how unusual the term is. At 153k jobs an id search nearly always
+     * drags in strangers.
+     *
+     * It was also slow for the same reason: eleven '%term%' predicates cannot
+     * use an index, so every search full-scanned tbl_job and five joined tables.
+     *
+     * So a digits-only term takes a typed path:
+     *   - j.job_id = ?  — a PRIMARY KEY lookup, exact and instant. This is what
+     *     the operator meant, and it is the whole reason the search felt slow.
+     *   - the two reference columns keep a substring match: they are opaque
+     *     client strings (WO1024566, 171-2677513-3675553) where a fragment is a
+     *     legitimate way to search.
+     *   - the mobile matches only a term long enough to BE a phone fragment
+     *     (>= MOBILE_MIN_DIGITS), and is anchored so it cannot match mid-number.
+     *   - name/city/client/owner columns are skipped entirely — a digits-only
+     *     term is never a person's name, and each one was a full scan.
+     * Anything containing a non-digit keeps the original eleven-column search.
+     */
+    const digitsOnly = /^\d+$/.test(q);
+    if (digitsOnly) {
+      const idTerms = ['j.job_id = ?', 'j.job_reference_id LIKE ?', 'j.client_ref_id LIKE ?'];
+      const idParams = [Number(q), `%${q}%`, `%${q}%`];
+      // A phone fragment, not an id. Anchored at the START so "530280" can
+      // never match the middle of 9845302806 — the reported bug.
+      if (q.length >= MOBILE_MIN_DIGITS) {
+        /*
+         * ── THE MOBILE BRANCH IS A SET LOOKUP, NOT A JOINED COLUMN ──
+         * (2026-08-20, measured against the 481k-row table — see the numbers
+         * in the block below.)
+         *
+         * It used to read `cu.customer_mob_no LIKE ?`, i.e. a column of the
+         * OUTER LEFT JOIN. Because it sat inside an OR with three tbl_job
+         * predicates, MySQL could not decide the row until tbl_customer had
+         * been joined, so EXPLAIN showed `cu eq_ref … Using where` and the
+         * server paid ~481k PK probes into tbl_customer for one search —
+         * whether or not any of them could match. That is what made a phone
+         * search the slowest thing on the page (2.0s data + 1.9s count).
+         *
+         * Written as an uncorrelated IN (…), the same rows come back but the
+         * predicate is now pure-`j`: MySQL runs the subquery ONCE as
+         * `range` on the customer_mob_no index (EXPLAIN: `2 SUBQUERY qmob
+         * type=range key=mobile_unique … Using index`) and probes the result.
+         * The prefix anchor is what makes the range possible — it is a
+         * correctness rule first (see above) and an index rule second.
+         *
+         * SAME ROWS, three-valued logic included: customer_id is the PK of
+         * tbl_customer, so `cu.customer_mob_no LIKE 't%'` is true for exactly
+         * the jobs whose fk_customer_id is in that set. A NULL or orphan
+         * fk_customer_id yields NULL/false on both sides (`NULL IN (…)` is
+         * UNKNOWN, `NULL LIKE …` is NULL) and OR-composes identically.
+         * ⚠ This is IN, never NOT IN — the NOT-IN/NULL trap does not apply,
+         * and must not be introduced here by "simplifying" it later.
+         *
+         * SIDE EFFECT, deliberate: the WHERE no longer names `cu.`, so the
+         * COUNT query's alias sniffing below stops adding the tbl_customer
+         * join to it as well. The subquery is self-contained, so COUNT and
+         * the data query still filter on exactly the same predicate — the
+         * totals were verified equal on real data for every term shape.
+         *
+         * Measured, min-of-5 interleaved, q = a real 10-digit mobile:
+         *              data query      COUNT query
+         *   before      2027 ms         1864 ms
+         *   after       1088 ms          865 ms
+         * and unchanged (~31 ms) on the selective tabs, because the plan is
+         * still free to drive from idx_tbl_job_status.
+         */
+        idTerms.push(
+          'j.fk_customer_id IN (SELECT qmob.customer_id FROM tbl_customer qmob WHERE qmob.customer_mob_no LIKE ?)'
+        );
+        idParams.push(`${q}%`);
+      }
+      /*
+       * ═══ WHY THIS IS STILL AN `OR`, AND NOT A UNION OF INDEXED BRANCHES ═══
+       *
+       * The obvious next move — and the one docs/migrations for the
+       * customer_mob_no index proposed — is to stop OR-ing indexable and
+       * non-indexable branches and instead feed the outer query a UNION of
+       * per-branch id lookups:
+       *
+       *   FROM tbl_job j … JOIN (
+       *        SELECT job_id FROM tbl_job WHERE job_id = ?
+       *   UNION SELECT job_id FROM tbl_job WHERE job_reference_id LIKE ?
+       *                                        OR client_ref_id LIKE ?
+       *   UNION SELECT … FROM tbl_customer … JOIN tbl_job …
+       *   ) qs ON qs.job_id = j.job_id
+       *
+       * It was built and MEASURED against the real 481k-row table before
+       * being rejected. Both halves of the premise turn out to be false:
+       *
+       * 1. IT CANNOT MAKE EVERY BRANCH INDEX-USABLE. job_reference_id and
+       *    client_ref_id are matched with a LEADING wildcard, which no index
+       *    shape can serve — not in an OR, not in a UNION branch, not
+       *    anywhere. Moving them into a subquery changes where the scan
+       *    happens, never whether it happens. (Neither column is indexed at
+       *    all today; even a covering index would only turn the clustered
+       *    scan into a narrower index-only one — measured 600 ms → 137 ms for
+       *    an equivalent full scan of a narrow secondary index. Worth doing
+       *    on its own merits; it does not change this conclusion.)
+       *
+       * 2. IT TAKES THE PLAN CHOICE AWAY FROM THE OPTIMISER. The derived
+       *    table has to be materialised before the join, so the UNION shape
+       *    costs one full scan of tbl_job — ~690 ms — NO MATTER WHAT ELSE IS
+       *    IN THE WHERE. The current OR is an ordinary per-row predicate, so
+       *    MySQL is free to drive from whichever filter is selective and
+       *    check the term on the few rows that survive. Quick search almost
+       *    always ships with a tab filter, and 9 of the 12 tabs are tiny
+       *    (status 0=430 rows, 1=432, 10=259, 21=78, 15=66, 2+20=48 …).
+       *
+       *    Endpoint latency, min-of-5 interleaved, real data, q=482507:
+       *                       today (OR)      UNION shape
+       *      no tab ('All')      896 ms          694 ms   ← UNION 1.3× better
+       *      status=5 (332k)    1259 ms          694 ms   ← UNION 1.8× better
+       *      status=0 (430)       33 ms          706 ms   ← UNION 21× WORSE
+       *      status=20 (4)        35 ms          729 ms   ← UNION 21× WORSE
+       *
+       *    A 1.3–1.8× win on two tabs bought with a 21× loss on nine is not a
+       *    trade worth making. Result parity was never the problem — the
+       *    UNION returned identical rows on every term shape tested — the
+       *    physics is.
+       *
+       * 3. `j.job_id IN (SELECT … UNION …)` — the same idea kept in the
+       *    WHERE so the optimiser could still choose — is worse than either:
+       *    MySQL 8.4 refuses to flatten a UNION subquery into a semi-join and
+       *    executes it as a DEPENDENT SUBQUERY, re-running the union per
+       *    outer row. Measured 5.1 s / 10.3 s. Do not resurrect it.
+       *
+       * THE `REF-` REDUNDANCY QUESTION. job_reference_id is normally
+       * `REF-{job_id}` (utils/job-reference.js), which makes it tempting to
+       * drop `j.job_reference_id LIKE ?` for a digits-only term as
+       * "already covered by j.job_id = ?". It is NOT covered, on two
+       * independent grounds:
+       *   • SEMANTICS. On auto rows the branch is effectively
+       *     `CAST(job_id AS CHAR) LIKE '%t%'` — a SUBSTRING match over the id
+       *     digits, strictly wider than equality. Searching "5302" returns
+       *     261 jobs today (453027, 415302, …); equality returns none of them.
+       *   • PROVENANCE. The value is only auto-generated when the caller
+       *     supplies neither `job_reference_id` nor `reuse_client_ref`
+       *     (create(), ~line 3255). On this database 3,768 rows of 481,043
+       *     carry a ref that is NOT `REF-{job_id}`, and a live search proves
+       *     the branch earns its place: q=999998 matches job 298642 even
+       *     though no such job id exists (max id is 482507).
+       * So the branch stays, and with it the one scan nothing can remove.
+       */
+      // No outer parens here: each caller wraps the clause itself, so the
+      // emitted string stays byte-identical to what the grid emitted before
+      // this was extracted (tests/job-search-numeric-plan.test.js parses it).
+      clauses.push(idTerms.join(' OR '));
+      params.push(...idParams);
+    } else {
+      clauses.push(`CAST(j.job_id AS CHAR) LIKE ? OR j.job_reference_id LIKE ? OR j.client_ref_id LIKE ? OR ${JOB_CUSTOMER_NAME_EXPR} LIKE ? OR cu.customer_mob_no LIKE ? OR cl.client_name LIKE ? OR ci.city_name LIKE ? OR ef.efr_name LIKE ? OR ow.user_name LIKE ? OR j.client_spoc_name LIKE ? OR j.client_spoc LIKE ?`);
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
+  }
+  return {
+    sql: clauses.length ? clauses.join(' AND ') : '',
+    params,
+    // The text branch reads these; the digits-only branch is pure `j` plus a
+    // self-contained subquery, so it needs nothing joined.
+    needsAliases: clauses.length && !/^\d+$/.test(String(q)) ? ['cu', 'cl', 'ci', 'ef', 'ow'] : [],
+  };
 }
 
 // ─── Create ─────────────────────────────────────────────────────────
@@ -5808,6 +6027,21 @@ async function update(jobId, input, actor) {
      * key and treated as immutable here (callers must use the dedicated
      * customer swap flow if they truly need a different number).
      */
+    /*
+     * Confirm & Schedule shows the customer's name and saves it to
+     * tbl_job.job_customer_name. Since 2026-09-24 the master follows it too, so
+     * a correction made on a booking is the customer's name everywhere — see
+     * syncCustomerName. Only when no explicit customer.customer_name came with
+     * the request; that block below owns the field when it does.
+     */
+    if (!hasCustomerEdit && existing.fk_customer_id && input.job_customer_name !== undefined) {
+      const [[custRow]] = await conn.query(
+        'SELECT customer_id, customer_name FROM tbl_customer WHERE customer_id = ? LIMIT 1',
+        [existing.fk_customer_id]
+      );
+      if (custRow) await syncCustomerName(conn, custRow, input.job_customer_name, actor);
+    }
+
     if (hasCustomerEdit && existing.fk_customer_id) {
       const custSets = [];
       const custVals = [];
@@ -8702,14 +8936,26 @@ async function notifyCustomerNotReachable(jobId) {
 }
 
 module.exports = {
+  // Exported for tests: the rule is three lines of guard, and driving it
+  // through create()/update() would stub half the job schema to see them.
+  syncCustomerName,
   // preferred_slot column probe — shared by the customer reschedule writer and
   // the admin request readers (routes/public/job-completion.js, routes/admin/).
   customerRequestSlotColumnExists,
+  // The RBAC/stage row filter as SQL — shared with the Booking-queue counts so
+  // the tiles and the grid can never describe different populations.
+  jobScopeFragment,
+  // tbl_job_customer_request table probe — the Booking-queue route asks BEFORE
+  // calling list(), so the bucket predicate can degrade instead of 500ing.
+  customerRequestTableExists,
   // Shared with services/job-export.service.js so the two q-clauses cannot
   // drift on what counts as a phone fragment. See the block at its definition.
   MOBILE_MIN_DIGITS,
   // Same reason: the Job Id box's id-or-reference search, for the export.
   jobIdOrRefPredicate,
+  // The search box as SQL — shared with the Booking-queue tile counts so a
+  // search narrows the tiles and the rows by the same rule.
+  searchClause,
   STATUS, ALL_STATUS_VALUES, MUTABLE_COLUMNS,
   // Cross-service helper — used by job-magic-link.service.js to keep the
   // tbl_job.client_services CSV in sync after the customer's self-submit

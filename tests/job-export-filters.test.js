@@ -513,6 +513,13 @@ const SAMPLE = {
   quotationStatus: 'approved',
   requestedBefore: 'now',
   section: 'overdue',
+  // Booking-queue tile + its flag chip. Both are ignored by the export (see
+  // FILTER_COVERAGE): dropping them yields a superset of the tile, never
+  // another tile's rows.
+  bucket: 'no_response',
+  ageDay: '3plus',
+  withEscalation: 'true',
+  customerRescheduled: 'true',
   sortBy: 'job_id',
   sortDir: 'asc',
   limit: 50,

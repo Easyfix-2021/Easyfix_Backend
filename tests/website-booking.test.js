@@ -89,7 +89,9 @@ const fake = installFakePool([
    * `\b` after tbl_job excludes tbl_job_services / tbl_job_image.
    */
   [/INSERT INTO tbl_job\b/i, () => ({ insertId: NEW_JOB_ID })],
-  [/SELECT customer_id FROM tbl_customer WHERE customer_id/i, [{ customer_id: 7 }]],
+  // Reads customer_name too since 2026-09-24 (the booking name is written
+  // back to the customer master), so match the table and key, not the list.
+  [/FROM tbl_customer WHERE customer_id/i, [{ customer_id: 7 }]],
   // The booking-image write itself. Nothing reads the result; it exists so the
   // statement is CAPTURED, in order, alongside BEGIN/COMMIT.
   [/INSERT INTO tbl_job_image/i, () => ({ affectedRows: 1 })],
