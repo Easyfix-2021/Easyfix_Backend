@@ -114,7 +114,7 @@ before(async () => {
     res.status(err && err.status ? err.status : 500).json({ success: false });
   });
 
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 

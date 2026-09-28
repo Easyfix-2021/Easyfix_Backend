@@ -128,7 +128,7 @@ describe('GET /:clientId/rate-cards/export.{xlsx,pdf}', () => {
     });
     app.use('/clients', clientsRouter);
     app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
-    await new Promise((resolve) => { server = app.listen(0, resolve); });
+    await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
     baseUrl = `http://127.0.0.1:${server.address().port}`;
   });
   after(async () => {

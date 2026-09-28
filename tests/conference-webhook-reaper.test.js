@@ -272,7 +272,7 @@ before(async () => {
   app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
   app.use('/api/webhook/plivo-conference', confWebhook);
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 

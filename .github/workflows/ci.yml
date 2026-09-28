@@ -143,8 +143,25 @@ jobs:
       # RUNNER_TEMP is outside the workspace, so `eslint .` never sees it.
       # ($RUNNER_TEMP is the shell env var inside `run:`; ${{ runner.temp }} is
       # the expression form needed in an `env:` block. Same path.)
+      #
+      # WHICH CRM BRANCH (2026-09-28). A bare clone takes the CRM's default
+      # branch, Production — so a PR into QA was checked against PRODUCTION's
+      # CRM, and QA's Booking Queue sort headers were never read. Now: the CRM
+      # branch with this PR's head name if the CRM has one (a feature built in
+      # both repos is tested as a pair), otherwise the PR's base (QA /
+      # Production). Only the head-name guess may fall back; the base must
+      # exist, and a failed clone of it fails the run.
+      # Refs arrive through env:, never ${{ }} inside run: — this repo is public,
+      # a fork's PR chooses head_ref, and an interpolated branch name is shell.
       - name: Fetch Easyfix_CRM_UI for cross-repo parity
-        run: git clone --quiet --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git "$RUNNER_TEMP/easyfix-crm-ui"
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref || github.ref_name }}
+        run: |
+          CRM=https://github.com/Easyfix-2021/Easyfix_CRM_UI.git
+          if git ls-remote --exit-code --heads "$CRM" "$HEAD_REF" >/dev/null; then CRM_BRANCH="$HEAD_REF"; else CRM_BRANCH="$BASE_REF"; fi
+          git clone --quiet --depth 1 --branch "$CRM_BRANCH" "$CRM" "$RUNNER_TEMP/easyfix-crm-ui"
+          echo "CRM parity checkout: $CRM_BRANCH @ $(git -C "$RUNNER_TEMP/easyfix-crm-ui" rev-parse --short HEAD)"
       - name: Unit tests (characterization — no DB)
         env:
           EASYFIX_CRM_UI_DIR: ${{ runner.temp }}/easyfix-crm-ui
