@@ -8772,6 +8772,9 @@ module.exports = {
   // The delegation-schema gate. job-share-delegation.service reads through it
   // too, so list() and the share reads agree on whether delegation exists.
   delegationColsExist,
+  // The one receiveNewJobs write gate. A share delegate takes over a job, so
+  // job-share-delegation.service gates create + accept through it too.
+  assertTechniciansCanReceiveJobs,
   notifyCustomerNotReachable,
   // Canonical IST wall-clock formatter (server-TZ independent). Exported so
   // route-layer guards can compare an appointment against "now" in IST without

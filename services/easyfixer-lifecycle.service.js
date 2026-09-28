@@ -555,6 +555,36 @@ function assertFinalActivationEligible(row = {}) {
   }
 }
 
+/*
+ * NO ACTIVATION OUT OF TRAINING_PENDING UNTIL MANDATORY TRAINING IS DONE.
+ *
+ * Called from transition() — the only writer of lifecycle_status — whenever the
+ * target is work-enabled and the STORED status is TRAINING_PENDING, so every
+ * activation path (activateFromVerification, syncFromVerificationFlagsAtomic)
+ * meets it; CRM/LEGACY/CRON cannot leave an onboarding state for work at all
+ * (assertTransition). Keyed on the STORED column, not the read-time reconciled
+ * status, which already reads a legacy-bit-flipped TRAINING_PENDING as ACTIVE.
+ *
+ * "Complete" is the app's own definition — fetchTrainingCompletedTime is what
+ * the registration screen shows — not lms.isTrainingComplete (all ASSIGNED
+ * courses), which only drives the TRAINING_PENDING -> UNDER_VERIFICATION exit.
+ * It returns null on a failed lookup or an empty mandatory set: fail closed.
+ *
+ * Scoped to TRAINING_PENDING on purpose. Legacy technicians have no mandatory
+ * training rows at all, so a blanket rule would stop every dispatch.
+ */
+async function assertMandatoryTrainingComplete(efrId) {
+  // Lazy: mobile-registration.service requires this module at load time.
+  const { fetchTrainingCompletedTime } = require('./mobile-registration.service');
+  if (await fetchTrainingCompletedTime(efrId)) return;
+  const error = httpError(
+    409,
+    'Mandatory training is not complete yet — the technician must finish it before activation.',
+  );
+  error.code = 'MANDATORY_TRAINING_INCOMPLETE';
+  throw error;
+}
+
 function assertVerificationActivationSourceAllowed(row = {}) {
   const status = lifecycleFromRow(row).status;
   if (['PAUSED', 'INACTIVE', 'BLACKLISTED', 'DORMANT', 'SUSPENDED', 'OFFLINE', 'ON_BENCH']
@@ -1448,6 +1478,10 @@ async function transition(efrId, input = {}, actor = null) {
           && !asBool(row.is_technician_verified)
           && input._willVerify !== true) {
         throw httpError(409, `${target} requires a verified technician`);
+      }
+      if (WORK_ENABLED.has(target)
+          && normalizeStatus(row.lifecycle_status) === 'TRAINING_PENDING') {
+        await assertMandatoryTrainingComplete(id);
       }
 
       if (typeof input._beforeUpdate === 'function') {
