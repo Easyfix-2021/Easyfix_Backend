@@ -67,6 +67,15 @@ router.get('/ops-desk', gate,
     } catch (e) { fail(res, next, e); }
   });
 
+// ─── GET /ops-desk/chats?limit= → { items, total } — last line is the technician's
+router.get('/ops-desk/chats', gate,
+  validate(Joi.object({ limit: Joi.number().integer().min(1).max(desk.LIMIT_MAX).default(50) }), 'query'),
+  async (req, res, next) => {
+    try {
+      modernOk(res, await desk.awaitingChats({ scope: req.scope, allowedStages: req.allowedStages, limit: req.query.limit }));
+    } catch (e) { fail(res, next, e); }
+  });
+
 // ─── POST /ops-desk/reports/:id/price { clientAmount, txAmount, note? } ────
 router.post('/ops-desk/reports/:id/price', gate, validate(idParam, 'params'),
   validate(Joi.object({

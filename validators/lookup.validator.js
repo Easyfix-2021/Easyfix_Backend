@@ -17,6 +17,9 @@ const citiesQuery = Joi.object({
   // preload the whole set, so the cap must clear it (with headroom) — a 1000 cap
   // truncated the list mid-alphabet (~"Balwada"). Pickers now typeahead via ?q=.
   limit: Joi.number().integer().min(1).max(20000).default(500),
+  // Tx-app Work Area: only cities that own a PIN, ranked prefix-first then by
+  // PIN count, each with pincode_count + state_name (lookup.service cities).
+  withPincodes: Joi.boolean().optional(),
   includeInactive: Joi.boolean().default(false),
 });
 

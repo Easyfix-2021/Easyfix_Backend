@@ -18,6 +18,7 @@
 
 const { pool } = require('../db');
 const logger = require('../logger');
+const pushDelivery = require('./push-delivery.service');
 
 const LIST_LIMIT_DEFAULT = 100;
 const LIST_LIMIT_MAX = 100;
@@ -36,13 +37,25 @@ const shape = (r) => ({
 const COLUMNS = 'id, sender_kind, efr_id, user_id, body, sent_on';
 
 /**
- * Messages after `after` (an id), oldest first, at most 100. The poller passes
- * the last id it holds, so a steady-state poll reads zero or one row off the
- * (job_id, id) index instead of re-reading the thread.
+ * Oldest first, at most 100. With `after` (an id) it is the messages after it:
+ * the poller passes the last id it holds, so a steady-state poll reads zero or
+ * one row off the (job_id, id) index instead of re-reading the thread. Without
+ * it (a first open) it is the NEWEST window — a long thread opens on its latest
+ * lines, not on its first 100.
  */
 async function list(jobId, { after = 0, limit = LIST_LIMIT_DEFAULT } = {}) {
   const since = Number.isSafeInteger(Number(after)) && Number(after) > 0 ? Number(after) : 0;
   const cap = Math.min(Math.max(Number(limit) || LIST_LIMIT_DEFAULT, 1), LIST_LIMIT_MAX);
+  if (!since) {
+    const [latest] = await pool.query(
+      `SELECT ${COLUMNS} FROM tbl_job_chat
+        WHERE job_id = ?
+        ORDER BY id DESC
+        LIMIT ?`,
+      [Number(jobId), cap],
+    );
+    return latest.reverse().map(shape);
+  }
   const [rows] = await pool.query(
     `SELECT ${COLUMNS} FROM tbl_job_chat
       WHERE job_id = ? AND id > ?
@@ -59,6 +72,27 @@ async function byClientMsgId(jobId, clientMsgId) {
     [Number(jobId), clientMsgId],
   );
   return row ? shape(row) : null;
+}
+
+/*
+ * Tell the job's assigned technician the desk replied. Fire-and-forget: post()
+ * does not await it, and deliverToEfr never throws, so a push can neither slow
+ * nor fail the reply. data.type 'job_chat' lets the app open / refetch the thread.
+ */
+const PUSH_BODY_MAX = 120;
+async function notifyTech(jobId, text) {
+  const [[j]] = await pool.query('SELECT fk_easyfixter_id FROM tbl_job WHERE job_id = ? LIMIT 1', [Number(jobId)]);
+  const efrId = j && Number(j.fk_easyfixter_id);
+  if (!efrId) return null;
+  return pushDelivery.deliverToEfr(
+    efrId,
+    {
+      title: `EasyFix · Job ${jobId}`,
+      body: text.length > PUSH_BODY_MAX ? `${text.slice(0, PUSH_BODY_MAX - 1)}…` : text,
+      data: { type: 'job_chat', jobId: String(jobId) },
+    },
+    { channel: 'job-chat', label: `job-chat · efr=${efrId} · job=${jobId}` },
+  );
 }
 
 /**
@@ -84,6 +118,10 @@ async function post(jobId, { senderKind, efrId = null, userId = null, body, clie
       [Number(jobId), senderKind, efrId, userId, text, msgId, sentOn],
     );
     logger.info('Job chat line · job=' + jobId + ' · from=' + senderKind + ' · id=' + ins.insertId);
+    // Fresh desk lines only: a replay returns from the catch below, never here.
+    if (senderKind === SENDER.DESK) {
+      notifyTech(jobId, text).catch((e) => logger.warn('Job chat push failed · job=' + jobId + ' · ' + e.message));
+    }
     const [[row]] = await pool.query(`SELECT ${COLUMNS} FROM tbl_job_chat WHERE id = ? LIMIT 1`, [ins.insertId]);
     return shape(row);
   } catch (e) {
