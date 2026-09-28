@@ -1680,7 +1680,16 @@ async function isTrainingComplete(efrId) {
 async function settleTrainingCompletion(efrId) {
   const efr = Number(efrId);
   await stampCourseCompletions(efr);
-  const { complete, required, done } = await isTrainingComplete(efr);
+  const { required, done } = await isTrainingComplete(efr);
+  /*
+   * The exit decision uses the app's definition (every MANDATORY item done,
+   * fetchTrainingCompletedTime), the same one Gate 1 and the activation guard
+   * use (owner, 2026-09-28). All-ASSIGNED here let a technician leave
+   * TRAINING_PENDING with a mandatory video unwatched and then be activated.
+   * required/done stay for the log line only.
+   */
+  // Lazy: mobile-registration.service requires this module at load time.
+  const complete = !!(await require('./mobile-registration.service').fetchTrainingCompletedTime(efr));
   if (!complete) {
     logger.info('Training not yet complete · efrId=' + efr + ' · ' + done + '/' + required);
     return { complete: false, required, done, changed: false };

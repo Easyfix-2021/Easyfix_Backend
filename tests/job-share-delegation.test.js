@@ -34,7 +34,12 @@ const readSrc = (rel) => stripComments(
  * return value.                                                              */
 let shareRow = null;
 let jobRow = null;
-let delegateRow = { efr_id: 902, efr_status: 1 };
+/* An ELIGIBLE delegate: the fields assertTechniciansCanReceiveJobs projects. */
+const ELIGIBLE_DELEGATE = Object.freeze({
+  efr_id: 902, efr_status: 1, is_technician_verified: 1, efr_manager_id: null,
+  lifecycle_status: 'ACTIVE', training_overdue: 0,
+});
+let delegateRow = { ...ELIGIBLE_DELEGATE };
 let updates = [];
 let updateAffected = 1;
 
@@ -61,7 +66,7 @@ beforeEach(() => {
   updateAffected = 1;
   shareRow = null;
   jobRow = null;
-  delegateRow = { efr_id: 902, efr_status: 1 };
+  delegateRow = { ...ELIGIBLE_DELEGATE };
 });
 
 function share(overrides = {}) {
@@ -220,9 +225,82 @@ test('a share needs a live job the sharer actually owns, and a real delegate', a
   await assert.rejects(() => delegation.createShare(4321, 901, { delegateEfrId: 901 }),
     (e) => e.status === 400 && e.details.code === 'share_self');
 
-  delegateRow = { efr_id: 902, efr_status: 0 /* deactivated */ };
+  delegateRow = { ...ELIGIBLE_DELEGATE, efr_status: 0 /* deactivated */ };
   await assert.rejects(() => delegation.createShare(4321, 901, { delegateEfrId: 902 }),
     (e) => e.status === 422 && e.details.code === 'delegate_unavailable');
+});
+
+/* ─── The delegate passes the job-offer work-eligibility gate ─────── */
+
+/* Each is a technician the offer/assign/accept gate refuses, as transition()
+ * really writes him: PAUSED/OFFLINE/ON_BENCH project efr_status 0 (a PAUSED row
+ * with efr_status 1 is drift and reads back as ACTIVE). The old create check
+ * (efr_status only) passed the training-overdue and unverified ones, and accept
+ * checked nothing at all. */
+const INELIGIBLE_DELEGATES = {
+  'training-overdue': { training_overdue: 1 },
+  PAUSED: { lifecycle_status: 'PAUSED', efr_status: 0 },
+  OFFLINE: { lifecycle_status: 'OFFLINE', efr_status: 0 },
+  ON_BENCH: { lifecycle_status: 'ON_BENCH', efr_status: 0 },
+  'not verified': { lifecycle_status: 'UNDER_VERIFICATION', is_technician_verified: 0 },
+};
+
+test('createShare refuses a delegate the job-offer gate refuses, with the sharer-facing 422', async () => {
+  jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 901 };
+  for (const [label, patch] of Object.entries(INELIGIBLE_DELEGATES)) {
+    delegateRow = { ...ELIGIBLE_DELEGATE, ...patch };
+    const from = fake.calls.length;
+    await assert.rejects(
+      () => delegation.createShare(4321, 901, { delegateEfrId: 902 }),
+      (e) => e.status === 422 && e.details.code === 'delegate_unavailable'
+        // The sharer is never told the colleague's lifecycle reason.
+        && !('technicians' in e.details),
+      label,
+    );
+    assert.equal(fake.calls.slice(from).some((c) => /INSERT INTO tbl_job_share_link/i.test(c.sql)), false,
+      `${label}: no share row may be written`);
+  }
+});
+
+test('acceptShare re-checks: a delegate who became ineligible after the share was made is refused', async () => {
+  for (const [label, patch] of Object.entries(INELIGIBLE_DELEGATES)) {
+    shareRow = share({ status: 'pending' });
+    delegateRow = { ...ELIGIBLE_DELEGATE, ...patch };
+    await assert.rejects(
+      () => delegation.acceptShare(4321, 902),
+      // The guard's own error, as acceptOffer surfaces it to the app.
+      (e) => e.status === 400
+        && ['TECH_CANNOT_RECEIVE_JOBS', 'TECH_NOT_VERIFIED'].includes(e.code)
+        && /cannot receive new jobs/.test(e.message),
+      label,
+    );
+  }
+  assert.equal(updates.length, 0, 'a refused accept must not write the share');
+});
+
+test('an eligible delegate can be shared with and can accept', async () => {
+  jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 901 };
+  const from = fake.calls.length;
+  await delegation.createShare(4321, 901, { delegateEfrId: 902 });
+  const gate = fake.calls.slice(from).find((c) => /FROM tbl_easyfixer e\s+WHERE e\.efr_id IN/i.test(c.sql));
+  assert.ok(gate, 'create runs the shared work-eligibility SELECT');
+  assert.deepEqual(gate.params, [[902]]);
+  shareRow = share({ status: 'pending' });
+  await delegation.acceptShare(4321, 902);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].params[0], 'accepted');
+});
+
+test('a contact share is unchanged: no technician gate on create or on OTP accept', async () => {
+  jobRow = { job_id: 4321, job_status: 1, fk_easyfixter_id: 901 };
+  delegateRow = null; // no technician row exists, and none is needed
+  const from = fake.calls.length;
+  await delegation.createShare(4321, 901, { contactNumber: '9289333404', contactName: 'Jyoti' });
+  shareRow = share({ status: 'pending', delegate_efr_id: null, contact_number: '9289333404' });
+  await delegation.acceptByContact(77);
+  assert.equal(fake.calls.slice(from).some((c) => /FROM tbl_easyfixer e\s+WHERE/i.test(c.sql)), false,
+    'contact shares never consult the technician gate');
+  assert.equal(updates.at(-1).params[0], 'accepted');
 });
 
 /* ─── The lock ────────────────────────────────────────────────────── */
