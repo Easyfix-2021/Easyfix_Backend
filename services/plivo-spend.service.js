@@ -37,6 +37,14 @@ const KINDS = {
   calls: {
     path: (sinceParam, offset) => `/Call/?limit=${PAGE}&offset=${offset}&end_time__gte=${encodeURIComponent(sinceParam)}`,
     id: 'call_uuid', amount: 'total_amount', time: 'end_time',
+    // The operator's leg is the CRM Browser SDK dialling INTO the Voice
+    // Application from the SIP endpoint (from_number "sip:…@phone.plivo.com"),
+    // which Plivo files as INBOUND; the customer leg is the outbound PSTN one.
+    // Verified on the live CDRs 2026-09-28. Everything else — the customer leg,
+    // and in mobile mode the agent's own mobile leg — is "customer".
+    // ponytail: mobile-mode agent legs are indistinguishable in the CDR; match on
+    // the tbl_job_caller_info row if that split is ever needed.
+    agent: (o) => String(o.from_number || '').startsWith('sip:'),
   },
   transcriptions: {
     path: (_sinceParam, offset) => `/Transcription/?limit=${PAGE}&offset=${offset}`,
@@ -81,7 +89,7 @@ async function walk(kindName, st) {
       for (const o of objects) {
         if (plivo.plivoTimeMs(o[k.time]) < st.startMs) { done = true; continue; }
         if (s.items.has(o[k.id])) continue;
-        s.items.set(o[k.id], Number(o[k.amount]) || 0);
+        s.items.set(o[k.id], { usd: Number(o[k.amount]) || 0, agent: k.agent ? k.agent(o) : false });
         fresh += 1;
       }
       if (objects.length < PAGE) done = true;
@@ -126,9 +134,16 @@ function refresh(nowMs = Date.now()) {
  * 2026-09-17 that nothing call-related hides outside the CDRs: 612 multi-party
  * calls this month billed $0.0000 in total, and recording is ₹0/min.
  */
-function summary(s, st) {
+function summary(s, st, split) {
   let usd = 0;
-  for (const v of s.items.values()) usd += v;
+  const agent = { usd: 0, count: 0 };
+  const customer = { usd: 0, count: 0 };
+  for (const v of s.items.values()) {
+    usd += v.usd;
+    const b = v.agent ? agent : customer;
+    b.usd += v.usd;
+    b.count += 1;
+  }
   const estimateReasons = [];
   if (!s.ready) {
     estimateReasons.push("Still counting this month's Plivo records after a server restart — this is the total counted so far, so the real figure is higher.");
@@ -142,6 +157,10 @@ function summary(s, st) {
     ready: s.ready,
     estimate: estimateReasons.length > 0,
     estimateReasons,
+    ...(split && {
+      agent: { usd: Number(agent.usd.toFixed(4)), count: agent.count },
+      customer: { usd: Number(customer.usd.toFixed(4)), count: customer.count },
+    }),
   };
 }
 
@@ -161,7 +180,7 @@ function getMonthSpend(nowMs = Date.now()) {
   return {
     month: state.month,
     currency: 'USD',
-    calls: summary(state.calls, state),
+    calls: summary(state.calls, state, true),
     transcriptions: summary(state.transcriptions, state),
     asOf: state.refreshedAt ? new Date(state.refreshedAt).toISOString() : null,
     refreshing: Boolean(state.refreshing),

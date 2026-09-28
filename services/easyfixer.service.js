@@ -1194,6 +1194,200 @@ async function attendance(efrIds, { scope } = {}) {
 }
 
 /*
+ * ─── XLSX export enrichment (2026-09-25) ───────────────────────────────────
+ *
+ * The columns the LEGACY "EasyFixerReport" sheet carried and neither list() nor
+ * aggregates() supplies. Ported from EasyfixerDaoImpl.getAllEasyfixerListing
+ * (EasyFix_CRM), which is the query that sheet was built from — operators
+ * reconcile against it, so the derivations here are legacy's, not new ones.
+ *
+ * WHY A SEPARATE FUNCTION, not columns on list(): list() serves the Manage
+ * Easyfixers GRID on every keystroke, and four correlated subqueries plus two
+ * grouped scans per page load is precisely the cost the 2026-06-08 split
+ * removed. The download is a once-a-day request and can pay for them.
+ *
+ * ⚠ NO JOIN TO tbl_easyfixer_attendance. A technician can have more than one
+ * attendance row for the same day, and joining it twice (today + tomorrow)
+ * would return a technician once PER PAIR of rows — a sheet with duplicate
+ * lines. Legacy joined and papered over it with GROUP BY EF.efr_id, which
+ * picks an arbitrary row of each day; the LIMIT 1 subqueries below take the
+ * LATEST row instead, which is what the legacy row-mapper did when it read the
+ * same table per technician (ORDER BY id DESC).
+ *
+ * CHUNKED at 1000 ids. aggregates() / attendance() cap at 1000 and silently
+ * drop the rest — with EXPORT_HARD_CAP at 10 000 that left 9 000 rows of a
+ * full download with empty aggregate cells. This one loops instead, and the
+ * route now chunks its calls to the other two for the same reason.
+ */
+const EXPORT_ID_CHUNK = 1000;
+
+/*
+ * Cached probe, same contract as hasReactivationColumn above (a FAILURE is not
+ * cached). tbl_easyfixer.is_eligible_for_offline_orders backs the sheet's
+ * "Tx used Temp" column and is absent on some deploys; naming a column that is
+ * not there would 500 the whole download rather than blank one cell.
+ */
+let _hasOfflineOrdersCol;
+async function hasOfflineOrdersColumn() {
+  if (_hasOfflineOrdersCol !== undefined) return _hasOfflineOrdersCol;
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'tbl_easyfixer'
+          AND column_name = 'is_eligible_for_offline_orders'
+        LIMIT 1`,
+    );
+    _hasOfflineOrdersCol = rows.length > 0;
+  } catch (e) {
+    logger.warn('easyfixer: schema probe failed · _hasOfflineOrdersCol · ' + e.message
+      + ' — treating as absent for this call only');
+    return false;
+  }
+  return _hasOfflineOrdersCol;
+}
+
+async function exportExtras(efrIds, { scope } = {}) {
+  logger.info('Fetch easyfixer export extras · requested=' + (Array.isArray(efrIds) ? efrIds.length : 0));
+  if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
+  const ids = Array.from(new Set(
+    efrIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)
+  ));
+  if (ids.length === 0) return { rows: [] };
+
+  // RBAC scope filter — identical shape to aggregates().
+  const scopeClauses = [];
+  const scopeParams = [];
+  if (scope?.cities) {
+    const ci = scope.cities;
+    if (ci.mode === 'none') return { rows: [] };
+    if (ci.mode === 'allow' && ci.ids.length) {
+      scopeClauses.push(cityScopeSql('e.efr_cityId', 'e.efr_id', ci.ids));
+      scopeParams.push(...ci.ids);
+    }
+  }
+  const scopeWhere = scopeClauses.length ? ` AND ${scopeClauses.join(' AND ')}` : '';
+
+  const hasOffline = await hasOfflineOrdersColumn();
+  const offlineSelect = hasOffline
+    ? 'e.is_eligible_for_offline_orders AS is_eligible_for_offline_orders'
+    : 'NULL AS is_eligible_for_offline_orders';
+
+  /*
+   * Attendance label, legacy's three-way rule (EasyfixerDaoImpl:4400):
+   *   leave marked            -> On-Leave
+   *   either slot marked      -> Present
+   *   a row, but neither slot -> Absent
+   *   no row at all           -> No-Information (the COALESCE)
+   *
+   * THE DAY IS BOUND, NOT ASKED OF THE SERVER. The pool stores datetimes as
+   * IST, so a clock function inside the SQL answers in the server's zone and
+   * "today" can land on the wrong side of midnight (the repo lints for this —
+   * see eslint.config.mjs "SQL clock functions"). `today` below is one JS Date
+   * for the whole call, which also means every column of one download agrees
+   * about which day it is, even if the query straddles midnight.
+   */
+  const attendanceLabel = (fromOffsetDays, toOffsetDays) => {
+    const shift = (n) => (n === 0 ? 'DATE(?)' : `DATE(?) + INTERVAL ${n} DAY`);
+    return `COALESCE((
+    SELECT CASE
+             WHEN att.is_leave_marked THEN 'On-Leave'
+             WHEN att.morning_slot OR att.evening_slot THEN 'Present'
+             ELSE 'Absent'
+           END
+      FROM tbl_easyfixer_attendance att
+     WHERE att.easyfixer_id = e.efr_id
+       AND att.created_on >= ${shift(fromOffsetDays)}
+       AND att.created_on <  ${shift(toOffsetDays)}
+     ORDER BY att.id DESC
+     LIMIT 1), 'No-Information')`;
+  };
+  const today = new Date();
+
+  const out = [];
+  for (let i = 0; i < ids.length; i += EXPORT_ID_CHUNK) {
+    const chunk = ids.slice(i, i + EXPORT_ID_CHUNK);
+    const placeholders = chunk.map(() => '?').join(',');
+    const [rows] = await pool.query(
+      `SELECT
+         e.efr_id,
+         c.district                       AS home_district,
+         e.efr_pin_no                     AS efr_pin_no,
+         mgr.efr_name                     AS master_name,
+         e.profile_crm_activation_by      AS profile_activated_by,
+         ${offlineSelect},
+         /*
+          * Service Category / Service Type as NAMES, which is the whole point
+          * of this block: both columns are stored on tbl_easyfixer as a CSV of
+          * IDS, and the sheet printed those ids while the grid beside it
+          * printed names (the FE resolves them against its own lookups).
+          *
+          * The CSV is read FIRST so the sheet and the grid agree — they are the
+          * same source. easyfixer_service_type is the fallback: it is what
+          * legacy's report joined, and it still carries rows for technicians
+          * whose CSV column was never filled in.
+          */
+         COALESCE(
+           (SELECT GROUP_CONCAT(DISTINCT sc.service_catg_name
+                     ORDER BY sc.service_catg_id ASC SEPARATOR ', ')
+              FROM tbl_service_catg sc
+             WHERE FIND_IN_SET(sc.service_catg_id, REPLACE(e.efr_service_category, ' ', ''))),
+           (SELECT GROUP_CONCAT(DISTINCT sc2.service_catg_name
+                     ORDER BY sc2.service_catg_id ASC SEPARATOR ', ')
+              FROM easyfixer_service_type est
+              JOIN tbl_service_catg sc2 ON sc2.service_catg_id = est.service_category_id
+             WHERE est.easyfixer_id = e.efr_id)
+         )                                AS service_category_names,
+         (SELECT GROUP_CONCAT(DISTINCT st.service_type_name
+                   ORDER BY st.service_type_id ASC SEPARATOR ', ')
+            FROM tbl_service_type st
+           WHERE FIND_IN_SET(st.service_type_id, REPLACE(e.efr_service_type, ' ', '')))
+                                          AS service_type_names,
+         /* "Appointment In App" — the technician's OPEN book: scheduled (1),
+            in progress (2) and started-with-OTP (20), legacy's own triple. */
+         COALESCE(oj.open_job_count, 0)   AS open_job_count,
+         /* Days with an attendance row in the last 30 (today-29 .. today,
+            inclusive at both ends = 30 days). The percentage is derived from it
+            in the route, where legacy formatted it. */
+         COALESCE(att30.days_marked, 0)   AS attendance_30_days,
+         ${attendanceLabel(0, 1)} AS attendance_today,
+         ${attendanceLabel(1, 2)} AS attendance_tomorrow
+       FROM tbl_easyfixer e
+       LEFT JOIN tbl_city c ON c.city_id = e.efr_cityId
+       LEFT JOIN tbl_easyfixer mgr ON mgr.efr_id = e.efr_manager_id
+       LEFT JOIN (
+         SELECT fk_easyfixter_id, COUNT(DISTINCT job_id) AS open_job_count
+           FROM tbl_job
+          WHERE fk_easyfixter_id IN (${placeholders}) AND job_status IN (1, 2, 20)
+          GROUP BY fk_easyfixter_id
+       ) oj ON oj.fk_easyfixter_id = e.efr_id
+       LEFT JOIN (
+         SELECT easyfixer_id, COUNT(*) AS days_marked
+           FROM tbl_easyfixer_attendance
+          WHERE easyfixer_id IN (${placeholders})
+            AND created_on >= DATE(?) - INTERVAL 29 DAY
+            AND created_on <= DATE(?)
+          GROUP BY easyfixer_id
+       ) att30 ON att30.easyfixer_id = e.efr_id
+       WHERE e.efr_id IN (${placeholders})${scopeWhere}`,
+      /*
+       * Param order follows the SQL text: the four bound days of the two
+       * attendance labels (SELECT list), the open-jobs id set, the 30-day id
+       * set and ITS two days, the outer id set, then the scope ids.
+       */
+      [today, today, today, today,
+        ...chunk,
+        ...chunk, today, today,
+        ...chunk, ...scopeParams],
+    );
+    out.push(...rows);
+  }
+
+  logger.info('Returning export extras for ' + out.length + ' easyfixers');
+  return { rows: out };
+}
+
+/*
  * Status-counts strip (2026-06-08). Single-query rollup of how many
  * easyfixers fall into each of the 6 status buckets, used by the page
  * subtitle ("2,635 Active · 215 Inactive · 3,449 Idle · …").
@@ -1841,6 +2035,8 @@ module.exports = {
   listMappedClients,
   aggregates,
   attendance,
+  exportExtras,
+  EXPORT_ID_CHUNK,
   statusCounts,
   MUTABLE_COLUMNS,
   _internals: {
