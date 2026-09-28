@@ -1012,8 +1012,18 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
   if (!job) return { error: 'job not found' };
   if (Number(job.job_status) !== 9) logger.warn('Start conversation skipped · job=' + jobId + ' not Unconfirmed · status=' + job.job_status);
   if (Number(job.job_status) !== 9) return { error: 'job is not Unconfirmed (status != 9)' };
-  if (!job.customer_mob_no) logger.warn('Start conversation skipped · job=' + jobId + ' has no customer mobile on file');
-  if (!job.customer_mob_no) return { error: 'no customer mobile on file' };
+  if (!job.customer_mob_no) {
+    logger.warn('Start conversation skipped · job=' + jobId + ' has no customer mobile on file');
+    /*
+     * Recorded as an instant failure (see markInstantFailure in
+     * job-magic-link.service.js). Returning without a trace left sent_at NULL,
+     * so the hourly cron picked this job again every hour, forever.
+     */
+    await jml.markInstantFailure(pool, jobId, {
+      reason: 'No customer mobile on file', action: `conversation_${action}`, at: new Date(),
+    });
+    return { error: 'no customer mobile on file' };
+  }
 
   const dateLabel = jobDateLabel(job);
   const addressLine = composeAddressLine(job);
@@ -1102,6 +1112,40 @@ async function startConversation(jobId, { action = 'first' } = {}, pool) {
    * deliberately silenced send, not a failure.
    */
   const failed = !result.delivered && !result.disabled;
+  /*
+   * Delivery bookkeeping, in the SAME columns the form-link path uses, so one
+   * definition of "failed" serves both channels:
+   *   accepted          → 'sent' + the provider message id, so a LATE failure
+   *                       callback (routes/webhook/whatsapp.js) can match this
+   *                       job — it never could before, because this path never
+   *                       stored the id. Also clears a prior failure after an
+   *                       operator re-sends to a corrected number.
+   *   refused, our fault → untouched (the next sweep retries).
+   *   refused, the number → 'failed' + reason; the cron stops re-sending.
+   * Column-tolerant: without the 2026-07-14 migration there is nothing to write.
+   */
+  if (result.delivered) {
+    try {
+      await pool.query(
+        `UPDATE tbl_job
+            SET magic_link_delivery_status = 'sent', magic_link_delivery_reason = NULL,
+                magic_link_provider_msg_id = ?
+          WHERE job_id = ?`,
+        [result.providerMessageId || null, jobId],
+      );
+    } catch (e) {
+      if (!e || e.code !== 'ER_BAD_FIELD_ERROR') {
+        logger.warn({ jobId, err: e && e.message }, 'whatsapp-conversation: delivery status stamp failed (non-fatal)');
+      }
+    }
+  } else if (failed) {
+    const failReason = jml.customerSideFailureReason(result);
+    if (failReason) {
+      await jml.markInstantFailure(pool, jobId, {
+        reason: failReason, action: `conversation_${action}`, at: new Date(),
+      });
+    }
+  }
   const logLine = { jobId, conversationId, delivered: !!result.delivered };
   if (failed) {
     logger.warn({ ...logLine, err: result.error }, 'whatsapp-conversation: started but NOT delivered');
