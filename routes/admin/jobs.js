@@ -760,8 +760,12 @@ router.get('/booking-queue', async (req, res, next) => {
     // Required inside the handler, as the sibling handlers in this file do.
     const { pool } = require('../../db');
     const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
-    const scope = await buildRequestScopeWithHierarchy(req, pool);
-    const hasVerticalCol = await job.hasClientVerticalIdColumn();
+    // Independent lookups — run together rather than one round trip after another.
+    const [scope, hasVerticalCol, hasRequestTable] = await Promise.all([
+      buildRequestScopeWithHierarchy(req, pool),
+      job.hasClientVerticalIdColumn(),
+      job.customerRequestTableExists(),
+    ]);
     const frag = job.jobScopeFragment(
       { scope, allowedStages: req.allowedStages, hasVerticalCol }, 'j',
     );
@@ -795,7 +799,7 @@ router.get('/booking-queue', async (req, res, next) => {
       scopeJoins: frag.joins,
       // Same probe the list route runs, so the tiles and the rows agree on
       // what "the customer answered" means.
-      hasRequestTable: await job.customerRequestTableExists(),
+      hasRequestTable,
     });
     modernOk(res, counts);
   } catch (e) { next(e); }
