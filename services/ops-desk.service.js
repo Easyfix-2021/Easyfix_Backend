@@ -689,8 +689,51 @@ async function verificationQueue({ scope, allowedStages, limit = LIMIT_DEFAULT, 
   };
 }
 
+/*
+ * Chats awaiting a desk reply (V3 3.4): jobs whose LATEST tbl_job_chat line is
+ * the technician's. No read-tracking — a desk reply is what clears it. The
+ * inner GROUP BY walks idx_jc_job (job_id, id) once per job; the outer join
+ * is by primary key. Same row scope as the desk (scopeClauses on j/ad/cl).
+ * ponytail: no age window — a thread the desk never answered stays listed
+ * until someone replies; add a sent_on cutoff if the list fills with dead jobs.
+ */
+async function awaitingChats({ scope, allowedStages, limit = LIMIT_DEFAULT }) {
+  const lim = Math.min(Math.max(Number(limit) || LIMIT_DEFAULT, 1), LIMIT_MAX);
+  const hasVerticalCol = await job.hasClientVerticalIdColumn();
+  const { clauses, params } = scopeClauses(scope, allowedStages, hasVerticalCol);
+  const from = `FROM (SELECT job_id, MAX(id) AS last_id FROM tbl_job_chat GROUP BY job_id) lc
+       JOIN tbl_job_chat c ON c.id = lc.last_id AND c.sender_kind = 'tx'
+       JOIN tbl_job j ON j.job_id = lc.job_id
+       ${JOB_JOINS}
+       LEFT JOIN tbl_easyfixer se ON se.efr_id = c.efr_id
+      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}`;
+  const [rows] = await pool.query(
+    `SELECT ${JOB_COLUMNS}, c.id AS chat_id, c.efr_id AS chat_efr_id, c.body AS chat_body,
+            c.sent_on AS chat_sent_on, se.efr_name AS sender_name
+       ${from}
+      ORDER BY c.id DESC
+      LIMIT ?`,
+    [...params, lim],
+  );
+  const [[found]] = await pool.query(`SELECT COUNT(*) AS n ${from}`, params);
+  return {
+    items: rows.map((r) => ({
+      ...jobHeader(r),
+      lastMessage: {
+        id: Number(r.chat_id),
+        efrId: r.chat_efr_id == null ? null : Number(r.chat_efr_id),
+        senderName: r.sender_name || r.efr_name || null,
+        body: r.chat_body,
+        sentOn: r.chat_sent_on,
+      },
+    })),
+    total: Number(found && found.n) || 0,
+  };
+}
+
 module.exports = {
   listDesk,
+  awaitingChats,
   moneyForJobs,
   startProofForJobs,
   loadReportInScope,
