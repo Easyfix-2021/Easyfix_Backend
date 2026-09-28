@@ -1430,41 +1430,6 @@ This task has no schedule and can only be started with "Trigger Now".`,
     ? 'manual only — this job has no schedule; use Trigger Now'
     : `manual only — and ENVIRONMENT is "${process.env.ENVIRONMENT || '(unset)'}", so it will refuse to run outside QA`;
 
-  /*
-   * ─── QA LOCATION data refresh (manual only, never scheduled) ─────────
-   * Same manual-only shape as the dry run above: no cron.schedule call, so it
-   * can only run from Trigger Now. Replaces just the five location tables, not
-   * the whole database — see services/qa-geo-refresh.service.js.
-   */
-  const qaGeoRefresh = require('../services/qa-geo-refresh.service');
-  const qaGeoRefreshJob = registerJob({
-    id: 'qa-geo-refresh',
-    name: 'QA Location Data Refresh from Production',
-    description:
-`What this task does: QA's list of states, cities and PIN codes is raw post-office data — thousands of made-up "cities" such as "Air Force Gurgaon", and Gurugram owning only 2 PINs — so anything that depends on a city or a PIN behaves nothing like production. This task copies production's location data into QA WITHOUT touching anything else: QA's own tables, test data and QA-only database changes are left exactly as they are.
-
-Here's how it works, step by step:
-  1. It only runs when someone presses Trigger Now. It has no schedule.
-  2. It runs the same safety checks as the full QA Database Refresh BEFORE touching anything: it refuses unless this is the QA environment, and unless the QA database is not the same server it is copying from.
-  3. It reads the location tables — states, cities, zones, PIN codes and the zone-to-PIN links — from production's REPLICA, a stand-by copy of production, never the live production database. It uses the read-only login that is not permitted to change anything, so production cannot be affected even in principle, and it reads all five tables from one consistent moment without locking anything.
-  4. It counts what it read first. If any of the five tables came back empty, or there are fewer than 5,000 PIN codes, it stops — a broken read must never wipe QA's data.
-  5. It replaces the five tables in QA in one single step: QA keeps showing the old data until the new data is completely in place, and if anything goes wrong part-way, QA goes straight back to the old data. The app stays up the whole time. Only columns both databases have are copied; columns only QA has keep their default values.
-  6. Afterwards it counts, without fixing anything, the technicians and clients whose city no longer exists and the technician serviceable PIN codes that no longer exist, and emails the result — success or failure — to the recipients in "qa.dbrefresh.alert.emails".
-
-Note: this task exists ONLY for QA. On production it refuses to run at all. Stop is honoured between batches, and a stopped run leaves QA's old location data in place.`,
-    cron: 'manual only (no schedule)',
-    // Cooperative: the service checks the flag before each batch and rolls back.
-    canceller: () => qaGeoRefresh.cancelRun(),
-    runner: async () => {
-      const r = await qaGeoRefresh.runQaGeoRefresh();
-      logger.info('QA geo refresh · ' + JSON.stringify({ ok: r.ok, tables: r.tables, dangling: r.dangling, error: r.error }));
-      return r;
-    },
-  });
-  qaGeoRefreshJob.skipReason = isQaEnv
-    ? 'manual only — this job has no schedule; use Trigger Now'
-    : `manual only — and ENVIRONMENT is "${process.env.ENVIRONMENT || '(unset)'}", so it will refuse to run outside QA`;
-
   // ─── Conference reaper — every 5 minutes ─────────────────────────────
   // (Added 2026-08-04) COST BACKSTOP for Plivo conference calling. Every ops
   // call is now a Multi-Party Call, an orphaned one bills every leg until
