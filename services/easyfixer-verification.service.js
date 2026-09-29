@@ -3,6 +3,7 @@ const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
 const lifecycle = require('./easyfixer-lifecycle.service');
+const { resolveEasyfixerDocumentUrl } = require('./easyfixer-document.service');
 const {
   mapAadhaarUniqueViolation,
   normalizeAadhaar,
@@ -219,7 +220,7 @@ async function getVerificationPage(efrId) {
     leadComments, profComments, persComments,
     bankComments, idComments, actComments,
     deepSkillCountRow, serviceablePincodesRow,
-    mandatoryTrainingRows] = await Promise.all([
+    kycDocRow, mandatoryTrainingRows] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -252,6 +253,23 @@ async function getVerificationPage(efrId) {
      * is_global arrived in a later migration, so a clone without it must still
      * render the rest of the page.
      */
+    /*
+     * KYC images the technician uploaded from the app: Aadhaar front (doc type
+     * 13), Aadhaar back (14) and the selfie (17, falling back to
+     * tbl_easyfixer.efr_profile_img, which is where the app has always put it).
+     * Same doc-type numbers services/mobile-identity.service.js reads.
+     *
+     * Fails OPEN to no images — a reviewer seeing the rest of the page beats a
+     * 500 because an S3 signature could not be produced.
+     */
+    pool.query(
+      `SELECT MAX(CASE WHEN efr_doc_type_id = 13 THEN efr_document_name END) AS aadhaar_front_key,
+              MAX(CASE WHEN efr_doc_type_id = 14 THEN efr_document_name END) AS aadhaar_back_key,
+              MAX(CASE WHEN efr_doc_type_id = 17 THEN efr_document_name END) AS selfie_key
+         FROM tbl_easyfixer_document
+        WHERE efr_id = ?`,
+      [efrId],
+    ).then(([rows]) => rows[0] || {}).catch((e) => { logger.warn({ efrId, err: e }, 'verification: KYC document read failed — rendering none'); return {}; }),
     pool.query(
       `SELECT t.id,
               t.title,
@@ -268,6 +286,12 @@ async function getVerificationPage(efrId) {
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
 
+  const [aadhaarFrontUrl, aadhaarBackUrl, selfieUrl] = await Promise.all([
+    resolveEasyfixerDocumentUrl(kycDocRow.aadhaar_front_key),
+    resolveEasyfixerDocumentUrl(kycDocRow.aadhaar_back_key),
+    resolveEasyfixerDocumentUrl(kycDocRow.selfie_key || e.efr_profile_img),
+  ]);
+
   // A video counts as done at the same threshold the LMS uses everywhere else.
   const TRAINING_COMPLETE_PERCENT = 100;
   const trainingVideos = (mandatoryTrainingRows || []).map((t) => ({
@@ -281,6 +305,19 @@ async function getVerificationPage(efrId) {
   const serviceablePincodesCount = pincodeCsv
     ? pincodeCsv.split(',').map((p) => p.trim()).filter(Boolean).length
     : 0;
+
+  // Six equal parts, matching the onboarding mandatory set exactly.
+  const strengthParts = [
+    String(e.tx_full_name || e.efr_name || '').trim() !== '',
+    e.date_of_birth != null,
+    String(e.adhaar_card_number || '').trim() !== '',
+    String(e.efr_profile_img || '').trim() !== '',
+    deepSkillsCount > 0,
+    serviceablePincodesCount > 0,
+  ];
+  const computedProfileStrength = Math.round(
+    (strengthParts.filter(Boolean).length / strengthParts.length) * 100,
+  );
 
   const fullName = e.tx_full_name || e.efr_name || '';
   const personalDetailsFilled = e.personal_details_filled; // 0 | 1 | 2
@@ -340,7 +377,19 @@ async function getVerificationPage(efrId) {
 
     // ─ Section 2: Registration Verification (4 sub-sections) ─
     registrationVerification: {
-      overall_progress: pct(e.efr_profile_perc),
+      /*
+       * PROFILE STRENGTH, COMPUTED — not read from efr_profile_perc.
+       *
+       * That column is legacy: the new technician app never writes it, so a
+       * technician who had filled his name, DOB, Aadhaar, photo, skills and
+       * pincodes still showed 0%. Reading a number nobody maintains is worse
+       * than having none, because it looks authoritative.
+       *
+       * The six parts below are exactly the fields onboarding treats as
+       * mandatory, so the ring and the Accept gate can never disagree: at 100%
+       * the decision is unlocked, and every part the technician fills moves it.
+       */
+      overall_progress: computedProfileStrength,
       is_verified: Number(e.is_identity_details_verified_by_crm) === 1,
       proceed_allowed: proceedAllowed,
 
@@ -412,6 +461,13 @@ async function getVerificationPage(efrId) {
         // tbl_easyfixer_documents — wire once a document-listing endpoint
         // lands. Frontend currently shows the numbers + "not uploaded" hints.
         driving_lisence_img:    e.driving_lisence_img_name,
+        // What the technician photographed during registration. Null when he
+        // has not uploaded it, or when the object cannot be signed right now.
+        documents: {
+          aadhaar_front_url: aadhaarFrontUrl,
+          aadhaar_back_url:  aadhaarBackUrl,
+          selfie_url:        selfieUrl,
+        },
         rejected_reason:        e.send_back_to_tx_reason_crm,
         updated_by_name:        e.update_details_by_user,
         update_date:            e.update_date,
