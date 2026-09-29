@@ -562,8 +562,10 @@ async function getTrainingPercentages(efrId) {
  * with a tolerance of 10. 25 is the app's head start; the other 5 absorbs
  * network latency and the floor(). Lower it only together with the app's step.
  *
- * No cap when the video has no duration (NULL/0 — the operator has not entered
- * one in the CRM), when either column is not migrated yet, or when elapsed is
+ * No cap when the video has no duration (NULL/0 — not detected yet; the first
+ * report on such a video starts a background probe, lms.refreshVideoDuration,
+ * or it is a YouTube link, which cannot be probed), when either column is not
+ * migrated yet, or when elapsed is
  * unknown. Unknown is not suspicious: this is an owner-approved soft check,
  * and failing closed would lock technicians out of earning.
  */
@@ -634,9 +636,14 @@ async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
           logger.warn({ efrId, videoId, requested: watchedPercentage, credited, elapsed, duration },
             'training watched-% capped by watch time');
         }
-      } else if (!_noDurationWarned.has(videoId)) {
-        _noDurationWarned.add(videoId);
-        logger.warn('Training video ' + videoId + ' has no duration_seconds — watched-% is NOT time-checked');
+      } else if (row) {
+        // Not awaited: this report stays uncapped; the probe fills the column
+        // for the next one. Deduped and backed off inside refreshVideoDuration.
+        lms.refreshVideoDuration(videoId);
+        if (!_noDurationWarned.has(videoId)) {
+          _noDurationWarned.add(videoId);
+          logger.warn('Training video ' + videoId + ' has no duration_seconds yet — probing it; watched-% is NOT time-checked until then');
+        }
       }
     } catch (e) {
       // The check is advisory; progress recording is not. Skip it, never fail.

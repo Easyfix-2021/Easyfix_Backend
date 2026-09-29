@@ -27,9 +27,22 @@ const fake = installFakePool([
   }],
   [UPSERT, { affectedRows: 1 }],
   [/^\s*(INSERT INTO|UPDATE) training_videos/i, { insertId: 42, affectedRows: 1 }],
+  // refreshVideoDuration's resolver read, and setVideoLink's two reads.
+  [/SELECT d\.url FROM training_videos tv\s+JOIN document d/i, () => [{ url: docUrl }]],
+  [/SELECT id, training_video_id FROM training_videos/i, (_s, p) => [{ id: p[0], training_video_id: 77 }]],
+  [/SELECT id FROM document WHERE id = \?/i, [{ id: 77 }]],
 ]);
 const profile = require('../services/mobile-profile-extra.service');
 const lms = require('../services/lms.service');
+
+// The duration probe never touches the network here: every test replaces it.
+const LEGACY_URL = 'http://core.easyfix_core.in/easydoc/te/doc/Doc20221124160807.mp4';
+let docUrl = LEGACY_URL;
+const videoDuration = require('../services/video-duration.service');
+const probes = [];
+let probeImpl = async () => null;
+videoDuration.probeVideoDuration = (url, opts) => { probes.push({ url, opts }); return probeImpl(url, opts); };
+const settle = () => new Promise((r) => setImmediate(r));
 
 after(() => fake.restore());
 beforeEach(async () => {
@@ -168,7 +181,7 @@ test('a failed probe assumes the columns ABSENT (the upsert must not name a miss
   }
 });
 
-// ─── The CRM's admin route stores the duration ───────────────────────
+// ─── The duration is detected, never entered ─────────────────────────
 
 async function aux(method, path, body) {
   const express = require('express');
@@ -186,31 +199,102 @@ async function aux(method, path, body) {
   }
 }
 const tvWrite = () => fake.calls.find((c) => /^\s*(INSERT INTO|UPDATE) training_videos/i.test(c.sql));
+const STORE = /SET tv\.duration_seconds = \?/;
+const CLEAR = /UPDATE training_videos SET duration_seconds = NULL WHERE id = \?/;
+const YT = 'https://www.youtube.com/watch?v=abc12345678';
 
-test('POST /aux/training-videos stores duration_seconds', async () => {
-  assert.equal(await aux('POST', '/training-videos', { title: 'Safety', duration_seconds: 52 }), 201);
-  assert.match(tvWrite().sql, /duration_seconds/);
-  assert.equal(tvWrite().params.at(-1), 52);
+test('lazy: reports on a NULL-duration video start ONE background probe; concurrent reports share it', async () => {
+  preRead = { duration_s: null, row_id: 11, pct: 25, elapsed_s: 10 };
+  docUrl = LEGACY_URL;
+  probes.length = 0;
+  let release;
+  probeImpl = () => new Promise((r) => { release = r; });
+
+  const results = await Promise.all([
+    profile.setTrainingPercentage(8379, 101, 50),
+    profile.setTrainingPercentage(8380, 101, 75),
+  ]);
+  await settle();
+  assert.deepEqual(results.map((r) => r.watchedPercentage), [50, 75], 'still uncapped: no duration yet');
+  assert.equal(probes.length, 1, 'one probe for two concurrent reports');
+  assert.equal(probes[0].url, 'https://core.easyfix.in/easydoc/te/doc/Doc20221124160807.mp4',
+    'the URL the app plays (normalizeVideoUrl), malformed host repaired');
+  assert.deepEqual(probes[0].opts.trustedHosts, ['core.easyfix.in']);
+
+  const shared = lms.refreshVideoDuration(101);
+  assert.equal(probes.length, 1, 'a third caller joins the in-flight probe');
+  release(125);
+  assert.equal(await shared, 125);
+  const stores = fake.calls.filter((c) => STORE.test(c.sql));
+  assert.equal(stores.length, 1);
+  assert.deepEqual(stores[0].params, [125, 101, LEGACY_URL], 'stored only while the link is still the probed one');
 });
 
-test('PATCH /aux/training-videos/:id can set or clear only the duration', async () => {
-  assert.equal(await aux('PATCH', '/training-videos/3', { duration_seconds: 90 }), 200);
-  assert.match(tvWrite().sql, /SET duration_seconds = \? WHERE id = \?/);
-  assert.deepEqual(tvWrite().params, [90, 3]);
+test('lazy: a failed probe is not retried for an hour; then it is', async () => {
+  probes.length = 0;
+  probeImpl = async () => null;
+  const realNow = Date.now;
+  try {
+    assert.equal(await lms.refreshVideoDuration(102), null);
+    assert.equal(await lms.refreshVideoDuration(102), null);
+    preRead = { duration_s: null, row_id: 11, pct: 25, elapsed_s: 10 };
+    await profile.setTrainingPercentage(8379, 102, 50);
+    await settle();
+    assert.equal(probes.length, 1, 'backed off');
+    const t = realNow();
+    Date.now = () => t + 61 * 60 * 1000;
+    await lms.refreshVideoDuration(102);
+    assert.equal(probes.length, 2, 'retried after the hour');
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(fake.calls.filter((c) => STORE.test(c.sql)).length, 0);
+});
+
+test('lazy: a video WITH a duration does not probe', async () => {
+  probes.length = 0;
+  preRead = { duration_s: 52, row_id: 11, pct: 25, elapsed_s: 20 };
+  await profile.setTrainingPercentage(8379, 103, 50);
+  await settle();
+  assert.equal(probes.length, 0);
+});
+
+test('link change (PATCH): the old duration is cleared, then probed and stored', async () => {
+  probes.length = 0;
+  docUrl = YT;
+  probeImpl = async () => 300;
+  assert.equal(await aux('PATCH', '/training-videos/104', { video_url: YT }), 200);
+  const clear = fake.calls.find((c) => CLEAR.test(c.sql));
+  assert.deepEqual(clear.params, [104], 'cleared in the request');
+  await settle(); await settle();
+  assert.equal(probes.length, 1);
+  assert.deepEqual(fake.calls.find((c) => STORE.test(c.sql)).params, [300, 104, YT]);
+});
+
+test('create (POST with a link): probed and stored; a failing probe does not fail the save', async () => {
+  probes.length = 0;
+  docUrl = YT;
+  probeImpl = async () => 90;
+  assert.equal(await aux('POST', '/training-videos', { title: 'Safety', video_url: YT }), 201);
+  await settle(); await settle();
+  assert.equal(probes.length, 1);
+  assert.deepEqual(fake.calls.find((c) => STORE.test(c.sql)).params, [90, 42, YT]);
+
   fake.reset();
-  assert.equal(await aux('PATCH', '/training-videos/3', { duration_seconds: null }), 200);
-  assert.deepEqual(tvWrite().params, [null, 3]);
+  probeImpl = async () => { throw new Error('boom'); };
+  assert.equal(await aux('PATCH', '/training-videos/105', { video_url: YT }), 200);
+  await settle(); await settle();
+  assert.equal(fake.calls.filter((c) => STORE.test(c.sql)).length, 0);
 });
 
-test('a zero or fractional duration is rejected', async () => {
-  assert.equal(await aux('POST', '/training-videos', { title: 'Safety', duration_seconds: 0 }), 400);
-  assert.equal(await aux('PATCH', '/training-videos/3', { duration_seconds: 1.5 }), 400);
-  assert.equal(tvWrite(), undefined);
-});
-
-test('pre-migration, the admin INSERT does not name duration_seconds', async () => {
-  probeRows = [];
-  lms.invalidateLmsSchemaCache();
+test('the admin routes no longer take duration_seconds from the client', async () => {
   assert.equal(await aux('POST', '/training-videos', { title: 'Safety', duration_seconds: 52 }), 201);
   assert.doesNotMatch(tvWrite().sql, /duration_seconds/);
+  assert.equal(tvWrite().params.length, 4);
+  fake.reset();
+  assert.equal(await aux('PATCH', '/training-videos/3', { duration_seconds: 90 }), 400, 'nothing left to update');
+  assert.equal(tvWrite(), undefined);
+  assert.equal(await aux('PATCH', '/training-videos/3', { title: 'Renamed', duration_seconds: 90 }), 200);
+  assert.match(tvWrite().sql, /SET title = \? WHERE id = \?/);
+  assert.deepEqual(tvWrite().params, ['Renamed', 3]);
 });
