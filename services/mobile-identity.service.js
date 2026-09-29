@@ -139,10 +139,16 @@ async function getIdentityDetails(efrId, { database = pool } = {}) {
  *
  * Neither the Aadhaar value nor a database duplicate-key message is logged.
  */
+// The CRM reviewer's "Verified" action. Required lazily: the verification
+// service sits above this one and must not become a load-time cycle.
+function approveIdentityAsReviewer(efrId) {
+  return require('./easyfixer-verification.service').saveIdentity(efrId, { verification_status: 1 }, null);
+}
+
 async function saveIdentityDetails(
   efrId,
   body,
-  { database = pool, finalize = null } = {},
+  { database = pool, finalize = null, approveIdentity = approveIdentityAsReviewer } = {},
 ) {
   const conn = await database.getConnection();
   const lockKey = `efr_doc:${efrId}`;
@@ -161,6 +167,7 @@ async function saveIdentityDetails(
     : (body.haveDrivingLicence ? 1 : 0);
   const identityComplete = Boolean(aadhaar);
   let aiCheckRow = null;
+  let aiApproved = false;
 
   try {
     // 0. AI CHECK ON RECORD (owner, 2026-09-29). A save that writes Aadhaar
@@ -279,6 +286,23 @@ async function saveIdentityDetails(
     ], { fillOnly: !replaceRejected });
     // Same transaction: the check the CRM shows is the one this save used.
     if (aiCheckRow) await aiCheck.markSubmitted(conn, aiCheckRow.id);
+    /*
+     * AI-VERIFIED IDENTITY IS APPROVED (owner, 2026-09-29): a save whose check
+     * came back "verified" sets is_identity_details_verified_by_crm = 1 rather
+     * than waiting for a reviewer. Decided HERE, under the row lock and after
+     * the UPDATE, against what the row now holds: fill-only can keep a legacy
+     * name/number/DOB the check never saw, and approving that would vouch for
+     * values nobody verified. Already-approved rows are left alone.
+     */
+    if (aiCheckRow?.verdict === 'verified') {
+      const [[stored]] = await conn.query(
+        `SELECT efr_name, adhaar_card_number, date_of_birth,
+                is_identity_details_verified_by_crm AS review_state
+           FROM tbl_easyfixer WHERE efr_id = ?`,
+        [efrId],
+      );
+      aiApproved = Number(stored?.review_state) !== 1 && aiCheck.storedMatchesCheck(stored, body);
+    }
 
     await conn.commit();
     transactionStarted = false;
@@ -312,8 +336,23 @@ async function saveIdentityDetails(
 
   let finalization = null;
   if (typeof finalize === 'function') finalization = await finalize(efrId);
-  logger.info({ efrId, complete: identityComplete, aiVerdict: aiCheckRow?.verdict || null }, 'Identity details saved');
-  return { updated: true, finalization, ...(aiCheckRow ? { aiVerdict: aiCheckRow.verdict } : {}) };
+  /*
+   * After finalize, so the lifecycle records "submitted" before "approved" —
+   * the same order a reviewer's click produces. Through the CRM's own approval
+   * (lifecycle sync, send-back reason cleared, status push), never a bare
+   * column write. Best effort: if it fails the identity is simply still
+   * pending, which is exactly where it would be without the AI.
+   */
+  if (aiApproved) {
+    try {
+      await approveIdentity(efrId);
+    } catch (e) {
+      aiApproved = false;
+      logger.warn({ efrId, err: e.message }, 'AI-verified identity NOT auto-approved; left for the reviewer');
+    }
+  }
+  logger.info({ efrId, complete: identityComplete, aiVerdict: aiCheckRow?.verdict || null, aiApproved }, 'Identity details saved');
+  return { updated: true, finalization, ...(aiCheckRow ? { aiVerdict: aiCheckRow.verdict, aiApproved } : {}) };
 }
 
 module.exports = {

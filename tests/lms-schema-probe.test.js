@@ -189,10 +189,10 @@ function stripComments(src) {
     .replace(/\/\/[^\n]*/g, '');
 }
 
-const PROBED_COLUMNS = /\b(is_mandatory|is_global)\b/;
+const PROBED_COLUMNS = /\b(is_mandatory|is_global|is_system)\b/;
 // The probe's own declaration of what it looks for: ['courses', 'is_mandatory'].
-const DECLARATION = /^\s*\['(?:courses|training_videos)',\s*'(?:is_mandatory|is_global)'\],?\s*$/;
-const PROBE_MARKER = /\b(courseMandatory|videoGlobal)\b/;
+const DECLARATION = /^\s*\['(?:courses|training_videos)',\s*'(?:is_mandatory|is_global|is_system)'\],?\s*$/;
+const PROBE_MARKER = /\b(courseMandatory|videoGlobal|courseSystem)\b/;
 const LOG_LINE = /\blogger\.(warn|info|error|debug)\(/;
 
 test('no read of a probed column escapes the probe', async () => {
@@ -225,6 +225,8 @@ test('no read of a probed column escapes the probe', async () => {
     /patch\.is_mandatory/g,
     /(?<![.\w'])is_mandatory = false/g,
     /(?<![.\w'])is_mandatory(?= \?)/g,
+    // A fetched course row's flag, read in JS: Number(course.is_system).
+    /Number\(\w+\.is_system\)/g,
   ];
 
   const violations = [];
