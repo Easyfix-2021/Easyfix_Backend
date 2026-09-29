@@ -144,10 +144,14 @@ function sentSql(alias = 'j') {
  * (latest pending, created_at DESC) so the tile and the row's own "Customer
  * Request" column can never disagree about what the customer asked for.
  */
-function pendingRequestSql(alias = 'j', type) {
+function pendingTypeSql(alias = 'j') {
   return `(SELECT cr_k.request_type FROM tbl_job_customer_request cr_k
             WHERE cr_k.job_id = ${alias}.job_id AND cr_k.request_status = 'pending'
-            ORDER BY cr_k.created_at DESC LIMIT 1) = '${type}'`;
+            ORDER BY cr_k.created_at DESC LIMIT 1)`;
+}
+
+function pendingRequestSql(alias = 'j', type, pendingType = pendingTypeSql(alias)) {
+  return `${pendingType} = '${type}'`;
 }
 
 /*
@@ -164,14 +168,18 @@ function pendingRequestSql(alias = 'j', type) {
  */
 const RESPONSE_KINDS = ['ready', 'reschedule', 'cancel'];
 
-function responseKindSql(kind, { hasRequestTable = true } = {}) {
+/*
+ * `pendingType` lets counts() pass a column it already computed once per row,
+ * instead of re-running the subquery in every SUM that asks.
+ */
+function responseKindSql(kind, { hasRequestTable = true, pendingType } = {}) {
   if (!hasRequestTable) {
     // No request table on this deploy: nobody can have asked for anything, so
     // every answer is a completed form. Conservative, and never wrong-headed.
     return kind === 'ready' ? '1=1' : '1=0';
   }
-  const cancel = pendingRequestSql('j', 'cancel');
-  const reschedule = pendingRequestSql('j', 'reschedule');
+  const cancel = pendingRequestSql('j', 'cancel', pendingType);
+  const reschedule = pendingRequestSql('j', 'reschedule', pendingType);
   switch (kind) {
     case 'cancel': return `(${cancel})`;
     case 'reschedule': return `(NOT (${cancel}) OR (${cancel}) IS NULL) AND (${reschedule})`;
@@ -243,7 +251,11 @@ function ageDaysSql(alias = 'j', today = istToday(), anchor = 'ticket') {
  * letting it fall out of the tile it is counted in.
  */
 function dayPredicate(day, alias = 'j', today = istToday(), anchor = 'ticket') {
-  const age = ageDaysSql(alias, today, anchor);
+  return agePillSql(day, ageDaysSql(alias, today, anchor));
+}
+
+/** One pill over an age expression already computed (counts() reads a column). */
+function agePillSql(day, age) {
   switch (String(day)) {
     case '0': return `${age} = 0`;
     case '1': return `${age} = 1`;
@@ -596,10 +608,33 @@ async function counts({
   searchSql = '', searchParams = [], searchJoins = '',
   ownerId, hasRequestTable = true, db = pool,
 } = {}) {
-  const responded = respondedSql('j', hasRequestTable);
-  const failed = failedSql();
-  const optedIn = optedInSql();
-  const sentP = sentSql();
+  /*
+   * EACH ROW'S FACTS ARE COMPUTED ONCE, in the derived table `f` below, and the
+   * SUMs read them as columns. They used to be inlined into every SUM, and
+   * MySQL does not share a repeated correlated subquery — so the attempt
+   * ledger (a four-way UNION per job) ran ~30 times per open order, and the
+   * tiles loaded long after the grid that uses the same predicate once.
+   * A select-list subquery also stops MySQL merging `f` into the outer query,
+   * so it is materialised once rather than re-inlined.
+   *
+   * Every fact is strictly 0/1 (EXISTS, IS NOT NULL, the NULL-guarded failure
+   * test), so NOT/AND over the columns behave exactly as over the expressions.
+   * Only the two ages can be NULL, and agePillSql's 3plus claims that.
+   */
+  const facts = `
+      ${optedInSql()} AS o,
+      ${respondedSql('j', hasRequestTable)} AS r,
+      ${failedSql()} AS f,
+      (${sentSql()}) AS s,
+      ${withClientSql()} AS c,
+      ${hasRequestTable ? pendingTypeSql('j') : 'NULL'} AS pt,
+      DATE(j.ticket_created_date_time) AS tk,
+      ${ageDaysSql('j', istToday(now))} AS age,
+      ${ageDaysSql('j', istToday(now), 'client')} AS cage`;
+  const optedIn = 'f.o';
+  const responded = 'f.r';
+  const failed = 'f.f';
+  const sentP = 'f.s';
 
   /*
    * The caller's row filter, verbatim. `ownerId` rides alongside it because My
@@ -625,10 +660,10 @@ async function counts({
    * halves and the links-sent tally come off the same rows, so they cannot
    * disagree with each other and the five buckets always sum to `total`.
    */
-  const client = withClientSql();
+  const client = 'f.c';
   const notClient = `NOT ${client}`;
   const isNew = `${notClient} AND ${optedIn} AND NOT ${sentP} AND NOT ${responded} AND NOT ${failed}`;
-  const ticketYmd = 'DATE(j.ticket_created_date_time)';
+  const ticketYmd = 'f.tk';
   const today = istToday(now);
   const [[row]] = await db.query(
     `SELECT COUNT(*) AS total,
@@ -638,40 +673,41 @@ async function counts({
         SUM(NOT (${optedIn} AND ${responded}) AND ${client})                 AS b_client,
         SUM(${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed})  AS b_failed,
         SUM(${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AS b_no_response,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable })}))      AS r_ready,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable })})) AS r_reschedule,
-        SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable })}))     AS r_cancel,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('ready', { hasRequestTable, pendingType: 'f.pt' })}))      AS r_ready,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('reschedule', { hasRequestTable, pendingType: 'f.pt' })})) AS r_reschedule,
+        SUM(${optedIn} AND ${responded} AND (${responseKindSql('cancel', { hasRequestTable, pendingType: 'f.pt' })}))     AS r_cancel,
         SUM(${isNew} AND ${ticketYmd} = ?)        AS new_today,
         SUM(${isNew} AND ${ticketYmd} <> ?)       AS new_old,
         SUM(NOT ${optedIn} AND ${ticketYmd} = ?)  AS no_link_today,
         SUM(NOT ${optedIn} AND ${ticketYmd} <> ?) AS no_link_old,
         SUM(${sentP})                             AS links_sent,
-        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('0', 'j', today, 'client')}))     AS d_client_0,
-        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('1', 'j', today, 'client')}))     AS d_client_1,
-        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('2', 'j', today, 'client')}))     AS d_client_2,
-        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${dayPredicate('3plus', 'j', today, 'client')})) AS d_client_3plus,
-        SUM((${isNew}) AND (${dayPredicate('0', 'j', today)})) AS d_new_0,
-        SUM((${isNew}) AND (${dayPredicate('1', 'j', today)})) AS d_new_1,
-        SUM((${isNew}) AND (${dayPredicate('2', 'j', today)})) AS d_new_2,
-        SUM((${isNew}) AND (${dayPredicate('3plus', 'j', today)})) AS d_new_3plus,
-        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('0', 'j', today)})) AS d_no_link_0,
-        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('1', 'j', today)})) AS d_no_link_1,
-        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('2', 'j', today)})) AS d_no_link_2,
-        SUM((${notClient} AND NOT ${optedIn}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_link_3plus,
-        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('0', 'j', today)})) AS d_responded_0,
-        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('1', 'j', today)})) AS d_responded_1,
-        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('2', 'j', today)})) AS d_responded_2,
-        SUM((${optedIn} AND ${responded}) AND (${dayPredicate('3plus', 'j', today)})) AS d_responded_3plus,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('0', 'j', today)})) AS d_failed_0,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('1', 'j', today)})) AS d_failed_1,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('2', 'j', today)})) AS d_failed_2,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${dayPredicate('3plus', 'j', today)})) AS d_failed_3plus,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('0', 'j', today)})) AS d_no_response_0,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('1', 'j', today)})) AS d_no_response_1,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('2', 'j', today)})) AS d_no_response_2,
-        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${dayPredicate('3plus', 'j', today)})) AS d_no_response_3plus
-       FROM tbl_job j${joins}
-      WHERE j.job_status = 9${scope}`,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${agePillSql('0', 'f.cage')}))     AS d_client_0,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${agePillSql('1', 'f.cage')}))     AS d_client_1,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${agePillSql('2', 'f.cage')}))     AS d_client_2,
+        SUM((NOT (${optedIn} AND ${responded}) AND ${client}) AND (${agePillSql('3plus', 'f.cage')})) AS d_client_3plus,
+        SUM((${isNew}) AND (${agePillSql('0', 'f.age')})) AS d_new_0,
+        SUM((${isNew}) AND (${agePillSql('1', 'f.age')})) AS d_new_1,
+        SUM((${isNew}) AND (${agePillSql('2', 'f.age')})) AS d_new_2,
+        SUM((${isNew}) AND (${agePillSql('3plus', 'f.age')})) AS d_new_3plus,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${agePillSql('0', 'f.age')})) AS d_no_link_0,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${agePillSql('1', 'f.age')})) AS d_no_link_1,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${agePillSql('2', 'f.age')})) AS d_no_link_2,
+        SUM((${notClient} AND NOT ${optedIn}) AND (${agePillSql('3plus', 'f.age')})) AS d_no_link_3plus,
+        SUM((${optedIn} AND ${responded}) AND (${agePillSql('0', 'f.age')})) AS d_responded_0,
+        SUM((${optedIn} AND ${responded}) AND (${agePillSql('1', 'f.age')})) AS d_responded_1,
+        SUM((${optedIn} AND ${responded}) AND (${agePillSql('2', 'f.age')})) AS d_responded_2,
+        SUM((${optedIn} AND ${responded}) AND (${agePillSql('3plus', 'f.age')})) AS d_responded_3plus,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${agePillSql('0', 'f.age')})) AS d_failed_0,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${agePillSql('1', 'f.age')})) AS d_failed_1,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${agePillSql('2', 'f.age')})) AS d_failed_2,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND ${failed}) AND (${agePillSql('3plus', 'f.age')})) AS d_failed_3plus,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${agePillSql('0', 'f.age')})) AS d_no_response_0,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${agePillSql('1', 'f.age')})) AS d_no_response_1,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${agePillSql('2', 'f.age')})) AS d_no_response_2,
+        SUM((${notClient} AND ${optedIn} AND NOT ${responded} AND NOT ${failed} AND ${sentP}) AND (${agePillSql('3plus', 'f.age')})) AS d_no_response_3plus
+       FROM (SELECT ${facts}
+               FROM tbl_job j${joins}
+              WHERE j.job_status = 9${scope}) f`,
     [today, today, today, today, ...whereParams],
   );
 

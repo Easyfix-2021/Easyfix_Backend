@@ -171,8 +171,21 @@ jobs:
       # --depth 1 because both tests are plain file reads with no `git log`;
       # public repo, so no token and no secret; "$RUNNER_TEMP" and not the
       # workspace because `npm run lint` above is `eslint .` from the repo root.
+      #
+      # THE CRM BRANCH OF THE SAME ENVIRONMENT (2026-09-28). A bare clone takes
+      # the CRM's default branch, Production — so every QA deploy compared QA's
+      # backend with PRODUCTION's CRM. QA's CRM had a Booking Queue whose sort
+      # headers this suite could not read, and the QA deploy was green because
+      # it never looked at them. Same target rule as the deploy job's "Resolve
+      # target": QA is QA, anything else is Production. No fallback — a missing
+      # branch must fail the clone, not quietly test against another one.
       - name: Fetch Easyfix_CRM_UI for cross-repo parity
-        run: git clone --quiet --depth 1 https://github.com/Easyfix-2021/Easyfix_CRM_UI.git "$RUNNER_TEMP/easyfix-crm-ui"
+        env:
+          TARGET: ${{ github.event.inputs.target || github.ref_name }}
+        run: |
+          [[ "$TARGET" == "QA" ]] && CRM_BRANCH=QA || CRM_BRANCH=Production
+          git clone --quiet --depth 1 --branch "$CRM_BRANCH" https://github.com/Easyfix-2021/Easyfix_CRM_UI.git "$RUNNER_TEMP/easyfix-crm-ui"
+          echo "CRM parity checkout: $CRM_BRANCH @ $(git -C "$RUNNER_TEMP/easyfix-crm-ui" rev-parse --short HEAD)"
       # Characterization tests for the shared choke points (setStatus, create,
       # assign, offer, accept-offer, reschedule, magic-link write, + the
       # statusToEventName notification gate). Fake-pool based — no DB, no network,
