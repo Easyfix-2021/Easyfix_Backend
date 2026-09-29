@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const aiCheck = require('./aadhaar-ai-check.service');
 const {
   upsertEasyfixerDocuments,
   resolveEasyfixerDocumentUrl,
@@ -159,8 +160,16 @@ async function saveIdentityDetails(
     ? null
     : (body.haveDrivingLicence ? 1 : 0);
   const identityComplete = Boolean(aadhaar);
+  let aiCheckRow = null;
 
   try {
+    // 0. AI CHECK ON RECORD (owner, 2026-09-29). A save that writes Aadhaar
+    //    identity must match a recorded check's fingerprint of these exact
+    //    inputs — see services/aadhaar-ai-check.service.js. Before any lock:
+    //    a refusal is a plain read and must not hold anyone up. Skipped (with a
+    //    warning) until the migration has run; PAN/DL-only saves never need it.
+    aiCheckRow = await aiCheck.assertCurrentCheck(conn, efrId, body);
+
     // 1. VALUE lock (coarse) — the only thing that serialises two DIFFERENT
     //    technicians claiming the same number. Skipped entirely for a doc-only
     //    or PAN-only save, which would otherwise all hash the empty string to
@@ -229,6 +238,8 @@ async function saveIdentityDetails(
       [3, docs.pan],
       [12, docs.drivingLicence],
     ]);
+    // Same transaction: the check the CRM shows is the one this save used.
+    if (aiCheckRow) await aiCheck.markSubmitted(conn, aiCheckRow.id);
 
     await conn.commit();
     transactionStarted = false;
@@ -262,8 +273,8 @@ async function saveIdentityDetails(
 
   let finalization = null;
   if (typeof finalize === 'function') finalization = await finalize(efrId);
-  logger.info({ efrId, complete: identityComplete }, 'Identity details saved');
-  return { updated: true, finalization };
+  logger.info({ efrId, complete: identityComplete, aiVerdict: aiCheckRow?.verdict || null }, 'Identity details saved');
+  return { updated: true, finalization, ...(aiCheckRow ? { aiVerdict: aiCheckRow.verdict } : {}) };
 }
 
 module.exports = {

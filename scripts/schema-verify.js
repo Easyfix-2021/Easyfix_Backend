@@ -432,6 +432,13 @@ const EXPECTED = {
   tbl_job_chat: [
     'id', 'job_id', 'sender_kind', 'efr_id', 'user_id', 'body', 'client_msg_id', 'sent_on',
   ],
+  // migrations/2026-09-29-01-aadhaar-ai-check.sql — the AI Aadhaar check record
+  // (services/aadhaar-ai-check.service.js). The code probes and degrades; the
+  // boot gate is deliberately stricter — apply the migration before deploy.
+  tbl_easyfixer_aadhaar_ai_check: [
+    'id', 'efr_id', 'status', 'verdict', 'reason', 'aadhaar_last4', 'name_score',
+    'discrepancies', 'input_fingerprint', 'created_at', 'submitted_at',
+  ],
   tbl_job_verification: [
     'job_id', 'verified_on', 'verified_by', 'qc_due_on', 'qc_status', 'qc_on',
     'qc_by_contact_id', 'qc_note', 'posted_on', 'post_error',

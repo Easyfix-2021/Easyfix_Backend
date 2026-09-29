@@ -49,6 +49,7 @@ deepSkillService.resolveImageUrlFromKey = async () => 'https://example.test/prof
 
 const registration = require('../services/mobile-registration.service');
 const lms = require('../services/lms.service');
+const aadhaarAiCheck = require('../services/aadhaar-ai-check.service');
 
 /*
  * The LMS flag probe is primed at BOOT (server.js) and cached for the process,
@@ -68,6 +69,11 @@ async function primeLmsProbe() {
   ], []];
   lms.invalidateLmsSchemaCache();
   await lms.lmsFlagColumns();
+  // Same for the AI Aadhaar check probe: cached once per process, so it is
+  // not part of the per-status budget.
+  db.pool.query = async () => [aadhaarAiCheck._internals.COLUMNS.map((c) => ({ c })), []];
+  aadhaarAiCheck._internals.resetProbeForTests();
+  await aadhaarAiCheck.installed();
   db.pool.query = previous;
   fake.reset();
 }

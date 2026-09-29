@@ -4,6 +4,7 @@ const deepSkillService = require('./deep-skill.service');
 const lifecycleService = require('./easyfixer-lifecycle.service');
 const registrationProfile = require('./technician-registration-profile.service');
 const profileCompletion = require('./profile-completion.service');
+const aadhaarAiCheck = require('./aadhaar-ai-check.service');
 // One definition of "mandatory", shared with the mobile training list — two
 // copies of this SQL would drift the first time either was touched.
 const { mandatoryVideoIdsSql, mandatoryNonVideoProgress } = require('./lms.service');
@@ -75,6 +76,10 @@ async function fetchGateRow(efrId) {
   // without them here every status reported the DOB missing and the Work Area
   // incomplete (regressed 4c78898, 2026-09-02; found on QA 2026-09-25).
   const completionSql = profileCompletion.sqlPredicates({ technicianAlias: 'e', userAlias: 'u' });
+  // Folded into this one row (no extra round trip once the probe is cached):
+  // the AI Aadhaar verdict of the latest submitted identity, for the hub's
+  // "the team will review it" note. NULL before the migration has run.
+  const aiVerdictSql = (await aadhaarAiCheck.installed()) ? aadhaarAiCheck.latestVerdictSql('e') : 'NULL';
   const [[row]] = await pool.query(
     `SELECT e.efr_id,
             e.efr_first_name, e.efr_name, e.efr_no,
@@ -100,7 +105,8 @@ async function fetchGateRow(efrId) {
             u.is_personal_detail_filled      AS user_is_personal_detail_filled,
             u.is_released                    AS user_is_released,
             ${completionSql.dobPresent}       AS dob_present,
-            ${completionSql.serviceablePincodesPresent} AS serviceable_pincodes_present
+            ${completionSql.serviceablePincodesPresent} AS serviceable_pincodes_present,
+            ${aiVerdictSql} AS identity_ai_verdict
        FROM tbl_easyfixer e
        LEFT JOIN tbl_user u ON u.user_id = e.user_id
       WHERE e.efr_id = ?
@@ -370,6 +376,10 @@ async function getStatus(efrId, authenticatedLifecycle = null) {
     hasSkills,
     trainingCompletedTime,
     profilePercentage:          pct(e.efr_profile_perc),
+    // Additive (2026-09-29): the AI Aadhaar verdict of the latest submitted
+    // identity — 'verified' | 'mismatch' | 'not_run' | null (legacy save, or
+    // none yet). Never part of any completeness or gate answer.
+    identityAiVerdict:          e.identity_ai_verdict || null,
   };
 
   const status = deriveStatus(flags);

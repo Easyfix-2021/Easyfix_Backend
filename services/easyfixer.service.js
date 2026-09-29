@@ -2,6 +2,7 @@ const { pool } = require('../db');
 const { cityScopeSql } = require('../lib/scope');
 const logger = require('../logger');
 const lifecycleService = require('./easyfixer-lifecycle.service');
+const aadhaarAiCheck = require('./aadhaar-ai-check.service');
 // Only lmsFlagColumns() — the same probed-column answer the LMS uses, so the
 // registered queue and the technician's training gate cannot disagree about
 // which flags exist. See registeredTrainingJoin().
@@ -1676,6 +1677,9 @@ async function listRegistered(f = {}, scope) {
   // straddle the LMS schema probe's TTL and build the two from different
   // answers, so a row could be on the page but not in the total.
   const joins = await registeredJoins();
+  // The AI Aadhaar verdict behind each row's latest app identity save, so a
+  // mismatch stands out in the queue. NULL before the migration has run.
+  const aiVerdictSql = (await aadhaarAiCheck.installed()) ? aadhaarAiCheck.latestVerdictSql('e') : 'NULL';
   const sortCol = REGISTERED_SORTS[f.sortBy] || 'U.insert_date';
   const sortDir = String(f.sortDir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   // Page-size ceiling: 500 for the interactive list (matches the Joi cap).
@@ -1725,7 +1729,8 @@ async function listRegistered(f = {}, scope) {
       tb.easyfix_bank_name_id                AS easyfix_bank_name_id,
       tb.efr_bank_acc_num                    AS efr_bank_acc_num,
       ${lifecycleProjection},
-      ${lifecycleInstalled ? reappliedProvenanceExists('e') : '0'} AS lifecycle_reapplication_count
+      ${lifecycleInstalled ? reappliedProvenanceExists('e') : '0'} AS lifecycle_reapplication_count,
+      ${aiVerdictSql} AS identity_ai_verdict
     ${joins}
     ${where}
     ORDER BY ${sortCol} ${sortDir}, e.efr_id DESC
