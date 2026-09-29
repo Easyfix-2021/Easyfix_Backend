@@ -1,11 +1,13 @@
 const router = require('express').Router();
 const Joi = require('joi');
 const ExcelJS = require('exceljs');
+const multer = require('multer');
 
 const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
 const { getEffectivePermissions } = require('../../services/role.service');
 const roster = require('../../services/roster.service');
+const rosterBulk = require('../../services/roster-bulk.service');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -156,11 +158,74 @@ manage.get('/logs/actions', validate(Joi.object(pageQuery), 'query'), async (req
   } catch (e) { sendError(res, next, e); }
 });
 
+// ── Bulk Update: template → upload (dry run) → Confirm & Save ─────────────
+const bulkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  fileFilter(_req, file, cb) {
+    if (!/\.xlsx$/i.test(file.originalname)) return cb(Object.assign(new Error('Upload the .xlsx template'), { status: 400 }));
+    return cb(null, true);
+  },
+}).single('file');
+function readUpload(req, res) {
+  return new Promise((resolve, reject) => bulkUpload(req, res, (e) => {
+    if (e) return reject(Object.assign(e, { status: e.status || 400 }));
+    if (!req.file) return reject(Object.assign(new Error('No file uploaded'), { status: 400 }));
+    return resolve(req.file.buffer);
+  }));
+}
+const csvIds = Joi.string().pattern(/^\d+(,\d+)*$/);
+async function sendXlsx(res, buffer, filename) {
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(Buffer.from(buffer));
+}
+
+manage.get('/bulk/template',
+  validate(Joi.object({ months: Joi.string().pattern(/^\d{4}-\d{2}(,\d{4}-\d{2})*$/).required(), userIds: csvIds }), 'query'),
+  async (req, res, next) => {
+    try {
+      const { buffer, from, to } = await rosterBulk.buildTemplate({
+        actorId: req.user.user_id, isAdmin: await isRosterAdmin(req),
+        months: req.query.months.split(','), userIds: req.query.userIds ? req.query.userIds.split(',').map(Number) : null,
+      });
+      logger.info('Roster bulk template · actor=' + req.user.user_id + ' · ' + from + '→' + to);
+      await sendXlsx(res, buffer, `team-roster-bulk-${from}-to-${to}.xlsx`);
+    } catch (e) { sendError(res, next, e); }
+  });
+
+// ?dryRun=1 = validate only (no Action Log row); without it = Confirm & Save.
+manage.post('/bulk/upload',
+  validate(Joi.object({ dryRun: Joi.boolean().truthy('1').falsy('0').default(false) }), 'query'),
+  async (req, res, next) => {
+    if (req.query.dryRun) {
+      try {
+        const buffer = await readUpload(req, res);
+        return modernOk(res, await rosterBulk.dryRun({ actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), buffer }));
+      } catch (e) { return sendError(res, next, e); }
+    }
+    return mutation('BULK_UPLOAD', async (rq, rs, isAdmin) => {
+      const buffer = await readUpload(rq, rs);
+      modernOk(rs, { summary: await rosterBulk.commit({ actorId: rq.user.user_id, isAdmin, buffer }) }, 'Roster updated');
+    })(req, res, next);
+  });
+
+// The uploaded file back with error cells filled red + the reason as a note.
+manage.post('/bulk/errors', async (req, res, next) => {
+  try {
+    const buffer = await readUpload(req, res);
+    const out = await rosterBulk.errorSheet({ actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), buffer });
+    await sendXlsx(res, out.buffer, 'team-roster-bulk-errors.xlsx');
+  } catch (e) { sendError(res, next, e); }
+});
+
 /*
- * Export a date range (≤ 93 days) as .xlsx — one row per employee, one column per date
+ * Export a date range (≤ 186 days) as .xlsx — one row per employee, one column per date
  * (PR / WO), the layout of the monthly roster e-mail this replaces.
  */
-const EXPORT_MAX_DAYS = 93; // "3 Months (From Today)" + a day of slack
+// ~6 months: the whole plan window (tomorrow → end of month+3, up to ~123 days)
+// plus a look back. The grid itself stays capped at 62 (MAX_RANGE_DAYS).
+const EXPORT_MAX_DAYS = 186;
 manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.required(), teamOf: Joi.number().integer().positive() }), 'query'),
   async (req, res, next) => {
     try {
@@ -170,7 +235,8 @@ manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.requir
       });
       const wb = new ExcelJS.Workbook();
       const ws = wb.addWorksheet('Roster');
-      const dayLabel = (d) => `${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][roster.weekdayIndex(d)]} ${d.slice(8)}`;
+      // DD/MM (Day) like the grid header — a bare "Mon 01" repeats across months.
+      const dayLabel = (d) => `${d.slice(8)}/${d.slice(5, 7)} (${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][roster.weekdayIndex(d)]})`;
       ws.addRow(['Team Member', 'Emp Code', 'Role', 'Shift', ...grid.dates.map(dayLabel)]).font = { bold: true };
       const hol = new Set(grid.holidays.map((h) => h.date));
       for (const m of grid.members) {

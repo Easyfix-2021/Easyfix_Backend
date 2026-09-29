@@ -88,3 +88,24 @@ test('a denied save (member outside the team) is 403 AND lands in the Action Log
   assert.equal(log.params[0], 'SAVE_GRID');
   assert.equal(log.params[6], 403);
 });
+
+test('Bulk Update routes sit behind the same key', async () => {
+  const noKey = { user_id: 5, official_email: 'tl2@easyfix.in' };
+  const month = new Date().toISOString().slice(0, 7);
+  assert.equal((await call(noKey, `/bulk/template?months=${month}`)).status, 403);
+  assert.equal((await call(noKey, '/bulk/upload?dryRun=1', { method: 'POST' })).status, 403);
+  assert.equal((await call(noKey, '/bulk/upload', { method: 'POST' })).status, 403);
+  assert.equal((await call(noKey, '/bulk/errors', { method: 'POST' })).status, 403);
+});
+
+test('Bulk upload: no file / a non-xlsx file → 400, not a crash', async () => {
+  const tl = { user_id: 1, official_email: 'tl@easyfix.in' };
+  actingUser = tl;
+  const fd = new FormData();
+  fd.append('file', new Blob(['a,b']), 'roster.csv');
+  const res = await fetch(base + '/bulk/upload?dryRun=1', { method: 'POST', body: fd });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /xlsx/);
+  const none = await fetch(base + '/bulk/upload?dryRun=1', { method: 'POST' });
+  assert.equal(none.status, 400);
+});
