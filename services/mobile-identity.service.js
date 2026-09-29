@@ -1,5 +1,6 @@
 const { pool } = require('../db');
 const logger = require('../logger');
+const aiCheck = require('./aadhaar-ai-check.service');
 const {
   upsertEasyfixerDocuments,
   resolveEasyfixerDocumentUrl,
@@ -159,8 +160,16 @@ async function saveIdentityDetails(
     ? null
     : (body.haveDrivingLicence ? 1 : 0);
   const identityComplete = Boolean(aadhaar);
+  let aiCheckRow = null;
 
   try {
+    // 0. AI CHECK ON RECORD (owner, 2026-09-29). A save that writes Aadhaar
+    //    identity must match a recorded check's fingerprint of these exact
+    //    inputs — see services/aadhaar-ai-check.service.js. Before any lock:
+    //    a refusal is a plain read and must not hold anyone up. Skipped (with a
+    //    warning) until the migration has run; PAN/DL-only saves never need it.
+    aiCheckRow = await aiCheck.assertCurrentCheck(conn, efrId, body);
+
     // 1. VALUE lock (coarse) — the only thing that serialises two DIFFERENT
     //    technicians claiming the same number. Skipped entirely for a doc-only
     //    or PAN-only save, which would otherwise all hash the empty string to
@@ -207,10 +216,27 @@ async function saveIdentityDetails(
      * Aadhaar/PAN also "not a valid number": legacy Flutter DigiLocker rows
      * hold masked Aadhaars (XXXXXXXX1234), which the app must still be able to
      * complete. Corrections to a real value are an ops action in the CRM.
+     *
+     * EXCEPT AFTER A CRM REJECTION (owner, 2026-09-29). When the reviewer has
+     * rejected the identity (is_identity_details_verified_by_crm = 2, "Profile
+     * Not Approved → Fix and Resubmit") the technician is SUPPOSED to replace
+     * it: fill-only would silently keep the rejected name/number/DOB/photos,
+     * and the AI check would have verified values that never got stored. Read
+     * under this transaction's row lock, so it is the state this save acts on.
      */
-    await conn.query(
-      `UPDATE tbl_easyfixer
-          SET efr_name              = COALESCE(NULLIF(TRIM(efr_name), ''), ?),
+    const [[reviewRow]] = await conn.query(
+      'SELECT is_identity_details_verified_by_crm AS identity_review FROM tbl_easyfixer WHERE efr_id = ? FOR UPDATE',
+      [efrId],
+    );
+    const replaceRejected = Number(reviewRow?.identity_review) === 2;
+    const identitySetSql = replaceRejected
+      ? `efr_name              = COALESCE(?, efr_name),
+              adhaar_card_number    = COALESCE(?, adhaar_card_number),
+              pan_card_number       = COALESCE(?, pan_card_number),
+              efr_first_name        = COALESCE(?, efr_first_name),
+              efr_last_name         = COALESCE(?, efr_last_name),
+              date_of_birth         = COALESCE(?, date_of_birth),`
+      : `efr_name              = COALESCE(NULLIF(TRIM(efr_name), ''), ?),
               adhaar_card_number    = CASE WHEN adhaar_card_number REGEXP '^[0-9]{12}$'
                                            THEN adhaar_card_number
                                            ELSE COALESCE(?, adhaar_card_number) END,
@@ -219,7 +245,10 @@ async function saveIdentityDetails(
                                            ELSE COALESCE(?, pan_card_number) END,
               efr_first_name        = COALESCE(NULLIF(TRIM(efr_first_name), ''), ?),
               efr_last_name         = COALESCE(NULLIF(TRIM(efr_last_name), ''), ?),
-              date_of_birth         = COALESCE(date_of_birth, ?),
+              date_of_birth         = COALESCE(date_of_birth, ?),`;
+    await conn.query(
+      `UPDATE tbl_easyfixer
+          SET ${identitySetSql}
               have_driving_lisence  = COALESCE(?, have_driving_lisence),
               efr_identity_details_perc = COALESCE(?, efr_identity_details_perc),
               update_date           = ?
@@ -240,13 +269,16 @@ async function saveIdentityDetails(
 
     const docs = body.docs || {};
     // Identity documents are fill-only too: a stored Aadhaar/PAN/licence
-    // image is kept; a new one is written only where none exists.
+    // image is kept; a new one is written only where none exists — except after
+    // a CRM rejection, when the resubmitted photos replace the rejected ones.
     await upsertEasyfixerDocuments(conn, efrId, [
       [13, docs.aadhaarFront],
       [14, docs.aadhaarBack],
       [3, docs.pan],
       [12, docs.drivingLicence],
-    ], { fillOnly: true });
+    ], { fillOnly: !replaceRejected });
+    // Same transaction: the check the CRM shows is the one this save used.
+    if (aiCheckRow) await aiCheck.markSubmitted(conn, aiCheckRow.id);
 
     await conn.commit();
     transactionStarted = false;
@@ -280,8 +312,8 @@ async function saveIdentityDetails(
 
   let finalization = null;
   if (typeof finalize === 'function') finalization = await finalize(efrId);
-  logger.info({ efrId, complete: identityComplete }, 'Identity details saved');
-  return { updated: true, finalization };
+  logger.info({ efrId, complete: identityComplete, aiVerdict: aiCheckRow?.verdict || null }, 'Identity details saved');
+  return { updated: true, finalization, ...(aiCheckRow ? { aiVerdict: aiCheckRow.verdict } : {}) };
 }
 
 module.exports = {

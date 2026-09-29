@@ -32,6 +32,13 @@ const identityDetailsSchema = Joi.object({
     pan: Joi.string().trim().max(255).optional(),
     drivingLicence: Joi.string().trim().max(255).optional(),
   }).optional(),
+  // MD5 of the two Aadhaar photos' bytes — the same digests the upload route
+  // verifies. They bind this save to the recorded AI check that read those
+  // photos (services/aadhaar-ai-check.service.js).
+  aadhaarPhotoDigests: Joi.object({
+    front: Joi.string().pattern(/^[a-f0-9]{32}$/i).required(),
+    back: Joi.string().pattern(/^[a-f0-9]{32}$/i).required(),
+  }).optional(),
 }).min(1);
 
 // Protected/authenticated by routes/mobile/index.js. One bounded aggregate

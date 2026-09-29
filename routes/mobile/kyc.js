@@ -37,6 +37,7 @@ const validate = require('../../middleware/validate');
 const { verifyIdempotencyUpload } = require('../../middleware/verify-idempotency-upload');
 const { modernOk, modernError } = require('../../utils/response');
 const kyc = require('../../services/mobile-kyc.service');
+const aiCheck = require('../../services/aadhaar-ai-check.service');
 const logger = require('../../logger');
 
 // KYC OCR uploads (PAN + Aadhaar) — in-memory, images only. This is the OUTER
@@ -183,7 +184,10 @@ router.post(
 // ─── 6. Aadhaar OCR (AI extraction via Sophy) ───────────────────────
 
 // POST /aadhaar-ocr — multipart: `front` (file), `back` (file), `name` (text,
-// optional: the "Name as per Aadhaar" the technician typed on the same screen).
+// optional: the "Name as per Aadhaar" the technician typed on the same screen),
+// `aadhaarNumber` + `dob` (text, optional: what the form holds — used ONLY for
+// the recorded check's discrepancies and input fingerprint, never returned or
+// logged).
 //   → 200 { available, extracted, nameMatch }
 // `available:false` is a SOFT DEGRADE (no key / gateway error / unreadable
 // reply) and still answers 200 with extracted+nameMatch null. 400 is reserved
@@ -193,7 +197,8 @@ const aadhaarUpload = upload.fields([
   { name: 'back', maxCount: 1 },
 ]);
 
-// A pure extraction read that PERSISTS NOTHING, so an Idempotency-Key buys no
+// An extraction read whose only write is an insert-only CHECK RECORD (a replay
+// adds a second, identical row — harmless), so an Idempotency-Key buys no
 // replay protection here — and it cannot be bound honestly. The idempotency
 // layer fingerprints method + URL + body + ONE content digest and runs BEFORE
 // Multer, so of this route's three payload parts (front, back, typed name) two
@@ -237,8 +242,22 @@ router.post('/aadhaar-ocr', rejectIdempotencyKey, aadhaarUploadOr400, async (req
       logger.warn('Aadhaar OCR rejected · missing image file');
       return modernError(res, 400, 'Both Aadhaar images are required (multipart fields "front" and "back")');
     }
-    // NEVER log req.body.name or anything extracted — bytes and booleans only.
-    const out = await kyc.aadhaarOcr(req.tech.efr_id, front, back, req.body && req.body.name);
+    // NEVER log req.body.name/aadhaarNumber/dob or anything extracted — bytes
+    // and booleans only.
+    const body = req.body || {};
+    const { reason, ...out } = await kyc.aadhaarOcr(req.tech.efr_id, front, back, body.name);
+    /*
+     * Every completed check goes on record — whatever the outcome — because the
+     * identity save now refuses inputs no check has read (owner, 2026-09-29).
+     * A record failure is a 500, not a silent 200: the app would otherwise show
+     * a finished check whose save the server then refuses.
+     */
+    await aiCheck.recordCheck(req.tech.efr_id, {
+      ocr: { ...out, reason },
+      typed: { name: body.name, aadhaarNumber: body.aadhaarNumber, dob: body.dob },
+      front: front.buffer,
+      back: back.buffer,
+    });
     logger.info('Aadhaar OCR responded · available=' + out.available);
     modernOk(res, out);
   } catch (e) { logger.warn('Aadhaar OCR failed · ' + e.message); handleErr(res, next, e); }

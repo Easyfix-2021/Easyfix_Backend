@@ -8,8 +8,8 @@
  * a same-key retry with a corrected name (or a re-shot back image) replayed the
  * stale extraction instead of re-reading the card.
  *
- * The endpoint persists nothing — it is a pure extraction read — so the key is
- * now refused outright. What is asserted here is the OUTCOME, not the wording:
+ * The endpoint's only write is an insert-only check record, so the key buys
+ * nothing and is refused outright. What is asserted here is the OUTCOME, not the wording:
  * a changed name or a changed back image must never be answered from a response
  * stored for a different payload. Unkeyed calls must stay untouched.
  *
@@ -25,8 +25,12 @@ const express = require('express');
 const idempotency = require('../middleware/idempotency');
 const logger = require('../logger');
 const sophy = require('../services/sophy.service');
+const aiCheck = require('../services/aadhaar-ai-check.service');
 
 const originalChatVision = sophy.chatVision;
+// The check record is the route's one write; stubbed (no DB) — it is covered
+// by tests/aadhaar-ai-check.test.js and tests/aadhaar-ocr-route.test.js.
+const originalRecordCheck = aiCheck.recordCheck;
 const originalKey = process.env.SOPHY_API_KEY_AADHAAR_OCR;
 
 // ── fake ledger — one row per (actor, key), same CAS contract as MySQL ──
@@ -79,6 +83,7 @@ let baseUrl;
 
 before(async () => {
   process.env.SOPHY_API_KEY_AADHAAR_OCR = 'mw_live_test';
+  aiCheck.recordCheck = async () => null;
   sophy.chatVision = async (args) => {
     visionCalls.push(args);
     return JSON.stringify({
@@ -99,6 +104,7 @@ before(async () => {
 
 after(async () => {
   sophy.chatVision = originalChatVision;
+  aiCheck.recordCheck = originalRecordCheck;
   if (originalKey === undefined) delete process.env.SOPHY_API_KEY_AADHAAR_OCR;
   else process.env.SOPHY_API_KEY_AADHAAR_OCR = originalKey;
   if (server) await new Promise((resolve) => server.close(resolve));

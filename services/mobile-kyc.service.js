@@ -418,8 +418,9 @@ async function upiVerify(efrId, upiId) {
  * nameMatch:null}` and the ROUTE still answers 200. A failed extraction must
  * NEVER surface as a name match — matched:true requires a real extraction.
  *
- * READ-ONLY: nothing here is persisted. Saving the identity fields stays with
- * the existing identity-details save.
+ * READ-ONLY: nothing here is persisted. The ROUTE records the outcome of each
+ * check (services/aadhaar-ai-check.service.js); saving the identity fields
+ * stays with the existing identity-details save.
  *
  * PII: the images, the extracted fields and the typed name are all PII. Log
  * byte counts and booleans only — never a value.
@@ -568,7 +569,9 @@ async function aadhaarOcr(efrId, frontFile, backFile, typedName) {
       aadhaarOcrDisabledLogged = true;
       logger.warn('KYC Aadhaar OCR is disabled · SOPHY_API_KEY_AADHAAR_OCR is not set');
     }
-    return { ...AADHAAR_UNAVAILABLE };
+    // `reason` is for the check record (services/aadhaar-ai-check.service.js);
+    // the route strips it, so the wire contract is unchanged.
+    return { ...AADHAAR_UNAVAILABLE, reason: 'not_configured' };
   }
 
   if (front.base64.length + back.base64.length > AADHAAR_MAX_TOTAL_BASE64) {
@@ -594,7 +597,7 @@ async function aadhaarOcr(efrId, frontFile, backFile, typedName) {
   const extracted = validateExtraction(sophy.parseJsonLoose(reply));
   if (!extracted) {
     logger.warn({ efrId, available: false }, 'mobile-kyc: Aadhaar OCR produced no usable extraction');
-    return { ...AADHAAR_UNAVAILABLE };
+    return { ...AADHAAR_UNAVAILABLE, reason: 'unreadable' };
   }
 
   // A verdict needs BOTH sides. No typed name ⇒ no verdict; a name the model

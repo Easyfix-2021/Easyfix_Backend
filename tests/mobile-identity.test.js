@@ -50,6 +50,7 @@ function identityDb({
         const duplicate = /pan_card_number/i.test(text) ? panConflict : conflict;
         return [[duplicate ? { conflict: 1 } : null].filter(Boolean), []];
       }
+      if (/identity_review FROM tbl_easyfixer/i.test(text)) return [[{ identity_review: globalThis.__identityReview ?? null }], []];
       if (/^\s*UPDATE tbl_easyfixer/i.test(text)) {
         if (failUpdate) throw failUpdate;
         return [{ affectedRows: 1 }, []];
