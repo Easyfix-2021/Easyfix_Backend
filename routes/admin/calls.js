@@ -1482,9 +1482,11 @@ router.get('/:id/recording', requireClickToCallAction, async (req, res, next) =>
       return modernError(res, 403, 'You do not have access to this call');
     }
 
-    // A Kaleyra row stores an https:// recording URL directly — hand it back.
-    if (row.recording && /^https?:\/\//i.test(String(row.recording))) {
-      return modernOk(res, { url: row.recording, source: 'external' });
+    // A Kaleyra row stores its recording URL directly — hand it back. Real rows
+    // are PROTOCOL-RELATIVE ('//play.solutionsinfini.com/?id=…', no scheme), so
+    // an https-only test sent every Kaleyra Play to the Plivo 404 (2026-09-29).
+    if (row.recording && /^(https?:)?\/\//i.test(String(row.recording))) {
+      return modernOk(res, { url: String(row.recording).replace(/^\/\//, 'https://'), source: 'external' });
     }
 
     if (!s3.isEnabled()) {
