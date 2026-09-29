@@ -24,8 +24,12 @@ const ALL_PR = { monday: 'PR', tuesday: 'PR', wednesday: 'PR', thursday: 'PR', f
 
 let prefs = [];      // tbl_employee_attendance_preference rows
 let rosterRows = []; // tbl_employee_roster rows (roster_date as 'YYYY-MM-DD')
+let changeRows = []; // tbl_employee_roster_change_log rows for one action
 
 const fake = installFakePool([
+  [/FROM \(SELECT c\.roster_date FROM tbl_employee_roster_change_log/i, () => [{ total: new Set(changeRows.map((r) => r.roster_date)).size }]],
+  [/GROUP BY c\.roster_date ORDER BY c\.roster_date/i, () => [...new Set(changeRows.map((r) => r.roster_date))].sort().map((d) => ({ roster_date: d }))],
+  [/ORDER BY u\.user_name, c\.user_id, c\.id/i, () => changeRows],
   [/FROM tbl_employee_attendance_preference/i, (sql, params) => prefs.filter((p) => params.includes(p.user_id))],
   [/FROM tbl_employee_roster\s+WHERE \(user_id, roster_date\) IN/i, (sql, params) => {
     const want = new Set();
@@ -54,7 +58,7 @@ const roster = require('../services/roster.service');
 const { todayIst, shiftYmd } = require('../utils/ist-calendar');
 
 const writes = (re) => fake.calls.filter((c) => re.test(c.sql));
-function reset() { fake.calls.length = 0; prefs = []; rosterRows = []; }
+function reset() { fake.calls.length = 0; prefs = []; rosterRows = []; changeRows = []; }
 
 // ── 1. RESOLUTION ─────────────────────────────────────────────────────────
 test('a planned row overrides the weekly days both ways; unplanned days follow the weekly days', async () => {
@@ -229,4 +233,29 @@ test('updates can be fetched for ONE action only', async () => {
   const q = fake.calls.find((c) => /FROM tbl_employee_roster_change_log c/.test(c.sql) && /LIMIT/.test(c.sql));
   assert.match(q.sql, /c\.action_id = \?/);
   assert.ok(q.params.includes(77));
+});
+
+test('an action\'s changes come back as ONE entry per date, one line per employee', async () => {
+  reset();
+  changeRows = [
+    { roster_date: '2026-12-24', user_id: 2, user_name: 'Sonakshi', user_code: null, field: 'day_type', old_value: null, new_value: 'PR' },
+    { roster_date: '2026-12-24', user_id: 2, user_name: 'Sonakshi', user_code: null, field: 'shift_start', old_value: null, new_value: '13:00' },
+    { roster_date: '2026-12-24', user_id: 3, user_name: 'Ravi', user_code: 'E2003', field: 'day_type', old_value: null, new_value: 'WO' },
+    { roster_date: '2026-12-25', user_id: 2, user_name: 'Sonakshi', user_code: null, field: 'day_type', old_value: null, new_value: 'PR' },
+  ];
+  const out = await roster.listActionChangesByDate({ actorId: 8, isAdmin: true, actionId: 77, page: 1, limit: 20 });
+  assert.equal(out.total, 2);
+  assert.deepEqual(out.items.map((i) => i.rosterDate), ['2026-12-24', '2026-12-25']);
+  const day = out.items[0];
+  assert.deepEqual(day.employees.map((e) => e.userId), [2, 3], 'one line per employee, not per field');
+  assert.deepEqual(day.employees[0].changes.map((c) => c.field), ['day_type', 'shift_start']);
+  assert.equal(out.items[1].employees.length, 1);
+
+  // A TL only sees their own line's rows.
+  reset();
+  await roster.listActionChangesByDate({ actorId: 1, isAdmin: false, actionId: 77, page: 1, limit: 20 });
+  const q = fake.calls.find((c) => /GROUP BY c\.roster_date ORDER BY/.test(c.sql));
+  assert.match(q.sql, /c\.user_id IN \(\?,\?,\?\)/);
+  assert.equal(q.params[0], 77);
+  assert.deepEqual(q.params.slice(1, 4).sort(), [2, 3, 4], 'never 8/9 — outside the line');
 });

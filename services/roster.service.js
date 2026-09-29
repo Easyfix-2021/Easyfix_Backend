@@ -576,6 +576,61 @@ async function listUpdateLog({ actorId, isAdmin, page, limit, userId, from, to, 
   };
 }
 
+/*
+ * One action's changes, one entry per roster date (owner, 2026-09-29: "max
+ * single entry for single date"), each listing one line per employee with
+ * all of that employee's field changes for the date. Pages over DATES, not
+ * change rows, so a date is never split across two pages. Working-days edits
+ * have no roster_date and group under one NULL-date entry.
+ */
+async function listActionChangesByDate({ actorId, isAdmin, actionId, page, limit }) {
+  const reach = await actorReach(actorId, isAdmin);
+  const where = ['c.action_id = ?'];
+  const params = [Number(actionId)];
+  if (!reach.isAdmin) {
+    const ids = [...reach.descendants];
+    if (!ids.length) return { items: [], total: 0 };
+    where.push(`c.user_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  }
+  const clause = 'WHERE ' + where.join(' AND ');
+  const { limit: l, offset } = paging(page, limit);
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM (SELECT c.roster_date FROM tbl_employee_roster_change_log c ${clause} GROUP BY c.roster_date) d`, params);
+  const [dateRows] = await pool.query(
+    `SELECT DATE_FORMAT(c.roster_date, '%Y-%m-%d') AS roster_date FROM tbl_employee_roster_change_log c ${clause}
+      GROUP BY c.roster_date ORDER BY c.roster_date LIMIT ?, ?`,
+    [...params, offset, l]
+  );
+  if (!dateRows.length) return { items: [], total: Number(total) };
+  const dates = dateRows.map((r) => r.roster_date || null);
+  const real = dates.filter(Boolean);
+  const dateClause = [
+    real.length ? `c.roster_date IN (${real.map(() => '?').join(',')})` : null,
+    dates.includes(null) ? 'c.roster_date IS NULL' : null,
+  ].filter(Boolean).join(' OR ');
+  const [rows] = await pool.query(
+    `SELECT DATE_FORMAT(c.roster_date, '%Y-%m-%d') AS roster_date, c.user_id, u.user_name, u.user_code, c.field, c.old_value, c.new_value
+       FROM tbl_employee_roster_change_log c
+       LEFT JOIN tbl_user u ON u.user_id = c.user_id
+       ${clause} AND (${dateClause})
+      ORDER BY u.user_name, c.user_id, c.id`,
+    [...params, ...real]
+  );
+  const byDate = new Map(dates.map((d) => [d, new Map()]));
+  for (const r of rows) {
+    const emps = byDate.get(r.roster_date || null);
+    if (!emps) continue;
+    const uid = Number(r.user_id);
+    if (!emps.has(uid)) emps.set(uid, { userId: uid, userName: r.user_name, empCode: r.user_code || null, changes: [] });
+    emps.get(uid).changes.push({ field: r.field, oldValue: r.old_value, newValue: r.new_value });
+  }
+  return {
+    total: Number(total),
+    items: dates.map((d) => ({ rosterDate: d, employees: [...byDate.get(d).values()] })),
+  };
+}
+
 async function listActionLog({ actorId, isAdmin, page, limit }) {
   const reach = await actorReach(actorId, isAdmin);
   const where = [];
@@ -624,6 +679,7 @@ module.exports = {
   resetRange,
   notifyMembers,
   listUpdateLog,
+  listActionChangesByDate,
   listActionLog,
   logFailedAction,
   insertAction,

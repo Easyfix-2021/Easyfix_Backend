@@ -138,6 +138,18 @@ manage.get('/logs/updates',
     } catch (e) { sendError(res, next, e); }
   });
 
+// One action's changes grouped by roster date (the Logs tab's "N Employees" dialog).
+manage.get('/logs/actions/:id/changes',
+  validate(Joi.object({ id: Joi.number().integer().positive().required() }), 'params'),
+  validate(Joi.object(pageQuery), 'query'),
+  async (req, res, next) => {
+    try {
+      modernOk(res, await roster.listActionChangesByDate({
+        actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), actionId: req.params.id, ...req.query,
+      }));
+    } catch (e) { sendError(res, next, e); }
+  });
+
 manage.get('/logs/actions', validate(Joi.object(pageQuery), 'query'), async (req, res, next) => {
   try {
     modernOk(res, await roster.listActionLog({ actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), ...req.query }));
