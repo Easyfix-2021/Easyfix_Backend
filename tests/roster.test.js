@@ -41,6 +41,7 @@ const fake = installFakePool([
   [/INSERT INTO tbl_employee_roster_change_log/i, () => ({ affectedRows: 1 })],
   [/INSERT INTO tbl_employee_roster\b/i, () => ({ affectedRows: 1 })],
   [/DELETE FROM tbl_employee_roster/i, () => ({ affectedRows: 1 })],
+  [/INSERT INTO dashboard_notification_log/i, () => ({ insertId: 5, affectedRows: 1 })],
   [/SELECT user_id, reporting_manager/i, ADJ],
   [/FROM tbl_user u LEFT JOIN tbl_role r/i, (sql, params) =>
     params.filter((id) => ADJ.some((a) => a.user_id === id)).map((id) => ({ user_id: id, user_name: 'U' + id, user_code: 'E20000' + id, reporting_manager: null, role_name: 'Ops' }))],
@@ -171,4 +172,34 @@ test('reset deletes the planned rows and logs each as → weekly (new_value NULL
   assert.equal(writes(/DELETE FROM tbl_employee_roster/i).length, 1);
   const [log] = writes(/INSERT INTO tbl_employee_roster_change_log/i);
   assert.deepEqual(log.params.slice(3, 6), ['day_type', 'WO', null]);
+});
+
+// ── 5. NOTIFY ─────────────────────────────────────────────────────────────
+test('notify puts one inbox item per member, one line per day, week offs and shifts as the grid resolves them', async () => {
+  reset();
+  const from = tomorrow();
+  const to = shiftYmd(from, 6);
+  prefs = [{ user_id: 2, ...ALL_PR, default_shift_start: '09:30:00' }];
+  rosterRows = [{ user_id: 2, roster_date: shiftYmd(from, 2), day_type: 'WO', shift_start: null, source: 'GRID' }];
+  const r = await roster.notifyMembers({ actorId: 1, isAdmin: false, userIds: [2, 3], from, to });
+  assert.equal(r.notified, 2);
+  const items = writes(/INSERT INTO dashboard_notification_log/i);
+  assert.equal(items.length, 2, 'one inbox row per member');
+  const [uid, , title, desc] = items[0].params;
+  assert.equal(uid, 2);
+  assert.match(title, /^Your Roster: /);
+  const lines = desc.split('\n');
+  assert.equal(lines.length, 7, 'one line per day');
+  assert.match(lines[2], / · Week Off\b/, 'the planned WO day (a holiday name may follow)');
+  assert.match(lines[0], /Present · 09:30 AM/, 'shift shown 12-hour from the default shift');
+  const [act] = writes(/INSERT INTO tbl_employee_roster_action_log/i);
+  assert.equal(act.params[0], 'NOTIFY');
+});
+
+test('notify clips a past start to today and refuses members outside the line', async () => {
+  reset();
+  const r = await roster.notifyMembers({ actorId: 1, isAdmin: false, userIds: [2], from: shiftYmd(todayIst(), -5), to: todayIst() });
+  assert.equal(r.from, todayIst());
+  await assert.rejects(roster.notifyMembers({ actorId: 1, isAdmin: false, userIds: [9], from: tomorrow(), to: tomorrow() }),
+    (e) => e.status === 403);
 });

@@ -126,6 +126,16 @@ manage.post('/reset',
     modernOk(res, await roster.resetRange({ actorId: req.user.user_id, isAdmin, ...req.body }), 'Reset to weekly days');
   }));
 
+/*
+ * Notify — each member gets their roster for the range in the CRM inbox. A
+ * mutation for logging purposes (Action Log 'NOTIFY'; denied attempts logged too).
+ */
+manage.post('/notify',
+  validate(Joi.object({ userIds: ids, from: ymd.required(), to: ymd.required() })),
+  mutation('NOTIFY', async (req, res, isAdmin) => {
+    modernOk(res, await roster.notifyMembers({ actorId: req.user.user_id, isAdmin, ...req.body }), 'Roster sent');
+  }));
+
 const pageQuery = { page: Joi.number().integer().min(1).default(1), limit: Joi.number().integer().min(1).max(200).default(50) };
 
 manage.get('/logs/updates',

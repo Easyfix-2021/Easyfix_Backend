@@ -517,6 +517,55 @@ async function resetRange({ actorId, isAdmin, userIds, from, to }) {
   return { removed };
 }
 
+// ─── Notify ───────────────────────────────────────────────────────────
+const DAY_ABBR = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function dayLabel(ymd) { return `${DAY_ABBR[weekdayIndex(ymd)]} ${ymd.slice(8)} ${MONTH_ABBR[Number(ymd.slice(5, 7)) - 1]}`; }
+function shift12(hhmm) {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(':').map(Number);
+  return `${String(h % 12 === 0 ? 12 : h % 12).padStart(2, '0')}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
+/*
+ * Notify: put each member's roster for [from, to] in their CRM inbox (the bell)
+ * — one line per day, the same resolution the grid shows. Same scope as
+ * editing (your reporting line, never yourself); range clipped to start today
+ * (IST), at most MAX_RANGE_DAYS. In-app only: e-mail / SMS need registered
+ * templates and are not wired.
+ */
+async function notifyMembers({ actorId, isAdmin, userIds, from, to }) {
+  assertYmd(from, 'from'); assertYmd(to, 'to');
+  const today = todayIst();
+  const start = from > today ? from : today;
+  if (start > to) throw mkErr(400, 'Nothing to notify — the range is in the past');
+  const dates = listDates(start, to);
+  if (dates.length > MAX_RANGE_DAYS) throw mkErr(400, `Range cannot exceed ${MAX_RANGE_DAYS} days`);
+  const reach = await actorReach(actorId, isAdmin);
+  const empCodes = await assertEditable(reach, userIds || []);
+  const ids = [...empCodes.keys()];
+  const { byUser } = await resolveDays(ids, start, to);
+  const hol = new Map(holidays.getRange({ from: start, to }).map((h) => [h.date, h.name]));
+  const inbox = require('./notification-inbox.service');
+
+  const title = `Your Roster: ${dayLabel(start)} – ${dayLabel(to)}`;
+  for (const uid of ids) {
+    const days = byUser.get(uid);
+    const lines = dates.map((d) => {
+      const c = days[d];
+      const what = c.type === 'WO' ? 'Week Off' : `Present · ${shift12(c.shift) || '—'}`;
+      return `${dayLabel(d)} · ${what}${hol.has(d) ? ` (${hol.get(d)})` : ''}`;
+    });
+    await inbox.create({ userId: uid, title, desc: lines.join('\n') });
+  }
+  await insertAction(pool, {
+    action: 'NOTIFY', actorId, scope: summarise('NOTIFY', ids.length, dates.length * ids.length, `${start} → ${to}`),
+    params: { userIds: ids, from: start, to }, users: ids.length, cells: dates.length * ids.length,
+  });
+  logger.info('Roster notified · actor=' + actorId + ' · users=' + ids.length + ' · ' + start + '→' + to);
+  return { notified: ids.length, from: start, to };
+}
+
 // ─── Logs ─────────────────────────────────────────────────────────────
 function paging(page, limit) {
   const l = Math.max(1, Math.min(Number(limit) || 50, 200));
@@ -611,6 +660,7 @@ module.exports = {
   fillPattern,
   copyMonth,
   resetRange,
+  notifyMembers,
   listUpdateLog,
   listActionLog,
   logFailedAction,
