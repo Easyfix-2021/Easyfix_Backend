@@ -20,6 +20,7 @@
  *   CREATE TABLE [IF NOT EXISTS] t          → does table t exist?
  *   ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c → does t.c exist?
  *   CREATE INDEX i ON t                     → does index i exist on t?
+ *   guarded ADD INDEX i (a,b) (LIKE 'a,b,%')  → does ANY index on t lead with a,b?
  *   INSERT INTO menu_action … 'isXxxView'   → is that action_name present?
  *   ALTER TABLE t CHANGE|RENAME COLUMN o n  → does t.n exist? (rename)
  *   INSERT INTO menu_action … NOT EXISTS 'k' → is that action_name present?
@@ -102,6 +103,37 @@ function stripComments(sql) {
     .replace(/\s--.*$/gm, ' ');           // trailing -- after code
 }
 
+/*
+ * LEFT-PREFIX-GUARDED ADD INDEX (2026-09-29). The index migrations of Aug 2026
+ * wrap each ADD in a guard that skips it when ANY index with the same leading
+ * columns already exists:
+ *
+ *   SET @has_x = (… GROUP_CONCAT(column_name ORDER BY seq_in_index) … LIKE 'a,b,%' …);
+ *   SET @ddl_x = IF(@has_x = 0, 'ALTER TABLE t ADD INDEX idx_x (a, b)', 'SELECT 1');
+ *
+ * So the NAME is not the artifact — an equivalent index is. QA's
+ * tbl_job_transaction already carries unique_job_id (fk_job_id), the guard in
+ * executed/2026-08-17-phe-team-read-indexes.sql correctly never creates
+ * idx_job_tx_job, and a name probe reported permanent drift for it.
+ *
+ * Returns Map<"table.index", "a,b"> for those ADDs only. The guard is tied to
+ * its ADD through the variable the IF reads, not by proximity. UNIQUE is
+ * excluded: a non-unique index on the same columns does not deliver the
+ * constraint. Plain CREATE INDEX / unguarded ADD keep the name probe.
+ */
+function prefixGuardedIndexes(sql) {
+  const out = new Map();
+  for (const m of sql.matchAll(/SET\s+@\w+\s*=\s*IF\(\s*@(\w+)\s*=\s*0\s*,\s*'([^']*)'/gi)) {
+    const add = /ALTER\s+TABLE\s+[`"]?([a-z0-9_]+)[`"]?\s+ADD\s+(?:INDEX|KEY)\s+[`"]?([a-z0-9_]+)[`"]?\s*\(([^)]*)\)/i.exec(m[2]);
+    if (!add) continue;
+    const guard = new RegExp(`SET\\s+@${m[1]}\\s*=\\s*\\(([^;]*)`, 'i').exec(sql);
+    if (!guard || !/GROUP_CONCAT\(\s*column_name\s+ORDER\s+BY\s+seq_in_index\s*\)[\s\S]*LIKE\s*'[^']*,%'/i.test(guard[1])) continue;
+    const columns = add[3].split(',').map((c) => c.trim().replace(/[`"]/g, '').replace(/\(\d+\)$/, '')).join(',');
+    out.set(`${add[1]}.${add[2]}`.toLowerCase(), columns.toLowerCase());
+  }
+  return out;
+}
+
 // ── Artifact extraction ──────────────────────────────────────────────
 function artifactsOf(rawSql) {
   const sql = stripComments(rawSql);
@@ -140,8 +172,10 @@ function artifactsOf(rawSql) {
     add({ kind: 'column', table: m[1], column: m[2] });
   }
   // Indexes added via ALTER (the other half of the pattern above).
+  const guarded = prefixGuardedIndexes(sql);
   for (const m of sql.matchAll(/ALTER\s+TABLE\s+[`"]?([a-z0-9_]+)[`"]?\s+ADD\s+(?:UNIQUE\s+)?(?:INDEX|KEY)\s+[`"]?([a-z0-9_]+)[`"]?/gi)) {
-    add({ kind: 'index', table: m[1], index: m[2] });
+    const columns = guarded.get(`${m[1]}.${m[2]}`.toLowerCase());
+    add(columns ? { kind: 'index', table: m[1], index: m[2], columns } : { kind: 'index', table: m[1], index: m[2] });
   }
   for (const m of sql.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+[`"]?([a-z0-9_]+)[`"]?\s+ON\s+[`"]?([a-z0-9_]+)[`"]?/gi)) {
     add({ kind: 'index', table: m[2], index: m[1] });
@@ -185,6 +219,23 @@ async function indexExists(table, index) {
   );
   return Number(r.n) > 0;
 }
+/*
+ * Any index on `table` whose column list is `columns` or starts with it — the
+ * same test the migration's own guard applies. Compared in JS, not with SQL
+ * LIKE: `_` is a LIKE wildcard and every column here has one.
+ */
+async function equivalentIndexExists(table, columns) {
+  const [rows] = await db().query(
+    `SELECT INDEX_NAME AS name, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols
+       FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+      GROUP BY INDEX_NAME`, [table],
+  );
+  return rows.some((r) => {
+    const cols = String(r.cols).toLowerCase();
+    return cols === columns || cols.startsWith(`${columns},`);
+  });
+}
 async function actionExists(action) {
   const [[r]] = await db().query(
     'SELECT COUNT(*) AS n FROM menu_action WHERE action_name = ?', [action],
@@ -202,7 +253,11 @@ async function probe(a) {
   switch (a.kind) {
     case 'table':    return { ...a, present: await tableExists(a.table), label: a.table };
     case 'column':   return { ...a, present: await columnExists(a.table, a.column), label: `${a.table}.${a.column}` };
-    case 'index':    return { ...a, present: await indexExists(a.table, a.index), label: `${a.table}:${a.index}` };
+    case 'index':
+      if (a.columns) {
+        return { ...a, present: await equivalentIndexExists(a.table, a.columns), label: `${a.table}:${a.index} (or any index on ${a.columns}…)` };
+      }
+      return { ...a, present: await indexExists(a.table, a.index), label: `${a.table}:${a.index}` };
     case 'action':   return { ...a, present: await actionExists(a.action), label: `action ${a.action}` };
     case 'property': return { ...a, present: await propertyExists(a.property), label: `property ${a.property}` };
     default:         return { ...a, present: null, label: JSON.stringify(a) };
@@ -364,7 +419,7 @@ async function cliMain() {
   await db().end();
 }
 
-module.exports = { checkMigrations, checkExecuted, artifactsOf, dropsOf, isTransient };
+module.exports = { checkMigrations, checkExecuted, artifactsOf, dropsOf, isTransient, probe };
 
 // CLI only when invoked directly (mirrors scripts/schema-verify.js).
 if (require.main === module) {

@@ -227,3 +227,90 @@ test('the transient filter is not swallowing the executed corpus', () => {
   assert.ok(dropped < total * 0.05,
     `the transient filter discarded ${dropped} of ${total} artifacts — that is a redesign signal, not a filter`);
 });
+
+// ─── LEFT-PREFIX-GUARDED ADD INDEX (probe against a fake information_schema) ──
+/*
+ * executed/2026-08-17-phe-team-read-indexes.sql skips `ADD INDEX idx_job_tx_job
+ * (fk_job_id)` when ANY index already leads with fk_job_id. QA has unique_job_id
+ * (fk_job_id), so the name probe reported drift that could never clear. The
+ * probe must accept an equivalent index — and must still say ABSENT when none
+ * exists, or it has merely been switched off.
+ *
+ * `../db` is required lazily by the script, so seeding require.cache here swaps
+ * the pool for a fake that answers from STATISTICS rows, grouped like MySQL.
+ */
+const { probe } = require('../scripts/migration-status');
+
+let statistics = [];
+require.cache[require.resolve('../db')] = {
+  exports: {
+    pool: {
+      async query(sql, [table, index]) {
+        assert.match(sql, /INFORMATION_SCHEMA\.STATISTICS/, 'expected a STATISTICS probe');
+        const byIndex = new Map();
+        for (const r of statistics.filter((s) => s.table === table).sort((a, b) => a.seq - b.seq)) {
+          byIndex.set(r.index, [...(byIndex.get(r.index) || []), r.column]);
+        }
+        if (/GROUP BY INDEX_NAME/i.test(sql)) {
+          return [[...byIndex].map(([name, cols]) => ({ name, cols: cols.join(',') }))];
+        }
+        return [[{ n: statistics.filter((s) => s.table === table && s.index === index).length }]];
+      },
+    },
+  },
+};
+
+const { readMigration } = require('./helpers/migration-file');
+
+const PHE = readMigration('2026-08-17-phe-team-read-indexes.sql');
+const jobTx = () => artifactsOf(PHE).find((a) => a.index === 'idx_job_tx_job');
+const stat = (table, index, ...cols) => cols.map((column, i) => ({ table, index, column, seq: i + 1 }));
+
+test('the real guarded ADD carries its column prefix; unguarded ADD / CREATE INDEX do not', () => {
+  // Locating the subject: without this, every probe test below could pass on nothing.
+  assert.deepEqual(jobTx(), { kind: 'index', table: 'tbl_job_transaction', index: 'idx_job_tx_job', columns: 'fk_job_id' });
+  const guardedCount = artifactsOf(PHE).filter((a) => a.kind === 'index' && a.columns).length;
+  assert.equal(guardedCount, 8, 'every ADD in that file is prefix-guarded');
+  assert.equal(find('ALTER TABLE t ADD INDEX idx_a (a);', 'index')[0].columns, undefined);
+  assert.equal(find('CREATE INDEX idx_a ON t (a);', 'index')[0].columns, undefined);
+});
+
+test('a guarded UNIQUE ADD keeps the name probe (a non-unique twin is not the constraint)', () => {
+  const sql = `
+    SET @has_u = (SELECT COUNT(*) FROM (SELECT index_name FROM information_schema.statistics
+      WHERE table_name = 't' GROUP BY index_name
+      HAVING GROUP_CONCAT(column_name ORDER BY seq_in_index) LIKE 'a,b,%') x);
+    SET @ddl_u = IF(@has_u = 0, 'ALTER TABLE t ADD UNIQUE INDEX uq_ab (a, b)', 'SELECT 1');`;
+  assert.equal(find(sql, 'index')[0].columns, undefined);
+});
+
+test('QA shape: unique_job_id (fk_job_id) satisfies idx_job_tx_job', async () => {
+  statistics = [...stat('tbl_job_transaction', 'PRIMARY', 'id'), ...stat('tbl_job_transaction', 'unique_job_id', 'fk_job_id')];
+  assert.equal((await probe(jobTx())).present, true);
+});
+
+test('a longer index leading with fk_job_id also satisfies it', async () => {
+  statistics = stat('tbl_job_transaction', 'idx_other', 'fk_job_id', 'created_at');
+  assert.equal((await probe(jobTx())).present, true);
+});
+
+test('POSITIVE CONTROL: no equivalent index → ABSENT', async () => {
+  const cases = {
+    'no index at all': [],
+    'fk_job_id not leading': stat('tbl_job_transaction', 'idx_x', 'created_at', 'fk_job_id'),
+    'string prefix is not a column prefix': stat('tbl_job_transaction', 'idx_x', 'fk_job_idx'),
+    'same columns, wrong table': stat('tbl_job', 'unique_job_id', 'fk_job_id'),
+  };
+  for (const [label, rows] of Object.entries(cases)) {
+    statistics = rows;
+    assert.equal((await probe(jobTx())).present, false, label);
+  }
+});
+
+test('plain CREATE INDEX stays name-based: an equivalent index under another name is ABSENT', async () => {
+  const [a] = find('CREATE INDEX idx_a ON tbl_job_transaction (fk_job_id);', 'index');
+  statistics = stat('tbl_job_transaction', 'unique_job_id', 'fk_job_id');
+  assert.equal((await probe(a)).present, false);
+  statistics = stat('tbl_job_transaction', 'idx_a', 'fk_job_id');
+  assert.equal((await probe(a)).present, true);
+});
