@@ -44,7 +44,7 @@ match the App allowlist.
 | Work Area | `PUT /api/mobile/registration/work-area` | Home location and complete serviceable set commit atomically |
 | Identity | `POST /api/mobile/profile/identity-details` | Identity fields and document references commit atomically |
 | Registration derive | `POST /api/mobile/registration/finalize` | Server-derived lifecycle transition |
-| Training progress | `POST /api/mobile/training-videos/percentage` | Monotonic per technician/video upsert |
+| Training progress | `POST /api/mobile/training-videos/percentage` | Monotonic per technician/video upsert; credit capped (never rejected) by time since the first report when the video has a duration |
 | Language | `PATCH /api/mobile/registration/language` | Latest preference replacement |
 
 Work Area and the mobile edit-profile endpoint resolve six-digit PIN values
