@@ -132,6 +132,23 @@ function fingerprint(efrId, { name, aadhaarNumber, dob, frontMd5, backMd5 }) {
     .digest('hex');
 }
 
+/*
+ * Does the ROW now hold what the check verified? A "verified" check vouches for
+ * the name/number/DOB the technician submitted — but identity is fill-only for
+ * existing technicians, so a legacy value can survive the save and the row can
+ * hold something the AI never looked at. Compared on the fingerprint's own
+ * normalisation, so a stored value differing only in case or spacing matches.
+ */
+function storedMatchesCheck(stored = {}, body = {}) {
+  const key = ({ name, aadhaarNumber, dob }) => JSON.stringify([
+    String(name == null ? '' : name).replace(/\s+/g, ' ').trim().toLowerCase(),
+    digits(aadhaarNumber),
+    isoDate(dob),
+  ]);
+  return key({ name: stored.efr_name, aadhaarNumber: stored.adhaar_card_number, dob: stored.date_of_birth })
+    === key({ name: body.name, aadhaarNumber: body.aadhaarNumber || body.aadhaar, dob: body.dob });
+}
+
 const md5 = (buffer) => crypto.createHash('md5').update(buffer).digest('hex');
 
 /*
@@ -334,6 +351,7 @@ module.exports = {
   latestSubmitted,
   latestVerdictSql,
   touchesAadhaarIdentity,
+  storedMatchesCheck,
   _internals: {
     TABLE,
     COLUMNS,

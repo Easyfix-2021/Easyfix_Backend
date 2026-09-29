@@ -28,7 +28,9 @@ beforeEach(() => {
 });
 
 /** In-memory tbl_easyfixer_aadhaar_ai_check + just enough of the identity save. */
-function fakeDb({ installed = true } = {}) {
+// `stored` = the tbl_easyfixer row the save reads back. Defaults to an
+// already-approved row so tests that are not about auto-approval never reach it.
+function fakeDb({ installed = true, stored = { review_state: 1 } } = {}) {
   const checks = [];
   const events = [];
   const conn = {
@@ -69,6 +71,7 @@ function fakeDb({ installed = true } = {}) {
       if (/RELEASE_LOCK/i.test(text)) return [[{ released: 1 }], []];
       if (/SELECT 1 AS conflict/i.test(text)) return [[], []];
       if (/identity_review FROM tbl_easyfixer/i.test(text)) return [[{ identity_review: null }], []];
+      if (/AS review_state\s+FROM tbl_easyfixer/i.test(text)) return [[stored], []];
       if (/^\s*UPDATE tbl_easyfixer\b/i.test(text)) return [{ affectedRows: 1 }, []];
       if (/^\s*SELECT efr_doc_id/i.test(text)) return [[], []];
       if (/^\s*INSERT INTO tbl_easyfixer_document/i.test(text)) return [{ affectedRows: 1 }, []];
@@ -110,7 +113,8 @@ test('a check is recorded with the masked last 4, the verdict and a fingerprint 
   const [row] = db.checks;
   assert.equal(row.aadhaar_last4, '0123');
   assert.match(row.input_fingerprint, /^[a-f0-9]{64}$/);
-  for (const value of row.params) {
+  // The fingerprint is hex and can hold a 12-digit run by chance (key-dependent).
+  for (const value of row.params.filter((v) => v !== row.input_fingerprint)) {
     assert.doesNotMatch(String(value), /234567890123|\d{12}/, 'no parameter may carry a full Aadhaar number');
   }
 });
@@ -271,4 +275,55 @@ test('the migration is one idempotent CREATE TABLE IF NOT EXISTS whose columns m
   const declared = [...statements[0].matchAll(/^\s{2}([a-z0-9_]+)\s+(?:INT|VARCHAR|CHAR|DECIMAL|TEXT|DATETIME)/gim)].map((m) => m[1]);
   assert.deepEqual(declared, [...COLUMNS]);
   assert.deepEqual(EXPECTED[TABLE], [...COLUMNS]);
+});
+
+/*
+ * AI-VERIFIED → APPROVED (owner, 2026-09-29): a "verified" check sets
+ * is_identity_details_verified_by_crm = 1 through the reviewer's own approval,
+ * but only when the row holds what the check verified.
+ */
+const matchingRow = (over = {}) => ({
+  efr_name: ' ramesh  KUMAR ', adhaar_card_number: '234567890123', date_of_birth: '1990-04-17', review_state: null, ...over,
+});
+
+async function saveWith(db, { ocr = matchedOcr(), approve } = {}) {
+  await aiCheck.recordCheck(EFR, { ocr, typed, front: FRONT, back: BACK }, { database: db });
+  return identity.saveIdentityDetails(EFR, saveBody(), { database: db, approveIdentity: approve });
+}
+
+test('a verified check whose values the row now holds is approved as the reviewer would', async () => {
+  const approved = [];
+  const out = await saveWith(fakeDb({ stored: matchingRow() }), { approve: async (id) => approved.push(id) });
+  assert.deepEqual(approved, [EFR]);
+  assert.equal(out.aiApproved, true);
+});
+
+test('after a CRM rejection (2) a verified resubmission is approved too', async () => {
+  const approved = [];
+  await saveWith(fakeDb({ stored: matchingRow({ review_state: 2 }) }), { approve: async (id) => approved.push(id) });
+  assert.deepEqual(approved, [EFR]);
+});
+
+test('NOT approved: a legacy value kept by fill-only, a non-verified verdict, or an already-approved row', async () => {
+  const approved = [];
+  const approve = async (id) => approved.push(id);
+  await saveWith(fakeDb({ stored: matchingRow({ adhaar_card_number: '999988887777' }) }), { approve });
+  await saveWith(fakeDb({ stored: matchingRow({ date_of_birth: '1991-01-01' }) }), { approve });
+  await saveWith(fakeDb({ stored: matchingRow({ efr_name: 'Suresh Kumar' }) }), { approve });
+  await saveWith(fakeDb({ stored: matchingRow({ review_state: 1 }) }), { approve });
+  const out = await saveWith(fakeDb({ stored: matchingRow() }), {
+    approve,
+    ocr: { available: false, extracted: null, nameMatch: null, reason: 'unreadable' },
+  });
+  assert.equal(out.aiVerdict, 'not_run');
+  assert.equal(out.aiApproved, false);
+  assert.deepEqual(approved, []);
+});
+
+test('an approval failure leaves the identity saved and pending — never a failed save', async () => {
+  const out = await saveWith(fakeDb({ stored: matchingRow() }), {
+    approve: async () => { throw new Error('lifecycle busy'); },
+  });
+  assert.equal(out.updated, true);
+  assert.equal(out.aiApproved, false);
 });
