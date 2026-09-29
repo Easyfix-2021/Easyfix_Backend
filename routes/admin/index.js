@@ -180,6 +180,8 @@ router.use('/legacy',          require('./legacy'));
 router.use('/notice-categories', require('./notice-categories'));
 router.use('/notices',           require('./notices'));
 router.use('/holidays',          require('./holidays'));
+// Team Roster (2026-09-29) — /me for everyone; management behind allowlist + isRosterManage.
+router.use('/roster',            require('./roster'));
 // LMS (added 2026-08-13) — courses, course content, assignment, completion
 // report. The training VIDEO catalogue stays on /aux/training-videos; this
 // router deliberately does not restate it.

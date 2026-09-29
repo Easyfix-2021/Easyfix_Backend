@@ -89,6 +89,14 @@ const FEATURES = {
    * nobody and Transfer Owner simply does not appear.
    */
   canTransferReportOwner: 'access.dynamicreport.owner.emails',
+  /*
+   * Team Roster management (plan week offs / shifts for a team, read its logs).
+   * Two locks: the RBAC key isRosterManage says the screen exists, this
+   * allowlist says who may reach it, and BOTH must pass (routes/admin/roster.js).
+   * Seeded in migrations/2026-09-29-employee-roster-02-rbac.sql; an absent or
+   * empty property is deny-all. Reading your OWN roster (dashboard) needs neither.
+   */
+  canManageRoster: 'roster.manager.emails',
   // (Re)provision a CRM user's Microsoft 365 mailbox — it CREATES an Entra
   // directory account and spends a licence seat, so it stays outside RBAC and
   // is granted per person. Seeded EMPTY = deny-all

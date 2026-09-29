@@ -481,6 +481,20 @@ router.post('/bulk-reassign', validate(Joi.object({
 })), async (req, res, next) => {
   try {
     logger.info('Bulk reassign jobs · userCount=' + req.body.userIds.length + ' · statuses=[' + req.body.statuses.join(',') + '] · limit=' + req.body.limit);
+    /*
+     * Team Roster: this is the only AUTOMATIC round-robin of work onto CRM users,
+     * so users on Week Off today are dropped from the rotation before anything is
+     * assigned (services/roster.service.js weekOffSet). If every chosen user is
+     * off, refuse rather than silently hand jobs to people who are not working.
+     */
+    const offToday = await require('../../services/roster.service').weekOffSet(req.body.userIds);
+    const skippedWeekOff = req.body.userIds.filter((id) => offToday.has(Number(id)));
+    const userIds = req.body.userIds.filter((id) => !offToday.has(Number(id)));
+    if (!userIds.length) {
+      logger.warn('Bulk reassign rejected · every selected user is on week off today');
+      return modernError(res, 400, 'Every selected user is on Week Off today', { skippedWeekOff });
+    }
+    if (skippedWeekOff.length) logger.info('Bulk reassign · skipping week-off users=' + skippedWeekOff.join(','));
     const placeholders = req.body.statuses.map(() => '?').join(',');
     const [jobs] = await pool.query(
       `SELECT job_id FROM tbl_job
@@ -496,7 +510,7 @@ router.post('/bulk-reassign', validate(Joi.object({
       await conn.beginTransaction();
       const now = new Date();
       for (let i = 0; i < jobs.length; i++) {
-        const ownerId = req.body.userIds[i % req.body.userIds.length];
+        const ownerId = userIds[i % userIds.length];
         await conn.query(
           'UPDATE tbl_job SET job_owner = ?, last_update_time = ? WHERE job_id = ?',
           [ownerId, now, jobs[i].job_id]
@@ -506,7 +520,7 @@ router.post('/bulk-reassign', validate(Joi.object({
       await conn.commit();
     } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
     logger.info('Bulk reassign done · reassigned=' + reassigned);
-    modernOk(res, { reassigned, userCount: req.body.userIds.length });
+    modernOk(res, { reassigned, userCount: userIds.length, skippedWeekOff });
   } catch (e) { next(e); }
 });
 

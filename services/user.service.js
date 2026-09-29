@@ -25,6 +25,7 @@ const entraProvisioning = require('./entra-provisioning.service');
 // "Your EasyFix account is ready" credential mail. Only ever called from the
 // create path, and only when the provisioning outcome says the mailbox is real.
 const welcomeMail = require('./user-welcome-mail.service');
+const attendancePref = require('./attendance-preference.service');
 const s3 = require('../utils/s3-storage');
 
 /*
@@ -1026,6 +1027,9 @@ async function getUserById(userId, { includeIdentifiers = false } = {}) {
    * pan and aadhaar arrive MASKED (see loadPersonalIdentifiers) even here.
    */
   if (includeIdentifiers) Object.assign(row, await loadPersonalIdentifiers(userId));
+  // Weekly working days — fail-soft read; a user without a row shows the 7-day
+  // default, which the Edit User save then persists (the auto-backfill).
+  row.attendance_preference = (await attendancePref.loadPreference(userId)) || attendancePref.defaultPreference();
   /*
    * Job Stage Access. NULL = unrestricted; [] = explicit NO ACCESS; a non-empty
    * array = restricted to those stage_keys. The null-vs-[] distinction is
@@ -1100,6 +1104,11 @@ async function createUser({
    */
   date_of_birth, date_of_joining, uan, pan, aadhaar, address,
   /*
+   * Weekly working days (services/attendance-preference.service.js). OPTIONAL:
+   * absent = the 7-day default. The Add User form always sends it.
+   */
+  attendance_preference,
+  /*
    * OPT-IN, defaulting to FALSE. The single-user Add User route passes true;
    * every other caller (bulk update, bulk upload, any future importer) keeps
    * the old behaviour. Defaulting to true would turn "set a role for 200 users"
@@ -1170,6 +1179,11 @@ async function createUser({
       throw mkErr(400, `${names} ${missing.length === 1 ? 'is' : 'are'} required`);
     }
   }
+
+  // Validated before the transaction so a bad day value rejects the create outright.
+  const workingDaysPref = attendance_preference !== undefined && attendance_preference !== null
+    ? attendancePref.normalisePreference(attendance_preference).values
+    : null;
 
   // Validate role exists + is admin-group (we don't manage technicians or
   // client-dashboard users here — those have their own lifecycles).
@@ -1317,6 +1331,13 @@ async function createUser({
      * left untouched issues no second write at all.
      */
     await upsertPersonalIdentifiers(r.insertId, hrIdentifiers, conn);
+    /*
+     * Working days, same transaction. Supplied → strict upsert (a missing table
+     * is a 503, never a silently dropped choice). Absent → the fail-soft 7-day
+     * default row, so a host without the migration can still create users.
+     */
+    if (workingDaysPref) await attendancePref.upsertPreference(r.insertId, empCode, workingDaysPref, createdBy, conn);
+    else await attendancePref.ensurePreferenceRow(r.insertId, empCode, conn);
     await conn.commit();
   } catch (e) {
     await conn.rollback();
@@ -1613,6 +1634,24 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
   const hrIdentifiers = identifiers.values;
 
   /*
+   * Weekly working days — validated here, before any write, like the identifiers.
+   * `prefWrite` is decided by a DIFF against the stored row (or the 7-day default
+   * when there is none), so an Edit that echoes unchanged days stays a no-op
+   * below, while an Edit of a user who has no row yet always writes one — the
+   * auto-backfill the form relies on.
+   */
+  const suppliedPref = fields.attendance_preference !== undefined && fields.attendance_preference !== null;
+  const prefValues = suppliedPref ? attendancePref.normalisePreference(fields.attendance_preference).values : null;
+  const finalEmpCode = fields.user_code ? String(fields.user_code).trim() : me.user_code;
+  let prefWrite = false;
+  if (suppliedPref) {
+    const storedPref = await attendancePref.loadPreference(userId);
+    prefWrite = !storedPref
+      || attendancePref.diffPreference(storedPref, prefValues).length > 0
+      || (storedPref.emp_code ?? null) !== (finalEmpCode ?? null);
+  }
+
+  /*
    * PERSONAL DETAILS ARE MANDATORY ON EDIT — with the same two exemptions
    * personal_email already carries, and for the same reason. An INACTIVE user,
    * and the edit that DEACTIVATES one, are both excused: offboarding someone
@@ -1805,11 +1844,12 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
    */
   const hasHrIdentifiers = Object.keys(hrIdentifiers).length > 0;
   if (hasHrIdentifiers) suppliedCount++;
+  if (suppliedPref) suppliedCount++;
 
   // Distinguish "operator sent nothing" (real 400) from "operator sent
   // values that all match" (no-op, return unchanged sentinel).
   if (suppliedCount === 0) throw mkErr(400, 'No mutable fields supplied');
-  if (!sets.length && !hasAllowedStages && !writePersonalEmail && !hasHrIdentifiers) {
+  if (!sets.length && !hasAllowedStages && !writePersonalEmail && !hasHrIdentifiers && !prefWrite) {
     logger.info('Update user no-op · userId=' + userId + ' · all supplied values match');
     const row = await getUserById(userId);
     if (row) row.__unchanged = true;
@@ -1870,6 +1910,15 @@ async function updateUser(userId, fields, updatedBy, opts = {}) {
     logger.info('HR identifiers updated · userId=' + userId
       + ' · fields=' + Object.keys(hrIdentifiers).join(','));
   }
+
+  /*
+   * Working days. Supplied and changed → upsert + change log. Otherwise, since
+   * this edit DID write something, make sure the user has a row (7-day default)
+   * and that its emp_code follows an edited Employee Code — the auto-backfill for
+   * existing users, which also covers the bulk-edit paths.
+   */
+  if (prefWrite) await attendancePref.upsertPreference(userId, finalEmpCode, prefValues, updatedBy);
+  else await attendancePref.ensurePreferenceRow(userId, finalEmpCode);
 
   // Job Stage Access reconcile — after the column write, atomically swaps the
   // user's grants. null = unrestricted (clears all rows); [] = no access.
