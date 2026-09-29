@@ -670,10 +670,6 @@ async function assertRefsExist(items) {
    * can never be passed; itemCompleteSql needs a PASSING attempt, so the
    * course never completes; and the overdue restriction eventually withdraws
    * work for training the technician had no way to finish.
-   *
-   * Checked here rather than in setCourseContent so the video-only save path
-   * (setCourseVideos, which re-submits the course's existing items) is covered
-   * by the same guard.
    */
   const assessmentIds = [...new Set(items.filter((i) => i.kind === 'assessment').map((i) => Number(i.ref_id)))];
   if (assessmentIds.length) {
@@ -772,47 +768,6 @@ async function setCourseContent(courseId, items = []) {
 
   logger.info('Course content saved · courseId=' + id);
   return getCourseContent(id);
-}
-
-async function getCourseVideos(courseId) {
-  const items = await getCourseContent(courseId);
-  // The legacy shape the CRM's video picker still reads: `video_id`, not
-  // `ref_id`. Kept as a projection over the same rows rather than a second
-  // query, so the two endpoints can never disagree about what a course holds.
-  return items
-    .filter((i) => i.kind === 'video')
-    .map((i) => ({
-      id: i.id,
-      video_id: i.ref_id,
-      sequence: i.sequence,
-      title: i.title,
-      sub_title: i.sub_title,
-      description: i.description,
-      video_url: i.video_url,
-    }));
-}
-
-/*
- * The video-only editor's save, expressed over the full content list.
- *
- * PUT /courses/:id/videos carries only videos, so it cannot express where a
- * document or an assessment sits relative to them. Rather than inventing an
- * answer, the submitted videos take the head positions and every other kind
- * keeps its existing relative order behind them — nothing is dropped, which is
- * the property that matters, and the full-content endpoint is where
- * interleaving is actually decided.
- */
-async function setCourseVideos(courseId, videoIds = []) {
-  const id = Number(courseId);
-  const ids = [...new Set(videoIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  const [rest] = await pool.query(
-    `SELECT kind, ref_id FROM lms_content
-      WHERE course_id = ? AND status = 1 AND kind <> 'video'
-      ORDER BY sequence ASC, id ASC`,
-    [id],
-  );
-  await setCourseContent(id, [...ids.map((v) => ({ kind: 'video', ref_id: v })), ...rest]);
-  return getCourseVideos(id);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3217,8 +3172,6 @@ module.exports = {
   createCourse,
   updateCourse,
   retireCourse,
-  getCourseVideos,
-  setCourseVideos,
   getCourseContent,
   setCourseContent,
   CONTENT_KINDS,
