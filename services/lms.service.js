@@ -4,8 +4,6 @@ const logger = require('../logger');
 const s3 = require('../utils/s3-storage');
 // The certificate's date spelling, so the PDF and the CRM agree.
 const { formatDate } = require('../utils/pdf-certificate');
-// Module object, not a destructure: tests stub probeVideoDuration on it.
-const videoDuration = require('./video-duration.service');
 
 /*
  * LMS — courses, course content, assignment and completion reporting.
@@ -102,15 +100,6 @@ const LMS_FLAG_COLUMNS = Object.freeze([
    * until someone runs the SQL.
    */
   ['lms_assessment', 'created_by'],
-  /*
-   * The watch-time check (mobile-profile-extra.service::setTrainingPercentage,
-   * migrations/2026-09-29-training-watch-time.sql). Unlike the flags above,
-   * these default ABSENT on a failed probe: the progress upsert names
-   * first_watched_at, and a wrong "present" would 500 the one write every
-   * technician's training depends on. A wrong "absent" only skips the check.
-   */
-  ['easyfixer_watched_video', 'first_watched_at'],
-  ['training_videos', 'duration_seconds'],
 ]);
 
 let _flagCache = null;
@@ -124,10 +113,7 @@ async function lmsFlagColumns() {
 
   // One round trip for both, not one per column: this sits in front of the
   // course list and the technician's training screen.
-  const value = {
-    courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true,
-    watchFirstAt: false, videoDuration: false,
-  };
+  const value = { courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true };
   try {
     const [rows] = await pool.query(
       `SELECT table_name AS t, column_name AS c
@@ -143,14 +129,12 @@ async function lmsFlagColumns() {
     value.courseMandatory = present.has('courses.is_mandatory');
     value.videoGlobal = present.has('training_videos.is_global');
     value.assessmentCreatedBy = present.has('lms_assessment.created_by');
-    value.watchFirstAt = present.has('easyfixer_watched_video.first_watched_at');
-    value.videoDuration = present.has('training_videos.duration_seconds');
     const missing = LMS_FLAG_COLUMNS
       .filter(([t, c]) => !present.has(`${t}.${c}`))
       .map(([t, c]) => `${t}.${c}`);
     if (missing.length) {
       logger.warn('LMS schema probe · missing ' + missing.join(', ')
-        + ' — treating as absent until its migration runs (see LMS_FLAG_COLUMNS)');
+        + ' — treating the flag as 0 (run 2026-08-26-lms-mandatory-flags.sql)');
     }
     _flagCache = { value, checkedAt: now, stable: !missing.length };
   } catch (e) {
@@ -899,11 +883,9 @@ async function listVideos({ q, limit = 200, offset = 0 } = {}) {
    * so a row whose document is missing or mistyped still returns with a null
    * url instead of vanishing from the catalogue.
    */
-  const { videoDuration } = await lmsFlagColumns();
   const [rows] = await pool.query(
     `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
             tv.training_video_id, d.url AS video_url,
-            ${videoDuration ? 'tv.duration_seconds' : 'NULL AS duration_seconds'},
             (SELECT COUNT(*) FROM easyfixer_watched_video w WHERE w.video_id = tv.id) AS progress_count,
             (SELECT COUNT(*) FROM lms_content lc
               WHERE lc.kind = 'video' AND lc.ref_id = tv.id AND lc.status = 1) AS course_count
@@ -1822,7 +1804,6 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
 
   if (!String(rawUrl || '').trim()) {
     await pool.query('UPDATE training_videos SET training_video_id = NULL WHERE id = ?', [id]);
-    await afterLinkChange(id);
     logger.info('Training video link cleared · id=' + id);
     return { video_url: null };
   }
@@ -1840,7 +1821,6 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
       'UPDATE document SET url = ?, updated_by = ?, updated_on = ? WHERE id = ?',
       [parsed.url, actorUserId, new Date(), existingDoc.id],
     );
-    await afterLinkChange(id);
     logger.info('Training video link updated · id=' + id + ' · doc=' + existingDoc.id);
     return { video_url: parsed.url };
   }
@@ -1851,86 +1831,8 @@ async function setVideoLink(videoId, rawUrl, actorUserId = null) {
     [`youtube:${parsed.id}`, parsed.url, actorUserId, new Date()],
   );
   await pool.query('UPDATE training_videos SET training_video_id = ? WHERE id = ?', [ins.insertId, id]);
-  await afterLinkChange(id);
   logger.info('Training video link created · id=' + id + ' · doc=' + ins.insertId);
   return { video_url: parsed.url };
-}
-
-/*
- * ─── duration_seconds IS READ FROM THE VIDEO, NEVER TYPED ─────────────────
- *
- * The watch-time cap (mobile-profile-extra.service::setTrainingPercentage)
- * divides by training_videos.duration_seconds. Nobody enters it: the server
- * probes the file (services/video-duration.service.js) at the URL the app is
- * served — the document row resolved by normalizeVideoUrl, the same resolver
- * as listVideos / coursesForTech / the mobile list.
- *
- * Two triggers:
- *   - a link change (setVideoLink): the old duration belongs to the old file,
- *     so it is cleared in the same request, then re-probed in the background;
- *   - lazily, from the first progress report on a video still at NULL — which
- *     is how the legacy rows fill themselves in.
- *
- * Background, never awaited by the caller: two ranged requests to the document
- * host can take seconds, and neither an admin save nor a progress ping may
- * wait on (or fail because of) a probe. One probe per video in flight; a
- * failed probe is not retried for PROBE_RETRY_MS in this process, so a broken
- * URL is not fetched on every ping. Until a duration exists the cap is off,
- * exactly as before.
- */
-const PROBE_RETRY_MS = 60 * 60 * 1000;
-const _probeInFlight = new Map();
-const _probeFailedAt = new Map();
-
-function refreshVideoDuration(videoId, { force = false } = {}) {
-  const id = Number(videoId);
-  if (_probeInFlight.has(id)) return _probeInFlight.get(id);
-  if (!force && Date.now() - (_probeFailedAt.get(id) ?? -Infinity) < PROBE_RETRY_MS) return Promise.resolve(null);
-  const run = (async () => {
-    try {
-      if (!(await lmsFlagColumns()).videoDuration) return null;
-      const [[row]] = await pool.query(
-        `SELECT d.url FROM training_videos tv
-           JOIN document d ON d.id = tv.training_video_id AND d.document_type_id = 2
-          WHERE tv.id = ?`,
-        [id],
-      );
-      const url = normalizeVideoUrl(row?.url);
-      const seconds = url
-        ? await videoDuration.probeVideoDuration(url, { trustedHosts: [new URL(TRAINING_VIDEO_HOST).hostname] })
-        : null;
-      if (seconds == null) {
-        _probeFailedAt.set(id, Date.now());
-        return null;
-      }
-      _probeFailedAt.delete(id);
-      // Only if the link is still the one probed: an edit mid-probe must not
-      // receive the old file's length.
-      await pool.query(
-        `UPDATE training_videos tv
-           JOIN document d ON d.id = tv.training_video_id
-            SET tv.duration_seconds = ?
-          WHERE tv.id = ? AND d.url = ?`,
-        [seconds, id, row.url],
-      );
-      logger.info('Training video duration detected · id=' + id + ' · seconds=' + seconds);
-      return seconds;
-    } catch (e) {
-      _probeFailedAt.set(id, Date.now());
-      logger.warn('Training video duration refresh failed · id=' + id + ' · ' + e.message);
-      return null;
-    } finally {
-      _probeInFlight.delete(id);
-    }
-  })();
-  _probeInFlight.set(id, run);
-  return run;
-}
-
-async function afterLinkChange(id) {
-  if (!(await lmsFlagColumns()).videoDuration) return;
-  await pool.query('UPDATE training_videos SET duration_seconds = NULL WHERE id = ?', [id]);
-  refreshVideoDuration(id, { force: true });
 }
 
 /*
@@ -3241,7 +3143,6 @@ module.exports = {
   parseYouTubeUrl,
   normalizeVideoUrl,
   setVideoLink,
-  refreshVideoDuration,
   isKnownVideo,
   invalidateVideoIdCache,
   SORTABLE_COLUMNS,

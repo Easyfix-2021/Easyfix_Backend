@@ -196,8 +196,6 @@ router.patch('/training-videos/:id', validate(Joi.object({
   sub_title: Joi.string().max(255).allow('', null).optional(),
   sub_description: Joi.string().max(2000).allow('', null).optional(),
   video_url: Joi.string().max(500).allow('', null).optional(),
-  // No duration_seconds: the server reads it from the video file
-  // (lms.refreshVideoDuration). validate() strips it if a client sends it.
 }).min(1)), async (req, res, next) => {
   try {
     /*
