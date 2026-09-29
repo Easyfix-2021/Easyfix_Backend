@@ -4,8 +4,6 @@ const ExcelJS = require('exceljs');
 
 const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
-const { requirePropertyAllowlist } = require('../../middleware/require-property-allowlist');
-const { FEATURES } = require('../../services/feature-access.service');
 const { getEffectivePermissions } = require('../../services/role.service');
 const roster = require('../../services/roster.service');
 const { monthBounds, shiftYmd } = require('../../utils/ist-calendar');
@@ -17,10 +15,10 @@ const logger = require('../../logger');
  * Team Roster — /api/admin/roster. Mount inherits requireAuth + role(['admin']).
  *
  *   GET /me              every CRM user — their own days (dashboard widget)
- *   everything else      TWO LOCKS, AND never OR (the routes/admin/field-rekey.js
- *                        model): the easyfix_properties allowlist
- *                        roster.manager.emails says WHO may reach the screen,
- *                        the RBAC key isRosterManage says the screen EXISTS.
+ *   everything else      the RBAC action key isRosterManage — ROLE-based only.
+ *                        Owner decision 2026-09-29: whoever can see the Team
+ *                        Roster menu can use it, so there is deliberately NO
+ *                        per-email allowlist on top (grant via Manage Roles).
  *
  * Which members a caller may edit is decided in services/roster.service.js
  * (their reporting-line descendants, never themselves; isRosterAdmin = anyone
@@ -51,9 +49,8 @@ router.get('/me', validate(Joi.object({ days: Joi.number().integer().min(1).max(
     } catch (e) { sendError(res, next, e); }
   });
 
-// ── Management — both locks from here on ────────────────────────────────
+// ── Management — isRosterManage from here on ────────────────────────────
 const manage = require('express').Router();
-manage.use(requirePropertyAllowlist(FEATURES.canManageRoster, { label: 'Team Roster' }));
 manage.use(requireAction('isRosterManage'));
 
 /*
