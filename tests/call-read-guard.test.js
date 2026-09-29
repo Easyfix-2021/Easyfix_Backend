@@ -28,7 +28,7 @@
  * Every deny test is paired with a POSITIVE CONTROL that flips ONE operand and
  * gets a 200, so a refusal can never be attributed to the fixture.
  *
- * Driven through GET /:id/recording: a Kaleyra row carries an https URL, so
+ * Driven through GET /:id/recording: a Kaleyra row carries its own URL, so
  * the allow path returns immediately after the gate — no S3, no provider, no
  * network. Non-destructive: fake pool, no DB.
  */
@@ -45,24 +45,24 @@ const JOB_CLIENT = 10;
 const JOB_CITY = 42;
 const JOB_VERTICAL = 3;
 
-const REC_URL = 'https://recordings.example.test/kaleyra/abc.mp3';
+// What Prod actually stores for a Kaleyra call: PROTOCOL-RELATIVE, no scheme
+// (job 541099, 2026-09-29). An invented https:// value here once let an
+// https-only check pass every test while failing every real Play.
+const REC_URL = '//play.solutionsinfini.com/?id=MTAwOTY2NDUwNzZh';
+const PLAY_URL = 'https:' + REC_URL;   // what the route hands the browser
 
 const CALL_OUT = 5001;        // OUT, placed by OWNER_ID, attached to JOB_ID
 const CALL_IN = 5002;         // IN, caller_id happens to equal OWNER_ID
 const CALL_NO_JOB = 5003;     // OUT by someone else, job_id NULL
 const CALL_JOB_ZERO = 5004;   // OUT by someone else, legacy job_id = 0 sentinel
-// The shape Prod actually stores (job 541099, 2026-09-29): provider NULL and a
-// PROTOCOL-RELATIVE Kaleyra URL. REC_URL above is an invented https:// value,
-// which is why an https-only check passed every test and failed every real Play.
-const CALL_KALEYRA_REAL = 5005;
-const REAL_KALEYRA_REC = '//play.solutionsinfini.com/?id=MTAwOTY2NDUwNzZh';
+const CALL_LEGACY_NULL_PROVIDER = 5005; // legacy-CRM row written before it stamped provider
 
 const CALLS = {
   [CALL_OUT]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'OUT' },
   [CALL_IN]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'IN' },
   [CALL_NO_JOB]: { job_id: null, caller_id: 999, call_type: 'OUT' },
   [CALL_JOB_ZERO]: { job_id: 0, caller_id: 999, call_type: 'OUT' },
-  [CALL_KALEYRA_REAL]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'OUT', provider: null, recording: REAL_KALEYRA_REC },
+  [CALL_LEGACY_NULL_PROVIDER]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'OUT', provider: null },
 };
 
 /* Zonal Field Team, NOT Admin. SCOPE_BYPASS_ROLES = {Admin, Finance}, so a
@@ -169,7 +169,7 @@ test('the operator who PLACED an outbound call hears it, on a job they cannot ot
   as(OWNER_ID);
   const { status, body } = await recording(CALL_OUT);
   assert.equal(status, 200, JSON.stringify(body));
-  assert.equal(body.data.url, REC_URL);
+  assert.equal(body.data.url, PLAY_URL);
 });
 
 test('the SAME user does NOT own an INBOUND row whose caller_id equals their user id', async () => {
@@ -194,11 +194,11 @@ test('POSITIVE CONTROL — the same inbound row IS audible once its job is in sc
   assert.equal(status, 200, JSON.stringify(body));
 });
 
-test('a REAL Kaleyra row (protocol-relative URL, provider NULL) plays, as https', async () => {
+test('a legacy Kaleyra row with provider NULL still plays its stored URL', async () => {
   as(OWNER_ID);
-  const { status, body } = await recording(CALL_KALEYRA_REAL);
+  const { status, body } = await recording(CALL_LEGACY_NULL_PROVIDER);
   assert.equal(status, 200, JSON.stringify(body));
-  assert.equal(body.data.url, 'https:' + REAL_KALEYRA_REC);
+  assert.equal(body.data.url, PLAY_URL);
 });
 
 // ─── The job-scope arm ────────────────────────────────────────────────
@@ -207,7 +207,7 @@ test('a colleague who could open the call\'s job hears it', async () => {
   as(COLLEAGUE_ID, { scope: scope(allowClients(JOB_CLIENT)) });
   const { status, body } = await recording(CALL_OUT);
   assert.equal(status, 200, JSON.stringify(body));
-  assert.equal(body.data.url, REC_URL);
+  assert.equal(body.data.url, PLAY_URL);
 });
 
 test('FINANCE does NOT bypass — recording bypass is Admin-only, unlike scope generally', async () => {
