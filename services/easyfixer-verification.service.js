@@ -4,6 +4,7 @@ const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
 const lifecycle = require('./easyfixer-lifecycle.service');
 const { resolveEasyfixerDocumentUrl } = require('./easyfixer-document.service');
+const profileCompletion = require('./profile-completion.service');
 const {
   mapAadhaarUniqueViolation,
   normalizeAadhaar,
@@ -306,18 +307,22 @@ async function getVerificationPage(efrId) {
     ? pincodeCsv.split(',').map((p) => p.trim()).filter(Boolean).length
     : 0;
 
-  // Six equal parts, matching the onboarding mandatory set exactly.
-  const strengthParts = [
-    String(e.tx_full_name || e.efr_name || '').trim() !== '',
-    e.date_of_birth != null,
-    String(e.adhaar_card_number || '').trim() !== '',
-    String(e.efr_profile_img || '').trim() !== '',
-    deepSkillsCount > 0,
-    serviceablePincodesCount > 0,
-  ];
-  const computedProfileStrength = Math.round(
-    (strengthParts.filter(Boolean).length / strengthParts.length) * 100,
-  );
+  /*
+   * ONE definition of "complete", shared with the technician app and the
+   * roster: services/profile-completion.service.js. Built from this row's own
+   * values rather than a second query — every input it reads is already here.
+   */
+  const completion = profileCompletion.strengthFromRow({
+    has_active_deep_skill: deepSkillsCount > 0,
+    efr_service_category: e.efr_service_category,
+    efr_service_type: e.efr_service_type,
+    adhaar_card_number: e.adhaar_card_number,
+    efr_profile_img: e.efr_profile_img,
+    dob_present: e.date_of_birth != null ? 1 : 0,
+    user_is_personal_detail_filled: e.is_personal_detail_filled,
+    serviceable_pincodes_present: serviceablePincodesCount > 0 ? 1 : 0,
+  });
+  const computedProfileStrength = completion.percent;
 
   const fullName = e.tx_full_name || e.efr_name || '';
   const personalDetailsFilled = e.personal_details_filled; // 0 | 1 | 2
@@ -527,6 +532,24 @@ async function getVerificationPage(efrId) {
       mandatory_total: trainingVideos.length,
       mandatory_done: trainingDone,
       is_complete: trainingVideos.length > 0 && trainingDone === trainingVideos.length,
+    },
+
+    /*
+     * The mandatory-field gate, computed once HERE so the CRM's Accept button,
+     * the profile-strength ring and the technician's own app can never
+     * disagree about what "complete" means.
+     */
+    completion: {
+      percent: completion.percent,
+      is_complete: completion.profileComplete,
+      missing: [
+        !completion.skillsComplete && 'Skills',
+        !completion.aadhaarPresent && 'Aadhaar',
+        !completion.photoPresent && 'Profile picture',
+        !completion.dobPresent && 'Date of birth',
+        !completion.personalDetailsComplete && 'Personal details',
+        !completion.serviceablePincodesPresent && 'Serviceable pincodes',
+      ].filter(Boolean),
     },
 
     // ─ The vertical this technician was onboarded FOR (a label, not a fence) ─
@@ -789,6 +812,18 @@ async function setLeadVerification(efrId, body, actor) {
      */
     const sets = [];
     const params = [];
+    if (v === 1) {
+      // The flags the rest of the stack reads as "this technician is live".
+      // is_identity_details_verified_by_crm: the reviewer HAS just reviewed
+      // the identity — that is what the Onboarding KYC section is.
+      sets.push(
+        'is_technician_verified = 1',
+        'is_identity_details_verified_by_crm = 1',
+        'profile_crm_activation_by = ?',
+        'profile_activation_date_time = ?',
+      );
+      params.push(actor?.user_id || null, now);
+    }
     if (v === 1 && body.efr_cityId) { sets.push('efr_cityId = ?'); params.push(body.efr_cityId); }
     if (v === 1 && body.vertical_id) { sets.push('efr_vertical_id = ?'); params.push(Number(body.vertical_id)); }
     if (v === 1 && body.reason) { sets.push('final_accept_comment = ?'); params.push(body.reason); }
@@ -837,7 +872,26 @@ async function setLeadVerification(efrId, body, actor) {
           reasonCode: v === 1 ? 'LEAD_ACCEPTED' : 'LEAD_RESET',
           reason: body.reason || statusText,
         }),
-      projectedRow: { user_personal_details_filled: v },
+      /*
+       * ACCEPTING IS ACTIVATING (Priyanka, 2026-09-29). Onboarding is now the
+       * whole review — there is no separate CRM identity step left to pass —
+       * so an accepted technician goes live.
+       *
+       * No explicit target status: projecting the verified flags lets
+       * deriveLegacyStatus pick it, which returns UNDER_MASTER instead of
+       * ACTIVE for a technician mapped under a master. Naming ACTIVE outright
+       * would trip assertManagerStatusInvariant and fail the whole accept for
+       * exactly those technicians.
+       *
+       * ⚠ This deliberately does not travel the verification workflow's own
+       * activation path, whose assertFinalActivationEligible demands a CRM
+       * identity approval and efr_profile_perc = 100 — a step this flow no
+       * longer has, and a legacy column the new app never writes. That path is
+       * untouched for its own callers.
+       */
+      projectedRow: v === 1
+        ? { user_personal_details_filled: 1, is_technician_verified: 1, efr_status: 1 }
+        : { user_personal_details_filled: v },
       mutate: applyLeadMutation,
     }, actor);
   } else {

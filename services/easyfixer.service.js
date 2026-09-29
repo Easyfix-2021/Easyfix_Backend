@@ -6,6 +6,17 @@ const lifecycleService = require('./easyfixer-lifecycle.service');
 // registered queue and the technician's training gate cannot disagree about
 // which flags exist. See registeredTrainingJoin().
 const lms = require('./lms.service');
+const profileCompletion = require('./profile-completion.service');
+
+/*
+ * MySQL hands a BIT(1)/boolean back as a Buffer, an EXISTS(...) back as 0/1.
+ * Both mean the same thing to the completion rule, so normalise once.
+ */
+function asBoolish(value) {
+  if (value == null) return false;
+  if (Buffer.isBuffer(value)) return value[0] === 1;
+  return Number(value) === 1;
+}
 const {
   mapAadhaarUniqueViolation,
   normalizeAadhaar,
@@ -48,6 +59,28 @@ const LIST_COLUMNS = `
   U.is_personal_detail_filled AS lifecycle_personal_submitted,
   (e.adhaar_card_number IS NOT NULL AND e.adhaar_card_number <> '') AS lifecycle_aadhaar_present,
   (e.efr_profile_img IS NOT NULL AND e.efr_profile_img <> '') AS lifecycle_photo_present,
+  /*
+   * Registration completeness inputs, for the roster's Profile column.
+   * efr_profile_perc above is LEGACY — the new technician app never writes it,
+   * so a technician with everything filled reads 0%. These three feed
+   * profile-completion.service's canonical rule instead (the same one the app
+   * and the onboarding gate use), scored in JS below.
+   */
+  (e.date_of_birth IS NOT NULL) AS dob_present,
+  EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping pcm
+           WHERE pcm.easyfixer_id = e.efr_id AND pcm.is_repairing = 1) AS has_active_deep_skill,
+  EXISTS (SELECT 1 FROM tbl_efr_serviceable_pincodes sp
+           WHERE sp.easyfixer_id = e.efr_id
+             AND NULLIF(TRIM(sp.pincodes), '') IS NOT NULL) AS serviceable_pincodes_present,
+  /*
+   * The categories the technician actually mapped. efr_service_category is the
+   * legacy CSV the old CRM wrote; the new app records its choice as deep-skill
+   * mappings and leaves that column NULL, which is why the roster's Service
+   * Category column read "—" for every new registration.
+   */
+  (SELECT GROUP_CONCAT(DISTINCT dm.category_id)
+     FROM tbl_efr_deepskill_mapping dm
+    WHERE dm.easyfixer_id = e.efr_id AND dm.is_repairing = 1) AS mapped_category_ids,
   /*
    * Column-name mapping (2026-06-08). The legacy Java DAO reads
    * personalDetailsFilled / isIdentityDetailsVerified -- names without
@@ -502,6 +535,26 @@ async function list({
     ...row,
     pause_count: Number(row.lifecycle_pause_count) || 0,
     lifecycle: lifecycleService.lifecycleFromRow(row),
+    /*
+     * Additive fields — efr_profile_perc and efr_service_category are left
+     * exactly as stored, because the legacy Manage Easyfixers page reads them.
+     *
+     * The Aadhaar number and photo name are deliberately NOT selected into a
+     * roster of 10,000 people just to test emptiness; the boolean columns
+     * already in this projection stand in for them.
+     */
+    computed_profile_perc: profileCompletion.strengthFromRow({
+      has_active_deep_skill: row.has_active_deep_skill,
+      efr_service_category: row.efr_service_category,
+      efr_service_type: row.efr_service_type,
+      adhaar_card_number: asBoolish(row.lifecycle_aadhaar_present) ? 'present' : null,
+      efr_profile_img: asBoolish(row.lifecycle_photo_present) ? 'present' : null,
+      dob_present: row.dob_present,
+      user_is_personal_detail_filled: row.lifecycle_personal_submitted,
+      serviceable_pincodes_present: row.serviceable_pincodes_present,
+    }).percent,
+    derived_service_category: String(row.efr_service_category || '').trim()
+      || (row.mapped_category_ids != null ? String(row.mapped_category_ids) : null),
   }));
   logger.info('Returning ' + items.length + ' easyfixers · total=' + total);
   return { rows: items, total };
@@ -1708,6 +1761,28 @@ async function listRegistered(f = {}, scope) {
       U.is_personal_detail_filled            AS lifecycle_personal_submitted,
       (e.adhaar_card_number IS NOT NULL AND e.adhaar_card_number <> '') AS lifecycle_aadhaar_present,
       (e.efr_profile_img IS NOT NULL AND e.efr_profile_img <> '') AS lifecycle_photo_present,
+  /*
+   * Registration completeness inputs, for the roster's Profile column.
+   * efr_profile_perc above is LEGACY — the new technician app never writes it,
+   * so a technician with everything filled reads 0%. These three feed
+   * profile-completion.service's canonical rule instead (the same one the app
+   * and the onboarding gate use), scored in JS below.
+   */
+  (e.date_of_birth IS NOT NULL) AS dob_present,
+  EXISTS (SELECT 1 FROM tbl_efr_deepskill_mapping pcm
+           WHERE pcm.easyfixer_id = e.efr_id AND pcm.is_repairing = 1) AS has_active_deep_skill,
+  EXISTS (SELECT 1 FROM tbl_efr_serviceable_pincodes sp
+           WHERE sp.easyfixer_id = e.efr_id
+             AND NULLIF(TRIM(sp.pincodes), '') IS NOT NULL) AS serviceable_pincodes_present,
+  /*
+   * The categories the technician actually mapped. efr_service_category is the
+   * legacy CSV the old CRM wrote; the new app records its choice as deep-skill
+   * mappings and leaves that column NULL, which is why the roster's Service
+   * Category column read "—" for every new registration.
+   */
+  (SELECT GROUP_CONCAT(DISTINCT dm.category_id)
+     FROM tbl_efr_deepskill_mapping dm
+    WHERE dm.easyfixer_id = e.efr_id AND dm.is_repairing = 1) AS mapped_category_ids,
       e.is_identity_details_verified_by_crm  AS is_identity_details_verified,
       e.send_back_to_tx_reason_crm           AS send_back_to_tx_reason_crm,
       e.efr_profile_img                      AS efr_profile_img,

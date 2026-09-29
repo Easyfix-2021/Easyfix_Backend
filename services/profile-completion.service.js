@@ -144,8 +144,38 @@ async function read(efrId, { database = pool } = {}) {
   };
 }
 
+/*
+ * Profile STRENGTH — the same facts as `fromRow`, expressed as a percentage.
+ *
+ * Six equal parts rather than the app's three cards, because the CRM's ring
+ * needs to move when a technician fills one more thing, and a three-card score
+ * only ever reads 0 / 33 / 67 / 100. The PARTS are the canonical ones, so the
+ * definition cannot drift from the app's — only its granularity differs.
+ *
+ * This replaced reading tbl_easyfixer.efr_profile_perc, which the new
+ * technician app never writes: technicians with everything filled were showing
+ * 0%, and a number nobody maintains is worse than no number at all.
+ */
+function strengthFromRow(row = {}) {
+  const c = fromRow(row);
+  const parts = [
+    c.skillsComplete,
+    c.aadhaarPresent,
+    c.photoPresent,
+    c.dobPresent,
+    c.personalDetailsComplete,
+    c.serviceablePincodesPresent,
+  ];
+  return {
+    ...c,
+    parts,
+    percent: Math.round((parts.filter(Boolean).length / parts.length) * 100),
+  };
+}
+
 module.exports = {
   fromRow,
+  strengthFromRow,
   projectionSql,
   read,
   sqlPredicates,
