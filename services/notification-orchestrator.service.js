@@ -8,6 +8,31 @@ const whatsappService = require('./meta.whatsapp.service');
 const fcmService = require('./fcm.service');
 const smsTemplate = require('./sms-template.service');
 const { displaySlot, appointmentDateLabel } = require('./time-slot');
+const { pool } = require('../db');
+
+/*
+ * Inbox item for the job OWNER — and, when the owner is on Week Off today per
+ * the Team Roster (services/roster.service.js weekOffSet), a copy to their
+ * reporting manager so the event does not sit unread for the day. The copy is
+ * best-effort: a roster/hierarchy lookup failure never drops the owner's item.
+ */
+async function createForOwner(item) {
+  await inbox.create(item);
+  try {
+    const off = await require('./roster.service').weekOffSet([item.userId]);
+    if (!off.has(Number(item.userId))) return;
+    const [[rm]] = await pool.query(
+      `SELECT m.user_id FROM tbl_user u JOIN tbl_user m ON m.user_id = u.reporting_manager
+        WHERE u.user_id = ? AND m.user_status = 1 LIMIT 1`,
+      [item.userId]
+    );
+    if (!rm) return;
+    await inbox.create({ ...item, userId: rm.user_id, title: `${item.title} (Owner On Week Off)` });
+    logger.info('Inbox copied to reporting manager · owner on week off · owner=' + item.userId + ' · rm=' + rm.user_id + ' · jobId=' + item.jobId);
+  } catch (e) {
+    logger.warn('Week-off inbox copy skipped · owner=' + item.userId + ' · ' + e.message);
+  }
+}
 
 /*
  * Positional vars passed to DLT-template fill for the
@@ -145,7 +170,7 @@ async function onJobEvent(eventName, jobCtx) {
           smsService.send({ to: jobCtx.customer_mob_no, message: `EasyFix: Technician ${jobCtx.easyfixer_name} assigned to your ${jobCtx.job_type} request.` });
         }
         if (jobCtx.job_owner) {
-          await inbox.create({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
+          await createForOwner({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
             title: 'Technician assigned', desc: `${jobCtx.easyfixer_name} accepted job ${jobCtx.job_id}` });
         }
         break;
@@ -179,7 +204,7 @@ async function onJobEvent(eventName, jobCtx) {
           smsService.send({ to: jobCtx.customer_mob_no, message });
         }
         if (jobCtx.job_owner) {
-          await inbox.create({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
+          await createForOwner({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
             title: 'Job completed', desc: `Job ${jobCtx.job_id} marked complete by ${jobCtx.easyfixer_name}` });
         }
         break;
@@ -188,7 +213,7 @@ async function onJobEvent(eventName, jobCtx) {
           smsService.send({ to: jobCtx.customer_mob_no, message: `EasyFix: Your ${jobCtx.job_type} request has been cancelled.` });
         }
         if (jobCtx.job_owner) {
-          await inbox.create({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
+          await createForOwner({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
             title: 'Job cancelled', desc: `Job ${jobCtx.job_id} cancelled.` });
         }
         break;
@@ -288,7 +313,7 @@ async function onJobEvent(eventName, jobCtx) {
           smsService.send({ to: jobCtx.customer_mob_no, message });
         }
         if (jobCtx.job_owner) {
-          await inbox.create({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
+          await createForOwner({ userId: jobCtx.job_owner, jobId: jobCtx.job_id,
             title: 'Customer unreachable', desc: `Job ${jobCtx.job_id} marked as Call Later — customer not reachable.` });
         }
         break;
