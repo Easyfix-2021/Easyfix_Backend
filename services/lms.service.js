@@ -100,6 +100,13 @@ const LMS_FLAG_COLUMNS = Object.freeze([
    * until someone runs the SQL.
    */
   ['lms_assessment', 'created_by'],
+  /*
+   * Added 2026-09-29 with the "Introduction to Easyfix" system course
+   * (migrations/2026-09-29-02-intro-course.sql). Absent, no course is the
+   * system course and the legacy is_global catalogue keeps gating — exactly
+   * what ran before the migration.
+   */
+  ['courses', 'is_system'],
 ]);
 
 let _flagCache = null;
@@ -113,7 +120,7 @@ async function lmsFlagColumns() {
 
   // One round trip for both, not one per column: this sits in front of the
   // course list and the technician's training screen.
-  const value = { courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true };
+  const value = { courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true, courseSystem: true };
   try {
     const [rows] = await pool.query(
       `SELECT table_name AS t, column_name AS c
@@ -129,6 +136,7 @@ async function lmsFlagColumns() {
     value.courseMandatory = present.has('courses.is_mandatory');
     value.videoGlobal = present.has('training_videos.is_global');
     value.assessmentCreatedBy = present.has('lms_assessment.created_by');
+    value.courseSystem = present.has('courses.is_system');
     const missing = LMS_FLAG_COLUMNS
       .filter(([t, c]) => !present.has(`${t}.${c}`))
       .map(([t, c]) => `${t}.${c}`);
@@ -317,7 +325,7 @@ async function listCourses({
    * A plain WHERE rather than a sort key: is_mandatory is two values, so
    * sorting by it just groups the list, while filtering removes the noise.
    */
-  const { courseMandatory } = await lmsFlagColumns();
+  const { courseMandatory, courseSystem } = await lmsFlagColumns();
   // No column means no course is mandatory, so the filter must return nothing
   // rather than everything — `1=0`, not a dropped clause.
   if (mandatoryOnly) where.push(courseMandatory ? 'c.is_mandatory = 1' : '1=0');
@@ -342,13 +350,14 @@ async function listCourses({
   const [rows] = await pool.query(
     `SELECT c.id, c.name, c.description, c.status,
             ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
+            ${courseSystem ? 'c.is_system' : '0 AS is_system'},
             c.reward_points, c.certificate_enabled,
             c.created_at, c.updated_at,
             (SELECT COUNT(*) FROM lms_content lc WHERE lc.course_id = c.id AND lc.status = 1) AS video_count,
             (SELECT COUNT(*) FROM easyfixer_courses ec WHERE ec.course_id = c.id) AS assigned_count
        FROM courses c
       WHERE ${whereSql}
-      ORDER BY ${sortExpr} ${dir}, c.id ASC
+      ORDER BY ${courseSystem ? 'c.is_system DESC, ' : ''}${sortExpr} ${dir}, c.id ASC
       LIMIT ? OFFSET ?`,
     [...params, limit, offset],
   );
@@ -363,10 +372,11 @@ async function listCourses({
 }
 
 async function getCourseById(id) {
-  const { courseMandatory } = await lmsFlagColumns();
+  const { courseMandatory, courseSystem } = await lmsFlagColumns();
   const [rows] = await pool.query(
     `SELECT id, name, description, status,
             ${courseMandatory ? 'is_mandatory' : '0 AS is_mandatory'},
+            ${courseSystem ? 'is_system' : '0 AS is_system'},
             reward_points, certificate_enabled,
             created_at, updated_at
        FROM courses WHERE id = ?`,
@@ -444,9 +454,33 @@ async function createCourse({
   return { id: ins.insertId };
 }
 
+/*
+ * THE SYSTEM COURSE — "Introduction to Easyfix" (owner, 2026-09-29).
+ *
+ * The one course every technician must finish, new or existing, whether or
+ * not anyone assigned it: the onboarding gate reads its videos for everyone
+ * (globalVideoIdsSql). So it can never be retired, made optional, emptied, or
+ * hold anything but videos — each of those would either unlock earning for
+ * everyone or lock it on content the app cannot complete. Name, description
+ * and rewards stay editable. Seeded by migrations/2026-09-29-02-intro-course.sql.
+ */
+function systemCourseError(message) {
+  const e = mkErr(409, message);
+  e.details = { code: 'SYSTEM_COURSE' };
+  return e;
+}
+
 async function updateCourse(id, patch = {}) {
   const courseId = Number(id);
-  await getCourseById(courseId);
+  const current = await getCourseById(courseId);
+  if (Number(current.is_system) === 1) {
+    if (patch.status !== undefined && !patch.status) {
+      throw systemCourseError('Introduction to Easyfix is the default course and cannot be retired');
+    }
+    if (patch.is_mandatory !== undefined && !patch.is_mandatory) {
+      throw systemCourseError('Introduction to Easyfix is the default course and is always mandatory');
+    }
+  }
 
   const sets = [];
   const params = [];
@@ -522,7 +556,10 @@ async function updateCourse(id, patch = {}) {
  */
 async function retireCourse(id) {
   const courseId = Number(id);
-  await getCourseById(courseId);
+  const current = await getCourseById(courseId);
+  if (Number(current.is_system) === 1) {
+    throw systemCourseError('Introduction to Easyfix is the default course and cannot be deleted');
+  }
   await pool.query('UPDATE courses SET status = 0 WHERE id = ?', [courseId]);
   logger.info('Course retired · id=' + courseId);
   return { retired: true };
@@ -685,7 +722,7 @@ async function assertRefsExist(items) {
  */
 async function setCourseContent(courseId, items = []) {
   const id = Number(courseId);
-  await getCourseById(id);
+  const course = await getCourseById(id);
 
   /*
    * De-duplicated on (kind, ref_id): the unique key would reject the second
@@ -703,6 +740,17 @@ async function setCourseContent(courseId, items = []) {
     if (seen.has(key)) continue;
     seen.add(key);
     list.push({ kind, ref_id: refId });
+  }
+
+  // The system course: videos only, at least one. Checked on the de-duplicated
+  // list, so a save of [video 4, video 4] is one video, not two.
+  if (Number(course.is_system) === 1) {
+    if (list.some((i) => i.kind !== 'video')) {
+      throw mkErr(400, 'Introduction to Easyfix can only contain videos');
+    }
+    if (!list.length) {
+      throw mkErr(400, 'Introduction to Easyfix must have at least 1 video');
+    }
   }
 
   logger.info('Set course content · courseId=' + id + ' · items=' + list.length
@@ -1396,6 +1444,10 @@ async function extendAssignment(courseId, easyfixerId, { months = 0, days = 0 } 
 }
 
 async function unassignCourse(courseId, easyfixerId) {
+  const course = await getCourseById(courseId);
+  if (Number(course.is_system) === 1) {
+    throw systemCourseError('Introduction to Easyfix is mandatory for every technician and cannot be unassigned');
+  }
   const [r] = await pool.query(
     'DELETE FROM easyfixer_courses WHERE course_id = ? AND easyfixer_id = ?',
     [Number(courseId), Number(easyfixerId)],
@@ -1921,6 +1973,32 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
 }
 
 /*
+ * The videos EVERY technician must watch, assigned or not. No `?` — callers
+ * splice it into statements with positional binds.
+ *
+ * ONE DEFINITION (owner, 2026-09-29): once the system course exists, ITS videos
+ * are that set and training_videos.is_global stops counting — otherwise the
+ * CRM would curate the course while a flag on a different screen still decided
+ * who is locked. is_global survives only as the fallback for a database the
+ * course migration has not reached, where it is exactly what gated before.
+ */
+async function globalVideoIdsSql() {
+  const { videoGlobal, courseSystem } = await lmsFlagColumns();
+  // Without the column no course is the system course: the NOT EXISTS is then
+  // always true and the second arm empty, which is the legacy set exactly.
+  // Ternaries stay inside the template: tests/mobile-query-bind-arity.test.js
+  // counts every question mark outside one as a MySQL placeholder.
+  return `
+  SELECT tv.id FROM training_videos tv
+   WHERE ${videoGlobal ? 'tv.is_global = 1' : '1=0'}
+     AND NOT EXISTS (SELECT 1 FROM courses sc WHERE ${courseSystem ? 'sc.is_system = 1 AND sc.status = 1' : '1=0'})
+   UNION
+  SELECT slc.ref_id FROM lms_content slc
+    JOIN courses sc ON sc.id = slc.course_id
+   WHERE ${courseSystem ? 'sc.is_system = 1 AND sc.status = 1' : '1=0'} AND slc.kind = 'video' AND slc.status = 1`;
+}
+
+/*
  * GATING FOLLOWS ASSIGNMENT, NOT THE FLAG.
  *
  * The first cut of this counted every mandatory course's videos for every
@@ -1964,9 +2042,9 @@ async function assignCourseToAll(courseId, { dueDate = null } = {}) {
  * from here, so a status filter has nothing to revoke.
  */
 async function mandatoryVideoIdsSql() {
-  const { courseMandatory, videoGlobal } = await lmsFlagColumns();
+  const { courseMandatory } = await lmsFlagColumns();
   return `
-  SELECT tv.id FROM training_videos tv WHERE ${videoGlobal ? 'tv.is_global = 1' : '1=0'}
+  ${await globalVideoIdsSql()}
    UNION
   SELECT lc.ref_id FROM lms_content lc
     JOIN courses c ON c.id = lc.course_id
@@ -2995,14 +3073,41 @@ function certificatePayload(row) {
   };
 }
 
+// Give this technician the system course if they lack it, stamping it complete
+// when they had already watched its videos (the carry-over the migration does
+// for everyone who existed on the day it ran).
+async function assignSystemCourse(efrId) {
+  const { courseSystem } = await lmsFlagColumns();
+  const [[sys]] = await pool.query(`SELECT id FROM courses WHERE ${courseSystem ? 'is_system = 1' : '1=0'} AND status = 1 LIMIT 1`);
+  if (!sys) return { assigned: 0 };
+  const now = new Date();
+  const [res] = await pool.query(
+    `INSERT INTO easyfixer_courses (easyfixer_id, course_id, created_at, updated_at, due_date)
+     SELECT ?, ?, ?, ?, NULL FROM DUAL
+      WHERE NOT EXISTS (SELECT 1 FROM easyfixer_courses WHERE easyfixer_id = ? AND course_id = ?)`,
+    [efrId, sys.id, now, now, efrId, sys.id],
+  );
+  if (res.affectedRows) await stampCompletionsForCourse(sys.id, [efrId]);
+  return { assigned: res.affectedRows };
+}
+
 async function coursesForTech(efrId) {
   const efr = Number(efrId);
   // Probed: this is the technician's own LMS screen, and both the projection
   // and the ordering below name a column that arrives by ALTER.
-  const { courseMandatory } = await lmsFlagColumns();
+  const { courseMandatory, courseSystem } = await lmsFlagColumns();
+  /*
+   * The system course gates everyone (globalVideoIdsSql), assigned or not, so
+   * a technician who joined through a path that never assigned it — the legacy
+   * app — must still find it on this screen. Idempotent; best effort.
+   */
+  try { await assignSystemCourse(efr); } catch (e) {
+    logger.warn('System course lazy assign failed · efrId=' + efr + ' · ' + e.message);
+  }
   const [courses] = await pool.query(
     `SELECT ec.course_id AS id, c.name, c.description,
             ${courseMandatory ? 'c.is_mandatory' : '0 AS is_mandatory'},
+            ${courseSystem ? 'c.is_system' : '0 AS is_system'},
             ec.due_date, ec.completion_date, ec.score,
             /*
              * The EARNED STAMP, not the course's current flag. There is still
@@ -3046,7 +3151,7 @@ async function coursesForTech(efrId) {
        * dropped rather than faked — the remaining due-date order is exactly
        * what this screen showed before the flag existed.
        */
-      ORDER BY ${courseMandatory ? 'c.is_mandatory DESC, ' : ''}(ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
+      ORDER BY ${courseSystem ? 'c.is_system DESC, ' : ''}${courseMandatory ? 'c.is_mandatory DESC, ' : ''}(ec.due_date IS NULL), ec.due_date ASC, c.name ASC`,
     [efr],
   );
   if (!courses.length) return { rows: [] };
@@ -3127,6 +3232,7 @@ module.exports = {
   certificatePayload,
   certificateNumber,
   mandatoryVideoIdsSql,
+  globalVideoIdsSql,
   mandatoryNonVideoProgress,
   visibleVideoIdsSql,
   lmsFlagColumns,

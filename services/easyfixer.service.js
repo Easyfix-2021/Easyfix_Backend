@@ -1656,7 +1656,8 @@ function earlyActivationEligible(r) {
  * 310-318ms (three runs).
  */
 async function registeredTrainingJoin() {
-  const { courseMandatory, videoGlobal } = await lms.lmsFlagColumns();
+  const { courseMandatory } = await lms.lmsFlagColumns();
+  const globalSql = await lms.globalVideoIdsSql();
   return `
   LEFT JOIN (
     SELECT m.easyfixer_id,
@@ -1664,7 +1665,7 @@ async function registeredTrainingJoin() {
       FROM (
             SELECT e2.efr_id AS easyfixer_id, tv.id AS video_id
               FROM tbl_easyfixer e2
-              JOIN training_videos tv ON ${videoGlobal ? 'tv.is_global = 1' : '1=0'}
+              JOIN (${globalSql}) tv
              UNION
             SELECT ec.easyfixer_id, lc.ref_id
               FROM lms_content lc
