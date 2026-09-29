@@ -539,6 +539,22 @@ async function getVerificationPage(efrId) {
      * the profile-strength ring and the technician's own app can never
      * disagree about what "complete" means.
      */
+    /*
+     * How long onboarding actually took. insert_date is when the technician's
+     * row was created (registration); profile_activation_date_time is stamped
+     * when a reviewer accepts him. days_to_activate is null while he is still
+     * waiting — that is the open case, not a missing value.
+     */
+    timeline: {
+      registered_on: e.insert_date || null,
+      activated_on: e.profile_activation_date_time || null,
+      days_to_activate: (e.insert_date && e.profile_activation_date_time)
+        ? Math.max(0, Math.round(
+          (new Date(e.profile_activation_date_time) - new Date(e.insert_date)) / 86400000,
+        ))
+        : null,
+    },
+
     completion: {
       percent: completion.percent,
       is_complete: completion.profileComplete,
