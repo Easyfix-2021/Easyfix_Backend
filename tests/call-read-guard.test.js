@@ -123,7 +123,7 @@ before(async () => {
   app.use('/calls', callsRouter);
   app.use((err, _req, res, _next) => { res.status(500).json({ success: false, error: String(err && err.message) }); });
 
-  await new Promise((resolve) => { server = app.listen(0, resolve); });
+  await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
@@ -395,4 +395,23 @@ test('the list projects has_recording, never the raw recording URL', async () =>
   assert.ok(select.includes('jci.caller_status'), 'sliced the wrong projection');
   assert.match(select, /AS has_recording/, 'the list must expose presence, not the URL');
   assert.doesNotMatch(select, /^\s*jci\.recording,\s*$/m, 'the raw recording URL is back in the list');
+});
+
+test('recording_lost flags ONLY Plivo calls inside the proven outage window', async () => {
+  /*
+   * "No recording" up front must never hide audio that exists. The Plivo
+   * account holds ZERO recordings while the broken build served Prod
+   * (13:42:28 UTC 09-24 → 05:42:40 UTC 09-25 = the IST window below), so every
+   * Plivo call inserted inside it is proven unrecorded — and nothing outside.
+   */
+  const src = require('fs').readFileSync(require.resolve('../routes/admin/calls.js'), 'utf8');
+  const from = src.indexOf("router.get('/', validate(callListQuery");
+  const body = src.slice(from).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const select = body.slice(body.indexOf('SELECT jci.job_caller_info'), body.indexOf('ORDER BY jci.inserted_time'));
+  const at = select.indexOf('AS recording_lost');
+  assert.notEqual(at, -1, 'the list must expose recording_lost');
+  const lost = select.slice(select.lastIndexOf('(jci.provider', at), at);
+  assert.match(lost, /jci\.provider = 'plivo'/, 'Kaleyra audio is never marked lost');
+  assert.match(lost, /jci\.inserted_time >= '2026-09-24 19:12:28'/, 'window opens when the broken build started (IST)');
+  assert.match(lost, /jci\.inserted_time <\s+'2026-09-25 11:12:40'/, 'and closes, exclusive, when the revert replaced it');
 });

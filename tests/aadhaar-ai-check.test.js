@@ -68,6 +68,7 @@ function fakeDb({ installed = true } = {}) {
       if (/GET_LOCK/i.test(text)) return [[{ acquired: 1 }], []];
       if (/RELEASE_LOCK/i.test(text)) return [[{ released: 1 }], []];
       if (/SELECT 1 AS conflict/i.test(text)) return [[], []];
+      if (/identity_review FROM tbl_easyfixer/i.test(text)) return [[{ identity_review: null }], []];
       if (/^\s*UPDATE tbl_easyfixer\b/i.test(text)) return [{ affectedRows: 1 }, []];
       if (/^\s*SELECT efr_doc_id/i.test(text)) return [[], []];
       if (/^\s*INSERT INTO tbl_easyfixer_document/i.test(text)) return [{ affectedRows: 1 }, []];

@@ -30,7 +30,9 @@ const fake = installFakePool(
   [
     [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
     [/SHOW COLUMNS/i, []],
-    [/SELECT customer_id FROM tbl_customer WHERE customer_id/, () => scenario.customerRows],
+    // The lookup also reads customer_name now (the booking's name is written
+    // back to the master, 2026-09-24), so match the table and key, not the list.
+    [/FROM tbl_customer WHERE customer_id/, () => scenario.customerRows],
   ],
   { stopOn: /INSERT INTO tbl_job\b/ }, // \b excludes tbl_job_services / tbl_job_image
 );

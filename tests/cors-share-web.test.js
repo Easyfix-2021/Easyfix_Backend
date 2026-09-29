@@ -15,7 +15,7 @@ test('a preflight from the CRM origin allows the headers the app sends on writes
   const app = express();
   app.use(require('../cors'));
   app.post('/api/mobile/jobs/1/checkin', (_req, res) => res.json({ ok: true }));
-  const server = await new Promise((r) => { const s = app.listen(0, () => r(s)); });
+  const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
   try {
     const res = await fetch(`http://127.0.0.1:${server.address().port}/api/mobile/jobs/1/checkin`, {
       method: 'OPTIONS',

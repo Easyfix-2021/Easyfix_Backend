@@ -21,6 +21,8 @@ const whatsappService = require('./gallabox.whatsapp.service');
  *   - magic_link_sent_at IS NULL OR magic_link_sent_at < now - INTERVAL 24 HOUR (24h cooldown; `now`
  *     is a bound app Date, not SQL NOW() — see the clock-rule comment below)
  *   - magic_link_send_count < 3 (cap at 3 sends per job)
+ *   - the last link did not FAIL (magic_link_delivery_status not failed /
+ *     undelivered) — failed links are called, not re-sent (2026-09-22)
  * LIMIT 500 per run to avoid choking on a backlog burst — next hour
  * picks up the rest.
  *
@@ -42,7 +44,21 @@ async function runHourlySweep() {
     // job-magic-link.service.js / whatsapp-conversation.service.js — bind
     // this instant instead of reading SQL NOW().
     const now = new Date();
-    const [rows] = await pool.query(`
+    /*
+     * SKIP FAILED LINKS (ops rule, 2026-09-22). A link WhatsApp could not
+     * deliver — refused on the spot, or reported failed/undelivered later —
+     * is not re-sent the next day: the team calls that customer instead. So a
+     * failed job is simply not eligible. An operator who corrects the number
+     * and re-sends by hand clears the flag (a successful send stamps 'sent'),
+     * which puts the job back on the cron's normal reminder cadence.
+     *
+     * Column-tolerant: on a deploy without the 2026-07-14 delivery-status
+     * migration the clause cannot parse, so the sweep re-runs without it
+     * rather than sending nothing at all.
+     */
+    const skipFailed = `AND (j.magic_link_delivery_status IS NULL
+               OR j.magic_link_delivery_status NOT IN ('failed', 'undelivered'))`;
+    const eligibilitySql = (extra) => `
       SELECT j.job_id, j.magic_link_sent_at, j.magic_link_send_count,
              (SELECT LOWER(REPLACE(cpm.c_prop_values, '_', ' '))
                 FROM tbl_client_custom_properties cpm
@@ -74,9 +90,18 @@ async function runHourlySweep() {
           * second chance to make that mistake. See maxSendCountSql().
           */
          AND j.magic_link_send_count < ${magicLinkService.maxSendCountSql('j')}
+         ${extra}
        ORDER BY j.job_id ASC
        LIMIT 500
-    `, [now]);
+    `;
+    let rows;
+    try {
+      [rows] = await pool.query(eligibilitySql(skipFailed), [now]);
+    } catch (e) {
+      if (!e || e.code !== 'ER_BAD_FIELD_ERROR') throw e;
+      logger.warn('Magic-link cron · delivery-status columns absent — sweeping without the skip-failed clause');
+      [rows] = await pool.query(eligibilitySql(''), [now]);
+    }
     eligible = rows.length;
     logger.info('Found ' + eligible + ' eligible unconfirmed jobs');
 

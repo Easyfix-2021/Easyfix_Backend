@@ -55,6 +55,13 @@ const ROUTES = [
   [/FROM tbl_user_personal_details/i, () => detailRows],
   [/COUNT\(\*\)/i, [{ total: USER_ROWS.length }]],
   [/FROM tbl_user_allowed_stages/i, []],
+  // Hierarchy tree (buildHierarchyTree): 602 reports to 601.
+  [/SELECT user_id, reporting_manager\s+FROM tbl_user/i, [{ user_id: 602, reporting_manager: 601 }]],
+  [/u\.user_id = \? AND u\.user_type_id/i, [{ user_id: 601, user_name: 'With Photo', reporting_manager: null }]],
+  [/u\.user_id IN \(/i, () => [
+    { user_id: 601, user_name: 'With Photo', reporting_manager: null },
+    { user_id: 602, user_name: 'Without Photo', reporting_manager: 601 },
+  ]],
   [/LIMIT \? OFFSET \?/i, () => USER_ROWS.map((r) => ({ ...r }))],
 ];
 
@@ -163,4 +170,15 @@ test('avatars are signed for an HOUR, not the shared 5-minute default', async ()
   await userService.listUsers({});
   assert.equal(presigns[0].ttl, 3600,
     'a grid left open past 300s would otherwise render 403 "Request has expired" for every avatar');
+});
+
+// ── 5. Users → Hierarchy carries the same avatar contract ─────────────────
+
+test('hierarchy nodes carry photo_url too — one batched side-table read for the tree', async () => {
+  const { tree } = await userService.buildHierarchyTree(601);
+  assert.match(tree.photo_url, /^https:\/\/bucket\.example\/Profile_Photos\/601_abc123\?/);
+  assert.equal(tree.children.length, 1, 'fixture sanity: 602 is attached under 601');
+  assert.equal(tree.children[0].photo_url, null, 'no key → null → monogram');
+  const reads = fake.calls.filter((c) => /tbl_user_personal_details/i.test(c.sql));
+  assert.equal(reads.length, 1, 'the whole tree costs one side-table statement, not one per node');
 });

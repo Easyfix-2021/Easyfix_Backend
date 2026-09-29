@@ -99,9 +99,7 @@ router.get('/answer', async (req, res) => {
        */
       xml(conference.operatorAnswerXml(claims.conf, {
         confId: claims.confId || null,
-        // No recordingCallbackUrl ⇒ no <Record> at join time. Recording starts
-        // when the receiver ANSWERS — the conference webhook's
-        // startRecordingOnAnswer, gated on the `record` flag markAnswered saved.
+        recordingCallbackUrl: record ? plivo.recordingCallbackUrl(claims.jci) : null,
       }));
 
       /*
@@ -230,8 +228,7 @@ async function webAnswer(req, res) {
       // carry it, or recording would silently depend on voice.call.mode.
       xml(conference.operatorAnswerXml(resolved.conferenceName, {
         confId: resolved.conferenceId || null,
-        // Recording starts on answer, not here — same as the mobile branch
-        // (startRecordingOnAnswer, gated on setRecordingRequested above).
+        recordingCallbackUrl: record ? plivo.recordingCallbackUrl(resolved.jci) : null,
       }));
       /*
        * Dial the receiver in only NOW — the operator's browser leg is connected.
@@ -308,9 +305,7 @@ async function recordingCallback(req, res) {
       logger.warn('Plivo recording-callback: invalid/expired token · ignoring');
       return res.status(200).type('text/plain').send('ok');
     }
-    // RecordUrl: the <Record> element's callback. record_url: the Record API's
-    // (conference recordings — startRecordingOnAnswer).
-    const url = src.RecordUrl || src.record_url || src.recording_url || null;
+    const url = src.RecordUrl || src.recording_url || null;
     const id = src.RecordingID || src.recording_id || null;
     const duration = src.RecordingDuration || src.recording_duration || null;
     logger.info('Plivo recording-callback · jci=' + claims.jci + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url);

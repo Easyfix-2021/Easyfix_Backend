@@ -519,6 +519,14 @@ async function loadPersonalEmails(userIds) {
   return out;
 }
 
+/** Presigned avatar URL for one loadPersonalEmails() entry, or null (see the
+ *  list's photo_url comment for the TTL and fail-soft reasoning). */
+function photoUrlOf(d) {
+  return (d && d.profile_image_key && s3.isEnabled())
+    ? s3.getPresignedUrl(d.profile_image_key, USER_PHOTO_PRESIGN_TTL_SEC).catch(() => null)
+    : Promise.resolve(null);
+}
+
 /** Single-user variant, same fail-soft contract → null when unreadable. */
 async function loadPersonalEmail(userId) {
   try {
@@ -979,9 +987,7 @@ async function listUsers({
      * avatar. Then .catch(() => null) for a transient signer failure. Most rows
      * have no key at all and cost nothing — no presign, no S3 call.
      */
-    r.photo_url = (d && d.profile_image_key && s3.isEnabled())
-      ? await s3.getPresignedUrl(d.profile_image_key, USER_PHOTO_PRESIGN_TTL_SEC).catch(() => null)
-      : null;
+    r.photo_url = await photoUrlOf(d);
   }
 
   logger.info('Found ' + rows.length + ' users (total=' + total + ')');
@@ -2010,6 +2016,9 @@ async function buildHierarchyTree(rootUserId) {
       WHERE u.user_id IN (${placeholders})`,
     allIds
   );
+  // Same avatar contract as the Manage Users list: photo_url, null = monogram.
+  const details = await loadPersonalEmails(allIds);
+  await Promise.all(allUsers.map(async (u) => { u.photo_url = await photoUrlOf(details.get(Number(u.user_id))); }));
   const byId = new Map(allUsers.map((u) => [u.user_id, { ...u, children: [] }]));
 
   // Build nested children tree

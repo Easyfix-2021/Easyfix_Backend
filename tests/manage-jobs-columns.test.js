@@ -88,11 +88,30 @@ test('the row shape is IDENTICAL whether tbl_job_offer is migrated in or not', (
   assert.ok(on.length >= 10, `expected at least 10 aliased columns, got ${on.length}`);
 });
 
+test('the row shape is IDENTICAL whether the enquiry columns are migrated in or not', () => {
+  /*
+   * Same invariant as tbl_job_offer above, for the trio getByIdCore already
+   * probes (enquiry_reason_id / enquiry_comment / enquiry_date_time). The
+   * Cancelled/Enquiry reason pair is NULL-aliased on a deploy that predates
+   * them; if that branch dropped an alias instead, the Remark cell would read
+   * the reason on one deploy and an em-dash on another with nothing in either
+   * payload to say which happened.
+   */
+  const on = aliases(fragment('manageColumns', true, true, true));
+  const off = aliases(fragment('manageColumns', true, true, false));
+  assert.deepEqual(off, on,
+    `aliases diverge between the two branches:\n  with:    ${on.join(',')}\n  without: ${off.join(',')}`);
+  assert.ok(on.includes('enquiry_reason_name') && on.includes('enquiry_comment'),
+    'both enquiry aliases must be present on BOTH branches');
+});
+
 test('every column the grid renders is projected', () => {
   // The denominator for the 20-column grid: the nine fields that are NOT
   // already on the default LIST projection. A missing one renders an em-dash
   // forever with no error anywhere — the exact failure this pins.
-  const sql = fragment('manageColumns', true, true);
+  // Enquiry columns ON: the NULL-aliased branch is pinned by its own parity
+  // test above, and this one is about what REACHES THE ROW.
+  const sql = fragment('manageColumns', true, true, true);
   /*
    * Asserts the ROW KEY, not the syntax. mysql2 names a column by its alias
    * when there is one and by the column name when there is not, so
@@ -103,6 +122,9 @@ test('every column the grid renders is projected', () => {
   for (const col of [
     'pin_code', 'efr_manager_id', 'efr_team_count', 'easyfix_spoc', 'customer_rating',
     'due_to_type', 'last_comment', 'contact_approval',
+    // Why a Failed Order / Cancelled row is closed — the Remark cell falls back
+    // to these when the job has no comment, which is the usual case there.
+    'cancel_reason_name', 'cancel_comment', 'enquiry_reason_name', 'enquiry_comment',
     'offer_total', 'offer_pending', 'offer_accepted', 'offer_rejected', 'offer_expired',
     // The bucket-derivation inputs that are also read directly by the grid.
     'sub_job_id', 'requested_time',
@@ -157,8 +179,15 @@ test('Rating reuses the escalation row rather than joining that table twice', ()
   // tbl_easyfixer_rating_by_customer's job_id is NOT unique, which is why
   // escalationJoin resolves it through MAX(table_id). Joining it a second time
   // for the rating would both fan out and pick a different row.
-  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated;/,
-    'the manage view must force the escalation JOIN on');
+  /*
+   * The Booking queue joined this list on 2026-09-24: it shows a flame on
+   * escalated rows in every bucket, so it needs the JOIN even when nobody is
+   * filtering by escalation. Widening the JOIN is safe; widening the FILTER is
+   * the regression this test exists for, and the assertions below still pin
+   * that half to the caller's own request.
+   */
+  assert.match(SRC, /const wantsEscalation = wantsManage \|\| filtersEscalated \|\| !!bucket\s*\|\| withEscalation === true/,
+    'the manage view, the booking queue, and any caller that opts in must force the escalation JOIN on');
   assert.match(fragment('manageColumns', true, true), /esc\.customer_rating/,
     'and read the rating off that same alias');
   /*

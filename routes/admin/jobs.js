@@ -12,6 +12,7 @@ const jobNotes = require('../../services/job-notes.service');
 // The one-list services editor (Uplifted tab): catalog read + complete-set PUT.
 const servicesEditor = require('../../services/job-services-editor.service');
 const clientRequest = require('../../services/client-request.service');
+const bookingQueue = require('../../services/booking-queue.service');
 const candidateRanking = require('../../services/candidate-ranking.service');
 const jobLocation = require('../../services/job-location.service');
 const { modernOk, modernError } = require('../../utils/response');
@@ -448,6 +449,15 @@ router.get('/', validate(listQuery, 'query'), async (req, res, next) => {
       const { pool } = require('../../db');
       req.query.sectionIds = await clientRequest.reasonIds(pool);
     }
+    /*
+     * The Booking-queue bucket's "has the customer answered" test reads
+     * tbl_job_customer_request, which does not exist on every deploy. Probe
+     * ONCE here (memoised in job.service) and hand the answer down, so the
+     * predicate degrades to customer_submitted_at instead of 500ing the list.
+     */
+    if (req.query.bucket || req.query.customerRescheduled) {
+      req.query.bucketHasRequestTable = await job.customerRequestTableExists();
+    }
     // Row-level RBAC + reporting hierarchy: row-filter the list by the
     // UNION of (caller's own manage_* scope) ∪ (every direct/indirect
     // report's manage_* scope). Admin/Finance bypass via the bypass
@@ -716,6 +726,82 @@ router.get('/unconfirmed-sections', async (req, res, next) => {
     const todayYmd = new Date(Date.now() + (5.5 * 60 * 60 * 1000)).toISOString().slice(0, 10);
     const sections = await clientRequest.sectionsFor(pool, ids, todayYmd);
     modernOk(res, { sections, meta: clientRequest.SECTION_META, today: todayYmd });
+  } catch (e) { next(e); }
+});
+
+/*
+ * GET /api/admin/jobs/booking-queue?ownerId=
+ *
+ * Every number on the Booking-queue tile strip (My Orders -> Unconfirmed, the
+ * new tab), in ONE query.
+ *
+ *   open.*              open orders per bucket. The five sum to `total`, and
+ *                       each matches the grid's row count for that tile.
+ *   days.<bucket>.*     that bucket split by ticket age: Day 0/1/2/3+, summing
+ *                       to the bucket. '3plus' is three-or-MORE, so the oldest
+ *                       orders have a pill instead of falling out of the sum.
+ *   response_breakdown  what the customers who answered asked for.
+ *   links_sent          how many of these orders have had a link go out.
+ *
+ * NO DATE WINDOW, deliberately: this route once defaulted to `period=today`,
+ * and when the page stopped sending a period every tile silently read 0 while
+ * 149 orders sat open. The age lives in the day pills now.
+ *
+ * The bucket definitions are NOT duplicated here: the same module supplies the
+ * counts and the `bucket=` filter the grid below sends to GET /admin/jobs, so
+ * a tile and its rows cannot describe different populations. Same reason the
+ * RBAC row filter is job.jobScopeFragment rather than a second copy.
+ */
+router.get('/booking-queue', async (req, res, next) => {
+  try {
+    const ownerId = Number(req.query.ownerId);
+    logger.info('Booking-queue counts · ownerId=' + (Number.isFinite(ownerId) ? ownerId : '-'));
+
+    // Required inside the handler, as the sibling handlers in this file do.
+    const { pool } = require('../../db');
+    const { buildRequestScopeWithHierarchy } = require('../../lib/scope');
+    // Independent lookups — run together rather than one round trip after another.
+    const [scope, hasVerticalCol, hasRequestTable] = await Promise.all([
+      buildRequestScopeWithHierarchy(req, pool),
+      job.hasClientVerticalIdColumn(),
+      job.customerRequestTableExists(),
+    ]);
+    const frag = job.jobScopeFragment(
+      { scope, allowedStages: req.allowedStages, hasVerticalCol }, 'j',
+    );
+
+    /*
+     * THE SEARCH NARROWS THE TILES TOO (ops, 2026-09-25). Typing a client name
+     * narrowed the rows while every tile kept the whole board's number, so the
+     * strip stopped adding up to the list under it — the one thing these
+     * counts exist to do.
+     *
+     * The predicate is job.searchClause(), the SAME builder the grid's own
+     * WHERE uses, plus the joins that clause needs and this query does not
+     * otherwise have.
+     */
+    const search = job.searchClause(req.query.q);
+    const searchJoins = search.needsAliases.length ? `
+      LEFT JOIN tbl_customer  cu ON cu.customer_id   = j.fk_customer_id
+      LEFT JOIN tbl_client    cl ON cl.client_id     = j.fk_client_id
+      LEFT JOIN tbl_address   adq ON adq.address_id  = j.fk_address_id
+      LEFT JOIN tbl_city      ci ON ci.city_id       = adq.city_id
+      LEFT JOIN tbl_easyfixer ef ON ef.efr_id        = j.fk_easyfixter_id
+      LEFT JOIN tbl_user      ow ON ow.user_id       = j.job_owner` : '';
+
+    const counts = await bookingQueue.counts({
+      searchSql: search.sql,
+      searchParams: search.params,
+      searchJoins,
+      ownerId: Number.isFinite(ownerId) ? ownerId : undefined,
+      scopeSql: frag.clauses.join(' AND '),
+      scopeParams: frag.params,
+      scopeJoins: frag.joins,
+      // Same probe the list route runs, so the tiles and the rows agree on
+      // what "the customer answered" means.
+      hasRequestTable,
+    });
+    modernOk(res, counts);
   } catch (e) { next(e); }
 });
 

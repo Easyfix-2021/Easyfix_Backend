@@ -149,12 +149,20 @@ test('cancel grants a cancellation ask AND moots a reschedule ask', () => {
   assert.doesNotMatch(SRC.replace(re, "await resolveAppRequests(jobId, ['cancel', 'reschedule']);"), re);
 });
 
-test('reschedule answers the appointment ask ONLY — a cancellation ask survives it', () => {
-  // reschedule() ends with its own resolve call; find it by the comment that
-  // explains the asymmetry so this cannot accidentally match the assign site.
-  const re = /A cancellation ask is NOT answered by a new appointment[\s\S]{0,200}?resolveAppRequests\(jobId, \['reschedule'\]\)/;
+test('reschedule answers the appointment ask AND the cancellation ask', () => {
+  // Was ONLY the appointment ask until 2026-09-25; the cancel flag now clears
+  // here too, so a rescheduled job never hands the incoming technician the
+  // outgoing one's banner. reschedule() ends with its own resolve call — find
+  // it by the comment that explains the change, so this cannot accidentally
+  // match the setStatus or assign site, which pass the same two kinds.
+  const re = /The CANCELLATION ask is cleared here TOO[\s\S]{0,1600}?resolveAppRequests\(jobId, \['cancel', 'reschedule'\]\)/;
   assert.match(SRC, re);
-  assert.doesNotMatch(SRC.replace(/resolveAppRequests\(jobId, \['reschedule'\]\)/, 'noop()'), re);
+  // Positive control: neutralise THAT call and the matcher must stop firing,
+  // proving it pins the reschedule site's arguments and not just the comment.
+  assert.doesNotMatch(
+    SRC.replace(/comment_on = 9\) stays as the record\.\n  await resolveAppRequests\(jobId, \['cancel', 'reschedule'\]\);/, 'noop();'),
+    re,
+  );
 });
 
 test('assign/reassign clears both — the ask belonged to the outgoing technician', () => {
