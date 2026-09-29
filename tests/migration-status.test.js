@@ -264,15 +264,46 @@ const { readMigration } = require('./helpers/migration-file');
 
 const PHE = readMigration('2026-08-17-phe-team-read-indexes.sql');
 const jobTx = () => artifactsOf(PHE).find((a) => a.index === 'idx_job_tx_job');
+const manager = () => artifactsOf(PHE).find((a) => a.index === 'idx_efr_manager_active');
 const stat = (table, index, ...cols) => cols.map((column, i) => ({ table, index, column, seq: i + 1 }));
 
-test('the real guarded ADD carries its column prefix; unguarded ADD / CREATE INDEX do not', () => {
+test('the real guarded ADD carries its guard; unguarded ADD / CREATE INDEX do not', () => {
   // Locating the subject: without this, every probe test below could pass on nothing.
-  assert.deepEqual(jobTx(), { kind: 'index', table: 'tbl_job_transaction', index: 'idx_job_tx_job', columns: 'fk_job_id' });
-  const guardedCount = artifactsOf(PHE).filter((a) => a.kind === 'index' && a.columns).length;
-  assert.equal(guardedCount, 8, 'every ADD in that file is prefix-guarded');
-  assert.equal(find('ALTER TABLE t ADD INDEX idx_a (a);', 'index')[0].columns, undefined);
-  assert.equal(find('CREATE INDEX idx_a ON t (a);', 'index')[0].columns, undefined);
+  assert.deepEqual(jobTx(), {
+    kind: 'index', table: 'tbl_job_transaction', index: 'idx_job_tx_job',
+    accepts: { exact: ['fk_job_id'], prefixes: ['fk_job_id'] },
+  });
+  assert.deepEqual(manager().accepts, {
+    exact: ['efr_manager_id,efr_status', 'efr_manager_id,efr_status,efr_id'],
+    prefixes: ['efr_manager_id,efr_status,efr_id'],
+  }, 'the IN list is mirrored entry by entry');
+  const guardedCount = artifactsOf(PHE).filter((a) => a.kind === 'index' && a.accepts).length;
+  assert.equal(guardedCount, 8, 'every ADD in that file is guarded');
+  assert.equal(find('ALTER TABLE t ADD INDEX idx_a (a);', 'index')[0].accepts, undefined);
+  assert.equal(find('CREATE INDEX idx_a ON t (a);', 'index')[0].accepts, undefined);
+});
+
+/* A guard with a HAVING term the checker cannot mirror falls back to the name probe. */
+const withHaving = (having) => `
+  SET @has_g = (SELECT COUNT(*) FROM (SELECT index_name FROM information_schema.statistics
+    WHERE table_schema = DATABASE() AND table_name = 't' GROUP BY index_name
+    HAVING ${having}) equivalent_index);
+  SET @ddl_g = IF(@has_g = 0, 'ALTER TABLE t ADD INDEX idx_ab (a, b)', 'SELECT 1');`;
+
+test('an unmirrorable guard term drops the artifact back to the name probe', () => {
+  const gc = 'GROUP_CONCAT(column_name ORDER BY seq_in_index)';
+  // Control: the plain shape IS mirrored, so the fallbacks below are not vacuous.
+  assert.deepEqual(find(withHaving(`${gc} = 'a,b' OR ${gc} LIKE 'a,b,%'`), 'index')[0].accepts,
+    { exact: ['a,b'], prefixes: ['a,b'] });
+  for (const having of [
+    `${gc} = 'a,b' AND MAX(non_unique) = 0`,
+    `${gc} LIKE '%a,b%'`,
+    'COUNT(*) > 0',
+  ]) {
+    assert.equal(find(withHaving(having), 'index')[0].accepts, undefined, having);
+  }
+  // Guard on a different table than the ADD: not its guard.
+  assert.equal(find(withHaving(`${gc} = 'a,b'`).replace("table_name = 't'", "table_name = 'u'"), 'index')[0].accepts, undefined);
 });
 
 test('a guarded UNIQUE ADD keeps the name probe (a non-unique twin is not the constraint)', () => {
@@ -313,4 +344,18 @@ test('plain CREATE INDEX stays name-based: an equivalent index under another nam
   assert.equal((await probe(a)).present, false);
   statistics = stat('tbl_job_transaction', 'idx_a', 'fk_job_id');
   assert.equal((await probe(a)).present, true);
+});
+
+test('the guard\'s IN list is honoured: a shorter listed index counts, an unlisted one does not', async () => {
+  statistics = stat('tbl_easyfixer', 'idx_mgr', 'efr_manager_id', 'efr_status');
+  assert.equal((await probe(manager())).present, true, 'IN (\'efr_manager_id,efr_status\', …)');
+  const absent = {
+    'shorter than any IN entry': stat('tbl_easyfixer', 'idx_mgr', 'efr_manager_id'),
+    // An IN entry is exact: it must not be widened into a prefix.
+    'extends an IN entry that is not the LIKE prefix': stat('tbl_easyfixer', 'idx_mgr', 'efr_manager_id', 'efr_status', 'efr_name'),
+  };
+  for (const [label, rows] of Object.entries(absent)) {
+    statistics = rows;
+    assert.equal((await probe(manager())).present, false, label);
+  }
 });
