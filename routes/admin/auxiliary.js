@@ -196,9 +196,6 @@ router.patch('/training-videos/:id', validate(Joi.object({
   sub_title: Joi.string().max(255).allow('', null).optional(),
   sub_description: Joi.string().max(2000).allow('', null).optional(),
   video_url: Joi.string().max(500).allow('', null).optional(),
-  // Lets the technician app's progress pings be checked against real time
-  // (mobile-profile-extra.service::setTrainingPercentage). null clears it.
-  duration_seconds: Joi.number().integer().min(1).max(86400).allow(null).optional(),
 }).min(1)), async (req, res, next) => {
   try {
     /*
@@ -224,10 +221,6 @@ router.patch('/training-videos/:id', validate(Joi.object({
       sets.push(`${field} = ?`);
       params.push(req.body[field] === '' ? null : req.body[field]);
     }
-    if (req.body.duration_seconds !== undefined && (await lms.lmsFlagColumns()).videoDuration) {
-      sets.push('duration_seconds = ?');
-      params.push(req.body.duration_seconds);
-    }
     logger.info('Update training video · id=' + req.params.id + ' · fields=' + sets.length);
     // A link-only edit leaves `sets` empty; setVideoLink already 404s on an
     // unknown id, so there is nothing left to do and an empty SET would throw.
@@ -248,7 +241,6 @@ router.post('/training-videos', validate(Joi.object({
   sub_description: Joi.string().max(2000).allow('', null).optional(),
   // Stored via the legacy document row, not as a column here — see setVideoLink.
   video_url: Joi.string().max(500).allow('', null).optional(),
-  duration_seconds: Joi.number().integer().min(1).max(86400).allow(null).optional(),
 })), async (req, res, next) => {
   try {
     logger.info('Add training video · title=' + req.body.title);
@@ -261,8 +253,7 @@ router.post('/training-videos', validate(Joi.object({
     if (String(req.body.video_url || '').trim() && !lms.parseYouTubeUrl(req.body.video_url)) {
       return modernError(res, 400, 'video link must be a YouTube URL');
     }
-    const { videoGlobal, videoDuration } = await lms.lmsFlagColumns();
-    const withDuration = videoDuration && req.body.duration_seconds != null;
+    const { videoGlobal } = await lms.lmsFlagColumns();
     const [ins] = await pool.query(
       /*
        * is_global = 0. A catalogue row created here is CONTENT; it becomes
@@ -277,11 +268,10 @@ router.post('/training-videos', validate(Joi.object({
       // pre-migration (there is no column to default) and unsafe after — the
       // DEFAULT is 1, so a dropped column here would make every new video
       // globally mandatory. lms.lmsFlagColumns() is what tells the two apart.
-      `INSERT INTO training_videos (title, description, sub_title, sub_description${videoGlobal ? ', is_global' : ''}${withDuration ? ', duration_seconds' : ''})
-       VALUES (?, ?, ?, ?${videoGlobal ? ', 0' : ''}${withDuration ? ', ?' : ''})`,
+      `INSERT INTO training_videos (title, description, sub_title, sub_description${videoGlobal ? ', is_global' : ''})
+       VALUES (?, ?, ?, ?${videoGlobal ? ', 0' : ''})`,
       [req.body.title, req.body.description || null,
-       req.body.sub_title || null, req.body.sub_description || null,
-       ...(withDuration ? [req.body.duration_seconds] : [])]
+       req.body.sub_title || null, req.body.sub_description || null]
     );
     if (String(req.body.video_url || '').trim()) {
       await lms.setVideoLink(ins.insertId, req.body.video_url, req.user?.user_id ?? null);

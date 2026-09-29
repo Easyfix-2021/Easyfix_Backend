@@ -100,15 +100,6 @@ const LMS_FLAG_COLUMNS = Object.freeze([
    * until someone runs the SQL.
    */
   ['lms_assessment', 'created_by'],
-  /*
-   * The watch-time check (mobile-profile-extra.service::setTrainingPercentage,
-   * migrations/2026-09-29-training-watch-time.sql). Unlike the flags above,
-   * these default ABSENT on a failed probe: the progress upsert names
-   * first_watched_at, and a wrong "present" would 500 the one write every
-   * technician's training depends on. A wrong "absent" only skips the check.
-   */
-  ['easyfixer_watched_video', 'first_watched_at'],
-  ['training_videos', 'duration_seconds'],
 ]);
 
 let _flagCache = null;
@@ -122,10 +113,7 @@ async function lmsFlagColumns() {
 
   // One round trip for both, not one per column: this sits in front of the
   // course list and the technician's training screen.
-  const value = {
-    courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true,
-    watchFirstAt: false, videoDuration: false,
-  };
+  const value = { courseMandatory: true, videoGlobal: true, assessmentCreatedBy: true };
   try {
     const [rows] = await pool.query(
       `SELECT table_name AS t, column_name AS c
@@ -141,14 +129,12 @@ async function lmsFlagColumns() {
     value.courseMandatory = present.has('courses.is_mandatory');
     value.videoGlobal = present.has('training_videos.is_global');
     value.assessmentCreatedBy = present.has('lms_assessment.created_by');
-    value.watchFirstAt = present.has('easyfixer_watched_video.first_watched_at');
-    value.videoDuration = present.has('training_videos.duration_seconds');
     const missing = LMS_FLAG_COLUMNS
       .filter(([t, c]) => !present.has(`${t}.${c}`))
       .map(([t, c]) => `${t}.${c}`);
     if (missing.length) {
       logger.warn('LMS schema probe · missing ' + missing.join(', ')
-        + ' — treating as absent until its migration runs (see LMS_FLAG_COLUMNS)');
+        + ' — treating the flag as 0 (run 2026-08-26-lms-mandatory-flags.sql)');
     }
     _flagCache = { value, checkedAt: now, stable: !missing.length };
   } catch (e) {
@@ -897,11 +883,9 @@ async function listVideos({ q, limit = 200, offset = 0 } = {}) {
    * so a row whose document is missing or mistyped still returns with a null
    * url instead of vanishing from the catalogue.
    */
-  const { videoDuration } = await lmsFlagColumns();
   const [rows] = await pool.query(
     `SELECT tv.id, tv.title, tv.description, tv.sub_title, tv.sub_description,
             tv.training_video_id, d.url AS video_url,
-            ${videoDuration ? 'tv.duration_seconds' : 'NULL AS duration_seconds'},
             (SELECT COUNT(*) FROM easyfixer_watched_video w WHERE w.video_id = tv.id) AS progress_count,
             (SELECT COUNT(*) FROM lms_content lc
               WHERE lc.kind = 'video' AND lc.ref_id = tv.id AND lc.status = 1) AS course_count
