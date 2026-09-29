@@ -62,7 +62,8 @@ async function resolveRecordingKey(jobCallerInfoId) {
       [jobCallerInfoId],
     );
     if (!row) return { key: null, reason: 'call_not_found' };
-    if (row.recording && /^https?:\/\//i.test(String(row.recording))) {
+    // (https?:)? — real Kaleyra rows are protocol-relative: '//play.solutionsinfini.com/…'.
+    if (row.recording && /^(https?:)?\/\//i.test(String(row.recording))) {
       return { key: null, reason: 'recording_external' };
     }
     if (!s3.isEnabled()) return { key: null, reason: 's3_not_configured' };
