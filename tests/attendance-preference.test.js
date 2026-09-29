@@ -141,3 +141,18 @@ test('an invalid day in Edit User rejects the whole edit before any write', asyn
     (e) => e.status === 400);
   assert.equal(writes(/UPDATE tbl_user SET|INSERT/i).length, 0, 'nothing may be half-applied');
 });
+
+// ── 5. SHIFT: 30-minute slots, 10:00 by default ─────────────────────────
+test('a shift off the :00/:30 grid is rejected; slot times are accepted', () => {
+  assert.throws(() => pref.normalisePreference({ ...ALL_PR, default_shift_start: '09:45' }), (e) => e.status === 400);
+  assert.equal(pref.normalisePreference({ ...ALL_PR, default_shift_start: '09:30' }).values.default_shift_start, '09:30');
+  assert.equal(pref.normalisePreference({ ...ALL_PR, default_shift_start: '11:00:00' }).values.default_shift_start, '11:00');
+});
+
+test('no shift sent → 10:00; a stored NULL shift reads back as 10:00', async () => {
+  reset();
+  assert.equal(pref.normalisePreference({ ...ALL_PR }).values.default_shift_start, '10:00');
+  assert.equal(pref.defaultPreference().default_shift_start, '10:00');
+  storedPref = storedRow({ ...ALL_PR });                       // default_shift_start: null in the row
+  assert.equal((await pref.loadPreference(501)).default_shift_start, '10:00');
+});

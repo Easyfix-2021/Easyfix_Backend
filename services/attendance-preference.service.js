@@ -21,6 +21,12 @@ const DAY_TYPES = Object.freeze(['PR', 'WO']);
 // Index 0 = Monday. JS Date#getDay() is 0 = Sunday — convert with dayKeyOfDate().
 const DAY_KEYS = Object.freeze(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']);
 const DEFAULT_DAYS = Object.freeze(Object.fromEntries(DAY_KEYS.map((d) => [d, 'PR'])));
+/*
+ * Everyone's shift unless set otherwise (owner, 2026-09-29). Applied on READ to
+ * rows whose column is NULL too, so no backfill is needed. Shifts are 30-minute
+ * slots only (:00 / :30) — the CRM picker offers nothing else.
+ */
+const DEFAULT_SHIFT = '10:00';
 
 const MIGRATION_HINT = 'apply migrations/2026-09-29-employee-roster-01-tables.sql';
 
@@ -44,6 +50,13 @@ function toHhMm(v) {
   return m ? `${m[1]}:${m[2]}` : undefined;
 }
 
+/** Like toHhMm, but only the 30-minute slots a shift may start on ('undefined' = invalid). */
+function toShift(v) {
+  const s = toHhMm(v);
+  if (s === undefined || s === null) return s;
+  return s.endsWith(':00') || s.endsWith(':30') ? s : undefined;
+}
+
 function workingDays(days) {
   return DAY_KEYS.filter((k) => days[k] !== 'WO').length;
 }
@@ -64,15 +77,15 @@ function normalisePreference(raw) {
     values[k] = v;
   }
   if (workingDays(values) === 0) throw mkErr(400, 'Select at least one working day');
-  const shift = toHhMm(raw.default_shift_start);
-  if (shift === undefined) throw mkErr(400, 'attendance_preference.default_shift_start must be HH:MM');
-  values.default_shift_start = shift;
+  const shift = toShift(raw.default_shift_start);
+  if (shift === undefined) throw mkErr(400, 'attendance_preference.default_shift_start must be a :00 or :30 time (HH:MM)');
+  values.default_shift_start = shift || DEFAULT_SHIFT;
   return { values };
 }
 
 function rowToPreference(r) {
   const days = Object.fromEntries(DAY_KEYS.map((k) => [k, r[k] === 'WO' ? 'WO' : 'PR']));
-  return { ...days, default_shift_start: toHhMm(r.default_shift_start) ?? null, working_days: workingDays(days) };
+  return { ...days, default_shift_start: toHhMm(r.default_shift_start) || DEFAULT_SHIFT, working_days: workingDays(days) };
 }
 
 /*
@@ -105,7 +118,7 @@ async function loadPreference(userId, runner = pool) {
 
 /** The preference a user without a row is treated as having. */
 function defaultPreference() {
-  return { ...DEFAULT_DAYS, default_shift_start: null, working_days: DAY_KEYS.length };
+  return { ...DEFAULT_DAYS, default_shift_start: DEFAULT_SHIFT, working_days: DAY_KEYS.length };
 }
 
 /*
@@ -216,6 +229,8 @@ async function ensurePreferenceRow(userId, empCode, runner = pool) {
 module.exports = {
   DAY_TYPES,
   DAY_KEYS,
+  DEFAULT_SHIFT,
+  toShift,
   dayKeyOfDate,
   toHhMm,
   workingDays,
