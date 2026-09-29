@@ -143,7 +143,10 @@ const setCourseContentBody = Joi.object({
   items: Joi.array().items(Joi.object({
     kind: Joi.string().valid(...svc.CONTENT_KINDS).required(),
     ref_id: Joi.number().integer().positive().required(),
-  })).max(100).required(),
+  // min(1): a course with no content can never be completed, so saving one
+  // empty is refused — the CRM blocks it too, this is the authority.
+  })).min(1).max(100).required()
+    .messages({ 'array.min': 'add at least one video, document or assessment to the course' }),
 });
 
 // ─── Documents ───────────────────────────────────────────────────────

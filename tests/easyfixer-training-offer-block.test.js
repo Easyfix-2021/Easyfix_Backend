@@ -42,6 +42,10 @@ const fake = installFakePool([
     () => [{ n: trainingColumnsPresent }]],
   // probeLifecycleSchema(): pretend the lifecycle migration IS installed, so
   // the predicate under test is the reconciled one production runs.
+  // lms.lmsFlagColumns(): courses.is_mandatory present, so the fragment carries
+  // the real mandatory predicate rather than its `1=0` degradation.
+  [/information_schema\.columns[\s\S]*table_name = \?/i,
+    () => [{ t: 'courses', c: 'is_mandatory' }]],
   [/tbl_easyfixer_lifecycle_status_log/i,
     () => [{ column_count: 6, history_count: 1 }]],
 ]);
@@ -61,7 +65,10 @@ const offerableRow = (extra = {}) => ({
   ...extra,
 });
 
-const resetProbes = () => lifecycle._internals.resetSchemaProbeForTests();
+const resetProbes = () => {
+  lifecycle._internals.resetSchemaProbeForTests();
+  require('../services/lms.service').invalidateLmsSchemaCache();
+};
 
 test('an overdue-training technician cannot be offered a new job', async () => {
   trainingColumnsPresent = 2;
@@ -149,6 +156,11 @@ test('readProjection ships the column the offer gate decides from', async () => 
   assert.match(projection, /ec\.completion_date IS NULL/);
   assert.match(projection, /ec\.due_date IS NOT NULL/);
   assert.match(projection, /ec\.due_date < '\d{4}-\d{2}-\d{2}'/);
+  // ONLY a mandatory, active course with content blocks (efr 3687: an optional
+  // "Deepskill" assignment with a lapsed deadline blocked his offers).
+  assert.match(projection, /c\.is_mandatory = 1/);
+  assert.match(projection, /c\.status = 1/);
+  assert.match(projection, /FROM lms_content lc WHERE lc\.course_id = ec\.course_id/);
 });
 
 test('sqlPredicate carries the same condition, so lists and the row gate agree', async () => {
@@ -161,7 +173,7 @@ test('sqlPredicate carries the same condition, so lists and the row gate agree',
   assert.match(predicate, /FROM easyfixer_courses ec/);
   // Both halves are generated from lifecycle.overdueTrainingSql(), so they
   // cannot drift into disagreeing about who is overdue.
-  assert.ok(predicate.includes(lifecycle.overdueTrainingSql('e')));
+  assert.ok(predicate.includes(await lifecycle.overdueTrainingSql('e')));
 });
 
 test('a database without the training-deadline migration blocks nobody', async () => {
