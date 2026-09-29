@@ -51,12 +51,18 @@ const CALL_OUT = 5001;        // OUT, placed by OWNER_ID, attached to JOB_ID
 const CALL_IN = 5002;         // IN, caller_id happens to equal OWNER_ID
 const CALL_NO_JOB = 5003;     // OUT by someone else, job_id NULL
 const CALL_JOB_ZERO = 5004;   // OUT by someone else, legacy job_id = 0 sentinel
+// The shape Prod actually stores (job 541099, 2026-09-29): provider NULL and a
+// PROTOCOL-RELATIVE Kaleyra URL. REC_URL above is an invented https:// value,
+// which is why an https-only check passed every test and failed every real Play.
+const CALL_KALEYRA_REAL = 5005;
+const REAL_KALEYRA_REC = '//play.solutionsinfini.com/?id=MTAwOTY2NDUwNzZh';
 
 const CALLS = {
   [CALL_OUT]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'OUT' },
   [CALL_IN]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'IN' },
   [CALL_NO_JOB]: { job_id: null, caller_id: 999, call_type: 'OUT' },
   [CALL_JOB_ZERO]: { job_id: 0, caller_id: 999, call_type: 'OUT' },
+  [CALL_KALEYRA_REAL]: { job_id: JOB_ID, caller_id: OWNER_ID, call_type: 'OUT', provider: null, recording: REAL_KALEYRA_REC },
 };
 
 /* Zonal Field Team, NOT Admin. SCOPE_BYPASS_ROLES = {Admin, Finance}, so a
@@ -84,8 +90,9 @@ const fake = installFakePool([
     const c = CALLS[Number(params?.[0])];
     if (!c) return [];
     return [{
-      id: Number(params[0]), ...c,
+      id: Number(params[0]),
       provider: 'kaleyra', unique_id: 'uuid-' + params[0], recording: REC_URL,
+      ...c,
     }];
   }],
   [/FROM tbl_job j/i, (sql, params) => (Number(params?.[0]) === JOB_ID
@@ -185,6 +192,13 @@ test('POSITIVE CONTROL — the same inbound row IS audible once its job is in sc
   as(OWNER_ID, { scope: scope(allowClients(JOB_CLIENT)) });
   const { status, body } = await recording(CALL_IN);
   assert.equal(status, 200, JSON.stringify(body));
+});
+
+test('a REAL Kaleyra row (protocol-relative URL, provider NULL) plays, as https', async () => {
+  as(OWNER_ID);
+  const { status, body } = await recording(CALL_KALEYRA_REAL);
+  assert.equal(status, 200, JSON.stringify(body));
+  assert.equal(body.data.url, 'https:' + REAL_KALEYRA_REC);
 });
 
 // ─── The job-scope arm ────────────────────────────────────────────────
