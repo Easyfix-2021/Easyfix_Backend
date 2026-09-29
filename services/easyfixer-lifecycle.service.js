@@ -555,6 +555,39 @@ function assertFinalActivationEligible(row = {}) {
   }
 }
 
+/*
+ * NO ACTIVATION OUT OF TRAINING_PENDING UNTIL MANDATORY TRAINING IS DONE.
+ *
+ * Called from transition() — the only writer of lifecycle_status — whenever the
+ * target is work-enabled and the STORED status is TRAINING_PENDING, so every
+ * activation path (activateFromVerification, syncFromVerificationFlagsAtomic)
+ * meets it; CRM/LEGACY/CRON cannot leave an onboarding state for work at all
+ * (assertTransition). Keyed on the STORED column, not the read-time reconciled
+ * status, which already reads a legacy-bit-flipped TRAINING_PENDING as ACTIVE.
+ *
+ * "Complete" is the app's own definition — fetchTrainingCompletedTime, what the
+ * registration screen shows (every MANDATORY item done). Since 2026-09-28 the
+ * same definition also decides entry into TRAINING_PENDING (Gate 1) and the
+ * automatic exit (lms.settleTrainingCompletion); lms.isTrainingComplete (all
+ * ASSIGNED courses) no longer decides either. It returns null on a failed lookup
+ * or an empty mandatory set: fail closed.
+ *
+ * Scoped to TRAINING_PENDING on purpose: technicians already working were never
+ * routed through it, and a blanket rule would reach every one of them (about
+ * 15% of QA's active technicians have not finished the mandatory video).
+ */
+async function assertMandatoryTrainingComplete(efrId) {
+  // Lazy: mobile-registration.service requires this module at load time.
+  const { fetchTrainingCompletedTime } = require('./mobile-registration.service');
+  if (await fetchTrainingCompletedTime(efrId)) return;
+  const error = httpError(
+    409,
+    'Mandatory training is not complete yet — the technician must finish it before activation.',
+  );
+  error.code = 'MANDATORY_TRAINING_INCOMPLETE';
+  throw error;
+}
+
 function assertVerificationActivationSourceAllowed(row = {}) {
   const status = lifecycleFromRow(row).status;
   if (['PAUSED', 'INACTIVE', 'BLACKLISTED', 'DORMANT', 'SUSPENDED', 'OFFLINE', 'ON_BENCH']
@@ -1449,6 +1482,10 @@ async function transition(efrId, input = {}, actor = null) {
           && input._willVerify !== true) {
         throw httpError(409, `${target} requires a verified technician`);
       }
+      if (WORK_ENABLED.has(target)
+          && normalizeStatus(row.lifecycle_status) === 'TRAINING_PENDING') {
+        await assertMandatoryTrainingComplete(id);
+      }
 
       if (typeof input._beforeUpdate === 'function') {
         await input._beforeUpdate(conn, row);
@@ -1725,12 +1762,22 @@ async function finalizeMobileRegistrationGate1(efrId) {
       } catch (e) {
         logger.warn({ err: e.message, efrId }, 'gate1: mandatory course assignment failed');
       }
-      const training = await lms.isTrainingComplete(efrId);
+      /*
+       * ONE definition of "training complete" (owner, 2026-09-28): the app's
+       * own, fetchTrainingCompletedTime — every MANDATORY item done. This used
+       * lms.isTrainingComplete (ASSIGNED courses), so with no mandatory course
+       * assigned a registrant skipped TRAINING_PENDING entirely and could be
+       * activated with the mandatory video unwatched. Fails closed (null on an
+       * empty set or a failed lookup), as that function documents.
+       */
+      // Lazy: mobile-registration.service requires this module at load time.
+      const { fetchTrainingCompletedTime } = require('./mobile-registration.service');
+      const trainingDone = !!(await fetchTrainingCompletedTime(efrId));
       const decision = resolveGate1Finalization(current.status, {
         personal_submitted: row.user_is_personal_detail_filled,
         adhaar_card_number: row.adhaar_card_number,
         efr_profile_img: row.efr_profile_img,
-      }, training.required > 0 && !training.complete);
+      }, !trainingDone);
       clearIdentityRejection = decision.clearIdentityRejection;
       return decision.target;
     },

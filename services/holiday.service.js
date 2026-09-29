@@ -166,4 +166,18 @@ function formatLocalDateStr(d) {
   return `${y}-${m}-${day}`;
 }
 
-module.exports = { getUpcoming };
+/*
+ * Holidays between two calendar dates inclusive ('YYYY-MM-DD'), any span —
+ * for the Team Roster grid, which plans up to ~3 months ahead and so cannot
+ * use getUpcoming (today-anchored, capped at 30 days). Synchronous: the data
+ * is the static table above.
+ */
+function getRange({ from, to }) {
+  const out = [];
+  for (let y = Number(String(from).slice(0, 4)); y <= Number(String(to).slice(0, 4)); y++) {
+    for (const r of getYear(y)) if (r.date >= from && r.date <= to) out.push({ date: r.date, name: r.name });
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
+}
+
+module.exports = { getUpcoming, getRange };

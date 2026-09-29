@@ -92,9 +92,25 @@ test('identity documents are fill-only: a stored image is kept, a blank one is f
 /* ─── The SQL of every identity writer: fill-only, and update_date moves ── */
 
 /** Every `<col> = …` assignment for `col` inside UPDATE tbl_easyfixer statements. */
+/*
+ * mobile-identity builds its SET list in `identitySetSql`: a replace branch
+ * that runs ONLY after a CRM rejection (identity_review === 2, owner
+ * 2026-09-29) and the fill-only branch every other save uses. The fill-only
+ * rule is asserted on the fill-only branch; the replace branch has its own
+ * test below.
+ */
+function identitySetBranches(src) {
+  const m = src.match(/const identitySetSql = replaceRejected\s*\?\s*`([\s\S]*?)`\s*:\s*`([\s\S]*?)`;/);
+  return m ? { replace: m[1], fillOnly: m[2] } : null;
+}
+
 function assignments(src, col) {
   const out = [];
-  for (const m of src.matchAll(/UPDATE tbl_easyfixer\b[\s\S]*?WHERE/g)) {
+  const branches = identitySetBranches(src);
+  const bodies = branches
+    ? [`UPDATE tbl_easyfixer SET ${branches.fillOnly} WHERE`, src.replace(/const identitySetSql = [\s\S]*?`;\n/, '')]
+    : [src];
+  for (const body of bodies) for (const m of body.matchAll(/UPDATE tbl_easyfixer\b[\s\S]*?WHERE/g)) {
     for (const a of m[0].matchAll(new RegExp(`\\b${col}\\s*=\\s*([^\\n]+)`, 'g'))) out.push(a[1].trim());
   }
   return out;
@@ -122,6 +138,17 @@ test('identity columns are never assigned `COALESCE(?, col)` (overwrite) on the 
     }
   }
   assert.ok(checked >= 13, `checked ${checked} identity assignments`);
+});
+
+test('the replace branch runs ONLY after a CRM rejection (Fix and Resubmit)', () => {
+  const src = read('services/mobile-identity.service.js');
+  const branches = identitySetBranches(src);
+  assert.ok(branches, 'identitySetSql with a replace and a fill-only branch');
+  assert.match(branches.replace, /efr_name\s*=\s*COALESCE\(\?, efr_name\)/, 'rejected: the resubmitted name replaces the rejected one');
+  assert.match(src, /const replaceRejected = Number\(reviewRow\?\.identity_review\) === 2;/,
+    'the replace branch is gated on is_identity_details_verified_by_crm = 2 and nothing else');
+  assert.match(src, /identity_review FROM tbl_easyfixer WHERE efr_id = \? FOR UPDATE/, 'read under the save\'s row lock');
+  assert.match(src, /\{ fillOnly: !replaceRejected \}/, 'documents follow the same rule');
 });
 
 test('a masked Aadhaar and an invalid PAN count as missing (the app can complete them)', () => {

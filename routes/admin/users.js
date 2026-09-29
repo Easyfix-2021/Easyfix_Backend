@@ -32,6 +32,20 @@ const logger = require('../../logger');
 const allowedStagesField = Joi.array().items(Joi.string().valid(...STAGE_KEYS)).allow(null).optional();
 
 /*
+ * Weekly working days (services/attendance-preference.service.js). All seven days
+ * are required when the object is sent; working_days is NOT accepted — it is
+ * derived from the days server-side (an echoed value is stripped by validate()'s
+ * stripUnknown). REQUIRED to be listed here at all: validate() strips unknown
+ * keys, so an unlisted field would be dropped silently and the save still "succeed".
+ */
+const dayType = Joi.string().valid('PR', 'WO').required();
+const attendancePreferenceField = Joi.object({
+  monday: dayType, tuesday: dayType, wednesday: dayType, thursday: dayType,
+  friday: dayType, saturday: dayType, sunday: dayType,
+  default_shift_start: Joi.string().trim().pattern(/^([01]\d|2[0-3]):(00|30)(:00)?$/).allow('', null).optional(),
+}).allow(null).optional();
+
+/*
  * PERSONAL EMAIL — stored in tbl_user_personal_details (an EasyFix-owned side
  * table; tbl_user is legacy and must not gain columns). It is where the
  * "your EasyFix account is ready" credential mail goes, because a brand-new
@@ -153,6 +167,7 @@ const createBody = Joi.object({
   manage_verticals:  Joi.string().allow('', null).optional(),
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   allowed_stages:    allowedStagesField,
+  attendance_preference: attendancePreferenceField,
   personal_email:    personalEmailCreateField,
   /*
    * ── HR MASTER-DATA IDENTIFIERS ────────────────────────────────────
@@ -186,6 +201,7 @@ const updateBody = Joi.object({
   reporting_manager: Joi.number().integer().positive().allow(null).optional(),
   is_active:         Joi.boolean().optional(),
   allowed_stages:    allowedStagesField,
+  attendance_preference: attendancePreferenceField,
   personal_email:    personalEmailUpdateField,
   /*
    * ── HR MASTER-DATA IDENTIFIERS ────────────────────────────────────

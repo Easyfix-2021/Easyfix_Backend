@@ -13,9 +13,16 @@ const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
 
+const crypto = require('node:crypto');
 const sophy = require('../services/sophy.service');
+const aiCheck = require('../services/aadhaar-ai-check.service');
 
 const originalChatVision = sophy.chatVision;
+const originalRecordCheck = aiCheck.recordCheck;
+// The route records every completed check; stubbed at the module boundary so
+// this stays a no-DB wire test. services/aadhaar-ai-check.service.js has its own.
+let recorded = [];
+let recordError = null;
 const originalKey = process.env.SOPHY_API_KEY_AADHAAR_OCR;
 
 let visionCalls = [];
@@ -25,6 +32,11 @@ let baseUrl;
 
 before(async () => {
   sophy.chatVision = async (args) => { visionCalls.push(args); return visionReply; };
+  aiCheck.recordCheck = async (efrId, input) => {
+    if (recordError) throw recordError;
+    recorded.push({ efrId, ...input });
+    return { id: recorded.length };
+  };
   // eslint-disable-next-line global-require
   const router = require('../routes/mobile/kyc');
   const app = express();
@@ -38,22 +50,25 @@ before(async () => {
 
 after(async () => {
   sophy.chatVision = originalChatVision;
+  aiCheck.recordCheck = originalRecordCheck;
   if (originalKey === undefined) delete process.env.SOPHY_API_KEY_AADHAAR_OCR;
   else process.env.SOPHY_API_KEY_AADHAAR_OCR = originalKey;
   if (server) await new Promise((resolve) => server.close(resolve));
 });
 
-beforeEach(() => { visionCalls = []; visionReply = null; });
+beforeEach(() => { visionCalls = []; visionReply = null; recorded = []; recordError = null; });
 
 function image(bytes = 'jpeg-bytes') {
   return new Blob([Buffer.from(bytes)], { type: 'image/jpeg' });
 }
 
-async function post({ front = image(), back = image('back-bytes'), name } = {}) {
+async function post({ front = image(), back = image('back-bytes'), name, aadhaarNumber, dob } = {}) {
   const form = new FormData();
   if (front) form.append('front', front, 'front.jpg');
   if (back) form.append('back', back, 'back.jpg');
   if (name !== undefined) form.append('name', name);
+  if (aadhaarNumber !== undefined) form.append('aadhaarNumber', aadhaarNumber);
+  if (dob !== undefined) form.append('dob', dob);
   const res = await fetch(`${baseUrl}/kyc/aadhaar-ocr`, { method: 'POST', body: form });
   return { status: res.status, body: await res.json() };
 }
@@ -208,4 +223,29 @@ test('a genuine third-gender card still reads as O', async () => {
     const out = await post();
     assert.equal(out.body.data.extracted.gender, code, `gender "${printed}" → ${code}`);
   }
+});
+
+test('every completed check is recorded with the photo bytes and typed inputs; the reason never reaches the wire', async () => {
+  delete process.env.SOPHY_API_KEY_AADHAAR_OCR;
+  const out = await post({ name: 'Ramesh Kumar', aadhaarNumber: '234567890123', dob: '1990-04-17' });
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body.data, { available: false, extracted: null, nameMatch: null });
+  assert.equal(recorded.length, 1);
+  const [r] = recorded;
+  assert.equal(r.efrId, 8379);
+  assert.deepEqual(r.typed, { name: 'Ramesh Kumar', aadhaarNumber: '234567890123', dob: '1990-04-17' });
+  assert.equal(r.ocr.reason, 'not_configured');
+  const md5 = (b) => crypto.createHash('md5').update(b).digest('hex');
+  assert.equal(md5(r.front), md5(Buffer.from('jpeg-bytes')));
+  assert.equal(md5(r.back), md5(Buffer.from('back-bytes')));
+});
+
+test('a bad request records nothing, and a failed record is a 500 — never a silent 200', async () => {
+  process.env.SOPHY_API_KEY_AADHAAR_OCR = 'mw_live_test';
+  await post({ back: null });
+  assert.equal(recorded.length, 0);
+  recordError = new Error('db down');
+  visionReply = '{"name":"Ramesh Kumar"}';
+  const out = await post({ name: 'Ramesh Kumar' });
+  assert.equal(out.status, 500);
 });

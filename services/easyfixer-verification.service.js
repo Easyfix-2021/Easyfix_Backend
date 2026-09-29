@@ -3,6 +3,7 @@ const deepSkillService = require('./deep-skill.service');
 const logger = require('../logger');
 const registrationStatusPush = require('./registration-status-push.service');
 const lifecycle = require('./easyfixer-lifecycle.service');
+const aadhaarAiCheck = require('./aadhaar-ai-check.service');
 const {
   mapAadhaarUniqueViolation,
   normalizeAadhaar,
@@ -216,7 +217,7 @@ async function getVerificationPage(efrId) {
   const [banking, banks, cities,
     leadComments, profComments, persComments,
     bankComments, idComments, actComments,
-    deepSkillCountRow, serviceablePincodesRow] = await Promise.all([
+    deepSkillCountRow, serviceablePincodesRow, identityAiCheck] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -235,6 +236,9 @@ async function getVerificationPage(efrId) {
       'SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ?',
       [efrId],
     ).then(([rows]) => rows[0] || { pincodes: '' }).catch((e) => { logger.warn({ efrId, err: e }, 'verification: serviceable pincodes read failed — rendering empty'); return { pincodes: '' }; }),
+    // The AI Aadhaar check behind the latest app identity save. Display only —
+    // a failed read renders "no check on record", never blocks the page.
+    aadhaarAiCheck.latestSubmitted(efrId).catch((e) => { logger.warn({ efrId, err: e }, 'verification: AI Aadhaar check read failed — rendering none'); return null; }),
   ]);
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
@@ -374,6 +378,9 @@ async function getVerificationPage(efrId) {
         // lands. Frontend currently shows the numbers + "not uploaded" hints.
         driving_lisence_img:    e.driving_lisence_img_name,
         rejected_reason:        e.send_back_to_tx_reason_crm,
+        // { verdict: verified|mismatch|not_run, status, reason, masked_number,
+        //   name_score, discrepancies[], checked_at, submitted_at } | null
+        ai_check:               identityAiCheck,
         updated_by_name:        e.update_details_by_user,
         update_date:            e.update_date,
         comments: idComments,

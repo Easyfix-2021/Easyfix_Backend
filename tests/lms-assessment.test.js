@@ -408,6 +408,10 @@ test('acknowledging the LAST item advances the lifecycle, exactly as a video doe
   const lifecycle = require('../services/easyfixer-lifecycle.service');
   const original = lifecycle.finalizeTrainingCompletion;
   lifecycle.finalizeTrainingCompletion = async () => { advanced += 1; return { changed: true, transitionedFrom: 'TRAINING_PENDING' }; };
+  // The exit decision is the app's definition (every MANDATORY item done).
+  const reg = require('../services/mobile-registration.service');
+  const originalDone = reg.fetchTrainingCompletedTime;
+  reg.fetchTrainingCompletedTime = async () => new Date('2026-09-28T10:00:00Z');
   scenario = [
     [ACK_LOOKUP, [{ id: 7, kind: 'document', course_id: 4 }]],
     [/INSERT INTO lms_document_ack/i, { affectedRows: 1 }],
@@ -418,10 +422,39 @@ test('acknowledging the LAST item advances the lifecycle, exactly as a video doe
     await lms.ackDocument(8379, 7);
   } finally {
     lifecycle.finalizeTrainingCompletion = original;
+    reg.fetchTrainingCompletedTime = originalDone;
   }
   assert.ok(call(STAMP), 'step 1 — the course is stamped complete');
-  assert.ok(call(TRAINING_COMPLETE), 'step 2 — and ALL training is probed');
   assert.equal(advanced, 1, 'step 3 — and the technician actually leaves TRAINING_PENDING');
+});
+
+/*
+ * One definition of "complete" (owner, 2026-09-28). All ASSIGNED courses done
+ * but a MANDATORY item unwatched must NOT leave TRAINING_PENDING — that exit
+ * then allowed activation with the mandatory video never seen.
+ */
+test('all assigned courses done but mandatory training incomplete → stays in TRAINING_PENDING', async () => {
+  fake.reset();
+  let advanced = 0;
+  const lifecycle = require('../services/easyfixer-lifecycle.service');
+  const reg = require('../services/mobile-registration.service');
+  const original = lifecycle.finalizeTrainingCompletion;
+  const originalDone = reg.fetchTrainingCompletedTime;
+  lifecycle.finalizeTrainingCompletion = async () => { advanced += 1; return { changed: true }; };
+  reg.fetchTrainingCompletedTime = async () => null;
+  scenario = [
+    [ACK_LOOKUP, [{ id: 7, kind: 'document', course_id: 4 }]],
+    [/INSERT INTO lms_document_ack/i, { affectedRows: 1 }],
+    [STAMP, { affectedRows: 1 }],
+    [TRAINING_COMPLETE, [{ required: 3, done: 3 }]],
+  ];
+  try {
+    await lms.ackDocument(8379, 7);
+  } finally {
+    lifecycle.finalizeTrainingCompletion = original;
+    reg.fetchTrainingCompletedTime = originalDone;
+  }
+  assert.equal(advanced, 0, 'mandatory item unwatched → no exit, whatever the assigned courses say');
 });
 
 test('a lifecycle failure never fails the acknowledgement itself', async () => {

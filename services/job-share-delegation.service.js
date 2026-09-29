@@ -76,7 +76,7 @@ const TERMINAL_STATUSES = Object.freeze(
 /* A job in one of these is finished — nothing left to delegate. Mirrors
  * job.service STATUS COMPLETED(3) / COMPLETED_ALT(5) / CANCELLED(6); imported
  * rather than retyped so a status renumber cannot silently diverge. */
-const { STATUS, delegationColsExist } = require('./job.service');
+const { STATUS, delegationColsExist, assertTechniciansCanReceiveJobs } = require('./job.service');
 const NON_SHAREABLE_JOB_STATUSES = new Set([
   STATUS.COMPLETED, STATUS.COMPLETED_ALT, STATUS.CANCELLED,
 ]);
@@ -199,9 +199,30 @@ async function applyTransition(share, to, { endReason = null, runner = pool } = 
 /* ─── Create ──────────────────────────────────────────────────────── */
 
 /*
+ * The delegate takes over the job, so he must pass the SAME gate as an offer,
+ * assign or accept (job.service.assertTechniciansCanReceiveJobs): lifecycle
+ * ACTIVE/UNDER_MASTER, efr_status 1, verified, not training-overdue. It
+ * subsumes the old bare efr_status check.
+ *
+ * Accept (the delegate asking) propagates the guard's own error — the 400 and
+ * message acceptOffer already shows the technician. Create (the SHARER asking)
+ * keeps its established 422 delegate_unavailable: the sharer is told the
+ * colleague is unavailable, never the colleague's lifecycle reason, which may
+ * be an internal CRM note.
+ */
+async function assertDelegateEligible(delegateEfrId, { asSharer = false } = {}) {
+  try {
+    await assertTechniciansCanReceiveJobs([delegateEfrId]);
+  } catch (e) {
+    if (!asSharer || !e || !e.status) throw e;
+    throw err(422, 'That technician is not available to take this job.', { code: 'delegate_unavailable' });
+  }
+}
+
+/*
  * The sharer must own a LIVE job. Any technician may share — there is no
- * allowlist. A delegate technician must exist, be active, and not be the
- * sharer himself.
+ * allowlist. A delegate technician must not be the sharer himself, and must
+ * pass the same work-eligibility gate as a job offer (assertDelegateEligible).
  *
  * 404 (not 403) when the job is not his: an ownership failure must not confirm
  * that a job id exists, matching every other /mobile/jobs ownership check.
@@ -226,13 +247,7 @@ async function createShare(jobId, sharerEfrId, { delegateEfrId = null, contactNa
     if (Number(delegateEfrId) === Number(sharerEfrId)) {
       throw err(400, 'You cannot share a job with yourself.', { code: 'share_self' });
     }
-    const [[delegate]] = await pool.query(
-      'SELECT efr_id, efr_status FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
-      [delegateEfrId],
-    );
-    if (!delegate || Number(delegate.efr_status) !== 1) {
-      throw err(422, 'That technician is not available to take this job.', { code: 'delegate_unavailable' });
-    }
+    await assertDelegateEligible(delegateEfrId, { asSharer: true });
   }
 
   const existing = await findLiveShare(jobId);
@@ -388,10 +403,13 @@ async function cancelShare(jobId, sharerEfrId) {
   return toShareJson(await applyTransition(share, 'cancelled', { endReason: 'sharer_cancelled' }), sharerEfrId);
 }
 
-/* Delegate only, pending only. */
+/* Delegate only, pending only. Eligibility is re-checked here, not trusted from
+ * create: accepting is the real hand-over, and the delegate may have been
+ * paused, benched or gone training-overdue since the share was made. */
 async function acceptShare(jobId, delegateEfrId) {
   const share = await requireLiveShare(jobId);
   if (Number(share.delegate_efr_id) !== Number(delegateEfrId)) throw err(404, 'This job is not shared with you.');
+  await assertDelegateEligible(delegateEfrId);
   return toShareJson(await applyTransition(share, 'accepted'), delegateEfrId);
 }
 
@@ -400,6 +418,9 @@ async function acceptShare(jobId, delegateEfrId) {
  * the phone with the OTP (services/job-share-guest.service.js) — there is no
  * Accept button for someone without the app. Pending → accepted; already
  * accepted/started is a no-op so a second device's verify is not a conflict.
+ *
+ * No assertDelegateEligible here, by the owner's decision: a contact is not a
+ * technician, so there is no lifecycle row to gate.
  */
 async function acceptByContact(shareId) {
   const share = await findShareById(shareId);

@@ -31,6 +31,7 @@ const fake = installFakePool([
     { t: 'courses', c: 'is_mandatory' },
     { t: 'training_videos', c: 'is_global' },
     { t: 'lms_assessment', c: 'created_by' },
+    { t: 'courses', c: 'is_system' },
   ]],
   // listRegistered destructures `[[{ total }]]` and registeredStatusCounts
   // `[[row]]`, so a bare [] would throw before any assertion could run.
@@ -99,14 +100,16 @@ test('the required set is what the APP LISTS, not only the mandatory subset', as
    * must not retro-gate technicians it was never assigned to.
    */
   for (const sql of [...await listSql(), ...await countsSql()]) {
-    assert.match(sql, /JOIN training_videos tv ON tv\.is_global = 1/);
+    // Everyone's arm is lms.globalVideoIdsSql(): the system course's videos,
+    // with is_global only as the pre-migration fallback (owner, 2026-09-29).
+    assert.match(sql, /JOIN \(\s*SELECT tv\.id FROM training_videos tv\s+WHERE tv\.is_global = 1\s+AND NOT EXISTS \(SELECT 1 FROM courses sc WHERE sc\.is_system = 1/);
     assert.match(sql, /JOIN easyfixer_courses ec\s+ON ec\.course_id = c\.id/);
     assert.match(sql, /c\.is_mandatory = 1/);
 
     const arms = requiredSetArms(sql);
-    assert.equal(arms.length, 3,
-      'three arms, one per arm of visibleVideoIdsSql(): global catalogue, '
-      + 'mandatory courses held, ANY course held');
+    assert.equal(arms.length, 4,
+      'four arms, one per arm of visibleVideoIdsSql(): global catalogue '
+      + '(legacy fallback + system course), mandatory courses held, ANY course held');
     const anyCourseArms = arms.filter(
       (a) => /easyfixer_courses/.test(a) && !/is_mandatory/.test(a));
     assert.equal(anyCourseArms.length, 1,

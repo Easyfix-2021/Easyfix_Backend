@@ -223,6 +223,9 @@ module.exports = {
   scrubDuplicateEntry,
   normalizeAadhaar,
   activeAadhaarLockName,
+  // Same key material, reused by services/aadhaar-ai-check.service.js for its
+  // input fingerprint — one secret decides every keyed Aadhaar hash.
+  aadhaarHmacKey: lockKeyMaterial,
   hasActiveAadhaarColumn,
   assertActiveAadhaarAvailable,
   withActiveAadhaarGuard,

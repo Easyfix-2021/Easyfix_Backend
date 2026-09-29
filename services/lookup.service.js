@@ -318,7 +318,21 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
       ORDER BY u.user_name ASC LIMIT ? OFFSET ?`,
     params
   );
-  logger.info(`Found ${rows.length} users`);
+  /*
+   * week_off_today — every "assign to user" picker reads this endpoint, so this
+   * one flag surfaces the Team Roster in all of them (services/roster.service.js
+   * weekOffSet: planned row, else weekly working days). FAIL-SOFT to false: a
+   * roster read error must never empty the picker, and "not on week off" is the
+   * safe default (it never hides anyone).
+   */
+  let off = new Set();
+  try {
+    off = await require('./roster.service').weekOffSet(rows.map((r) => Number(r.user_id)));
+  } catch (e) {
+    logger.warn('Lookup users · week-off flag skipped · ' + e.message);
+  }
+  for (const r of rows) r.week_off_today = off.has(Number(r.user_id));
+  logger.info(`Found ${rows.length} users · ${off.size} on week off today`);
   return rows;
 }
 
