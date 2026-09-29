@@ -210,6 +210,10 @@ const leadVerificationBody = Joi.object({
   personal_details_filled: Joi.number().integer().valid(0, 1, 2).required(),
   reason:     Joi.string().max(1000).allow('', null).optional(),
   efr_cityId: Joi.number().integer().positive().optional(),
+  // The vertical a technician is ONBOARDED for, recorded at Accept. Validated
+  // against tbl_vertical by the service before it is written; a positive
+  // integer is all this layer can honestly assert.
+  vertical_id: Joi.number().integer().positive().optional(),
 });
 
 const professionalBody = Joi.object({

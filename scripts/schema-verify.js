@@ -386,6 +386,12 @@ const EXPECTED = {
     // Insurance flags shown on the technician's own profile screen
     // (services/mobile-profile-extra.service.js). BIT(1) — see SCHEMA.md.
     'health_insurance', 'accidental_insurance',
+    // The vertical a technician was ONBOARDED for, written at Accept by
+    // services/easyfixer-verification.service.js (migrations/
+    // 2026-09-29-easyfixer-vertical.sql). Nothing gates work on it — a
+    // technician still takes jobs in any vertical — so losing the column
+    // breaks the verification page's read, not allocation.
+    'efr_vertical_id',
   ],
   tbl_idempotency_key: [
     'actor_type', 'actor_id', 'idempotency_key', 'method', 'path',

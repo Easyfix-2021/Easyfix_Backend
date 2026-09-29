@@ -87,6 +87,7 @@ async function getEasyfixerForVerification(efrId) {
         UB.user_name                    AS approved_by_user,
         UU.user_name                    AS update_details_by_user,
         ZM.user_name                    AS state_user,
+        VT.vertical_name                AS onboarded_vertical_name,
         EX.name                         AS experience_name
        FROM tbl_easyfixer E
        LEFT JOIN tbl_city  C  ON C.city_id  = E.efr_cityId
@@ -96,6 +97,7 @@ async function getEasyfixerForVerification(efrId) {
        LEFT JOIN tbl_user  UB ON UB.user_id = U.updated_by
        LEFT JOIN tbl_user  UU ON UU.user_id = E.updated_by
        LEFT JOIN experience EX ON EX.id     = E.experience_id
+       LEFT JOIN tbl_vertical VT ON VT.vertical_id = E.efr_vertical_id
       WHERE E.efr_id = ?
       LIMIT 1`,
     [efrId]
@@ -216,7 +218,8 @@ async function getVerificationPage(efrId) {
   const [banking, banks, cities,
     leadComments, profComments, persComments,
     bankComments, idComments, actComments,
-    deepSkillCountRow, serviceablePincodesRow] = await Promise.all([
+    deepSkillCountRow, serviceablePincodesRow,
+    mandatoryTrainingRows] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -235,9 +238,45 @@ async function getVerificationPage(efrId) {
       'SELECT pincodes FROM tbl_efr_serviceable_pincodes WHERE easyfixer_id = ?',
       [efrId],
     ).then(([rows]) => rows[0] || { pincodes: '' }).catch((e) => { logger.warn({ efrId, err: e }, 'verification: serviceable pincodes read failed — rendering empty'); return { pincodes: '' }; }),
+    /*
+     * Mandatory training — the videos flagged is_global in the LMS, with this
+     * technician's watched percentage against each. Which videos are mandatory
+     * is DATA, not code: ops flips is_global in LMS admin and this follows, so
+     * a fourth mandatory video needs no release here.
+     *
+     * Read-only signal. Training never blocks an onboarding decision (a
+     * technician is accepted first and can finish the videos afterwards); the
+     * reviewer just needs to see where he is.
+     *
+     * Fails OPEN to an empty list: the LMS tables are MyISAM legacy tables and
+     * is_global arrived in a later migration, so a clone without it must still
+     * render the rest of the page.
+     */
+    pool.query(
+      `SELECT t.id,
+              t.title,
+              COALESCE(MAX(w.watched_percentage), 0) AS watched_percentage
+         FROM training_videos t
+         LEFT JOIN easyfixer_watched_video w
+                ON w.video_id = t.id AND w.easyfixer_id = ?
+        WHERE t.is_global = 1
+        GROUP BY t.id, t.title
+        ORDER BY t.id ASC`,
+      [efrId],
+    ).then(([rows]) => rows).catch((e) => { logger.warn({ efrId, err: e }, 'verification: mandatory training read failed — rendering none'); return []; }),
   ]);
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
+
+  // A video counts as done at the same threshold the LMS uses everywhere else.
+  const TRAINING_COMPLETE_PERCENT = 100;
+  const trainingVideos = (mandatoryTrainingRows || []).map((t) => ({
+    video_id: Number(t.id),
+    title: t.title,
+    watched_percentage: Number(t.watched_percentage) || 0,
+    is_complete: (Number(t.watched_percentage) || 0) >= TRAINING_COMPLETE_PERCENT,
+  }));
+  const trainingDone = trainingVideos.filter((t) => t.is_complete).length;
   const pincodeCsv = String(serviceablePincodesRow.pincodes || '').trim();
   const serviceablePincodesCount = pincodeCsv
     ? pincodeCsv.split(',').map((p) => p.trim()).filter(Boolean).length
@@ -415,8 +454,29 @@ async function getVerificationPage(efrId) {
     additional: {
       deep_skills_count: deepSkillsCount,
       serviceable_pincodes_count: serviceablePincodesCount,
+      // `progress` is the COMBINED score, kept because the verification page's
+      // "Skill & Service Area Mapping" section genuinely covers both halves.
+      // Anything scoring one of them alone must use the split values below —
+      // feeding the combined number to a section labelled "Skills" made a
+      // technician with no skills but one pincode read 50%.
       progress: (deepSkillsCount > 0 ? 50 : 0) + (serviceablePincodesCount > 0 ? 50 : 0),
+      skills_progress: deepSkillsCount > 0 ? 100 : 0,
+      pincodes_progress: serviceablePincodesCount > 0 ? 100 : 0,
       is_complete: deepSkillsCount > 0 && serviceablePincodesCount > 0,
+    },
+
+    // ─ Mandatory training (read-only; never gates a decision) ─
+    training: {
+      videos: trainingVideos,
+      mandatory_total: trainingVideos.length,
+      mandatory_done: trainingDone,
+      is_complete: trainingVideos.length > 0 && trainingDone === trainingVideos.length,
+    },
+
+    // ─ The vertical this technician was onboarded FOR (a label, not a fence) ─
+    vertical: {
+      vertical_id: e.efr_vertical_id != null ? Number(e.efr_vertical_id) : null,
+      vertical_name: e.onboarded_vertical_name || null,
     },
 
     // Lookup data the page needs inline (cheap):
@@ -629,6 +689,22 @@ async function setLeadVerification(efrId, body, actor) {
   const v = Number(body.personal_details_filled);
   if (![0, 1, 2].includes(v)) { logger.warn('Lead verification rejected · invalid personal_details_filled=' + body.personal_details_filled + ' · efrId=' + efrId); const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
 
+  // A vertical id is only trustworthy if it names a live vertical — the column
+  // carries no foreign key (house style on tbl_easyfixer), so this is the only
+  // thing standing between a typo'd id and an unresolvable row.
+  if (v === 1 && body.vertical_id) {
+    const [[vertical]] = await pool.query(
+      'SELECT vertical_id FROM tbl_vertical WHERE vertical_id = ? AND status = 1 LIMIT 1',
+      [Number(body.vertical_id)],
+    );
+    if (!vertical) {
+      logger.warn('Lead verification rejected · unknown vertical_id=' + body.vertical_id + ' · efrId=' + efrId);
+      const e = new Error('unknown or inactive vertical');
+      e.status = 400;
+      throw e;
+    }
+  }
+
   // Auto-append the comment line that mirrors legacy "Accepted / Denied / ..."
   const statusText = v === 1 ? 'Accepted' : v === 2 ? 'Denied' : 'Not Eligible To New Lead';
   const comment = `${statusText}${body.reason ? ' <br> ' + body.reason : ''}`;
@@ -640,13 +716,31 @@ async function setLeadVerification(efrId, body, actor) {
       throw error;
     }
     const now = new Date();
-    if (v === 1 && body.efr_cityId) {
-      await conn.query(
-        `UPDATE tbl_easyfixer
-            SET efr_cityId = ?, updated_by = ?, update_date = ?
-          WHERE efr_id = ?`,
-        [body.efr_cityId, actor?.user_id || null, now, efrId],
-      );
+    /*
+     * The decision's own record on tbl_easyfixer, built as ONE update so a
+     * rollback cannot leave the vertical written without the decision:
+     *   efr_vertical_id      the vertical this technician is onboarded FOR,
+     *                        chosen at Accept. A label, not a work fence.
+     *   final_accept_comment / final_reject_comment
+     *                        the reviewer's note, per decision.
+     *   efr_cityId           legacy, only when the caller sends one.
+     *
+     * ⚠ final_accept_comment is ALSO written by the activation step
+     * (activateTechnician), which runs later and will overwrite this one. That
+     * is the intended reading — the column holds the most recent accept note —
+     * but it means this is not a per-step audit trail. The append-only trail is
+     * easyfixer_comments + tbl_easyfixer_lifecycle_status_log.
+     */
+    const sets = [];
+    const params = [];
+    if (v === 1 && body.efr_cityId) { sets.push('efr_cityId = ?'); params.push(body.efr_cityId); }
+    if (v === 1 && body.vertical_id) { sets.push('efr_vertical_id = ?'); params.push(Number(body.vertical_id)); }
+    if (v === 1 && body.reason) { sets.push('final_accept_comment = ?'); params.push(body.reason); }
+    if (v === 2 && body.reason) { sets.push('final_reject_comment = ?'); params.push(body.reason); }
+    if (sets.length) {
+      sets.push('updated_by = ?', 'update_date = ?');
+      params.push(actor?.user_id || null, now, efrId);
+      await conn.query(`UPDATE tbl_easyfixer SET ${sets.join(', ')} WHERE efr_id = ?`, params);
     }
     await conn.query(
       `UPDATE tbl_user
