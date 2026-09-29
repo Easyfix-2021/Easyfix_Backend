@@ -20,6 +20,7 @@ let currentUser = null;
 const fake = installFakePool([
   [/FROM tbl_employee_attendance_preference/i, () => (storedPref ? [storedPref] : [])],
   [/INSERT INTO tbl_employee_attendance_preference/i, () => ({ affectedRows: 1 })],
+  [/INSERT INTO tbl_employee_roster_action_log/i, () => ({ insertId: 314, affectedRows: 1 })],
   [/INSERT INTO tbl_employee_roster_change_log/i, () => ({ affectedRows: 1 })],
   [/FROM tbl_user_personal_details/i, []],
   [/FROM tbl_user_allowed_stages/i, []],
@@ -81,11 +82,17 @@ test('the first save that unselects Sunday logs PR → WO and 7 → 6 against th
   const [log] = writes(/INSERT INTO tbl_employee_roster_change_log/i);
   assert.ok(log, 'a change-log insert must happen');
   const rows = [];
-  for (let i = 0; i < log.params.length; i += 6) rows.push(log.params.slice(i, i + 6));
-  const byField = Object.fromEntries(rows.map(([, field, o, n]) => [field, [o, n]]));
+  for (let i = 0; i < log.params.length; i += 7) rows.push(log.params.slice(i, i + 7));
+  const byField = Object.fromEntries(rows.map(([, , field, o, n]) => [field, [o, n]]));
   assert.deepEqual(byField['pref.sunday'], ['PR', 'WO']);
   assert.deepEqual(byField['pref.working_days'], ['7', '6']);
   assert.equal(rows.length, 2, 'only the two real changes are logged');
+  // The save is ONE Action Log row ('WORKING_DAYS'), and every change points at it.
+  const [act] = writes(/INSERT INTO tbl_employee_roster_action_log/i);
+  assert.ok(act, 'a WORKING_DAYS action row must be written');
+  assert.match(act.sql, /'WORKING_DAYS'/);
+  assert.equal(act.params[1], 'Week Off: Sun · Shift 10:00 AM');
+  assert.ok(rows.every((r) => r[0] === 314), 'each change row carries the action id');
 });
 
 test('re-saving identical days with the same emp code writes nothing at all', async () => {

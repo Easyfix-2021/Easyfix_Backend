@@ -43,6 +43,9 @@ const fake = installFakePool([
   [/DELETE FROM tbl_employee_roster/i, () => ({ affectedRows: 1 })],
   [/INSERT INTO dashboard_notification_log/i, () => ({ insertId: 5, affectedRows: 1 })],
   [/SELECT user_id, reporting_manager/i, ADJ],
+  [/SELECT user_id FROM tbl_user WHERE user_status = 1 AND user_type_id = 5/i, () => ADJ.map((r) => ({ user_id: r.user_id }))],
+  [/JOIN tbl_user m ON m.user_id = u.reporting_manager/i, []],
+  [/SELECT COUNT\(\*\) AS total FROM tbl_employee_roster_change_log/i, [{ total: 0 }]],
   [/FROM tbl_user u LEFT JOIN tbl_role r/i, (sql, params) =>
     params.filter((id) => ADJ.some((a) => a.user_id === id)).map((id) => ({ user_id: id, user_name: 'U' + id, user_code: 'E20000' + id, reporting_manager: null, role_name: 'Ops' }))],
 ]);
@@ -202,4 +205,28 @@ test('notify clips a past start to today and refuses members outside the line', 
   assert.equal(r.from, todayIst());
   await assert.rejects(roster.notifyMembers({ actorId: 1, isAdmin: false, userIds: [9], from: tomorrow(), to: tomorrow() }),
     (e) => e.status === 403);
+});
+
+// ── 6. v2: All Employees, readable summaries, per-action details ─────────
+test('no Team filter: a roster admin sees every employee, a TL only their line', async () => {
+  reset();
+  const from = tomorrow();
+  const admin = await roster.getGrid({ actorId: 8, isAdmin: true, from, to: from });
+  assert.deepEqual(admin.members.map((m) => m.userId).sort((a, b) => a - b), [1, 2, 3, 4, 8, 9]);
+  const tl = await roster.getGrid({ actorId: 1, isAdmin: false, from, to: from });
+  assert.deepEqual(tl.members.map((m) => m.userId).sort((a, b) => a - b), [1, 2, 3, 4], 'a TL never sees 8/9');
+});
+
+test('summaries are plain dates, not ISO ranges', () => {
+  assert.equal(roster.rangeLabel('2026-10-01', '2026-12-31'), '01 Oct – 31 Dec 2026');
+  assert.equal(roster.rangeLabel('2026-12-28', '2027-01-03'), '28 Dec 2026 – 03 Jan 2027');
+  assert.equal(roster.rangeLabel('2026-10-02', '2026-10-02'), '02 Oct 2026');
+});
+
+test('updates can be fetched for ONE action only', async () => {
+  reset();
+  await roster.listUpdateLog({ actorId: 8, isAdmin: true, actionId: 77, page: 1, limit: 20 });
+  const q = fake.calls.find((c) => /FROM tbl_employee_roster_change_log c/.test(c.sql) && /LIMIT/.test(c.sql));
+  assert.match(q.sql, /c\.action_id = \?/);
+  assert.ok(q.params.includes(77));
 });
