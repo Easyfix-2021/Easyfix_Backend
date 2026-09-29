@@ -6,7 +6,6 @@ const validate = require('../../middleware/validate');
 const requireAction = require('../../middleware/require-action');
 const { getEffectivePermissions } = require('../../services/role.service');
 const roster = require('../../services/roster.service');
-const { monthBounds, shiftYmd } = require('../../utils/ist-calendar');
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const logger = require('../../logger');
@@ -26,7 +25,6 @@ const logger = require('../../logger');
  */
 
 const ymd = Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/);
-const month = Joi.string().pattern(/^\d{4}-(0[1-9]|1[0-2])$/);
 const hhmm = Joi.string().pattern(/^([01]\d|2[0-3]):(00|30)$/).allow(null, ''); // 30-minute slots only
 const ids = Joi.array().items(Joi.number().integer().positive()).min(1).max(1000).required();
 
@@ -114,12 +112,6 @@ manage.post('/fill-pattern',
     })(req, res, next);
   });
 
-manage.post('/copy-month',
-  validate(Joi.object({ userIds: ids, fromMonth: month.required(), toMonth: month.required() })),
-  mutation('COPY_MONTH', async (req, res, isAdmin) => {
-    modernOk(res, await roster.copyMonth({ actorId: req.user.user_id, isAdmin, ...req.body }), 'Month copied');
-  }));
-
 manage.post('/reset',
   validate(Joi.object({ userIds: ids, from: ymd.required(), to: ymd.required() })),
   mutation('RESET', async (req, res, isAdmin) => {
@@ -139,7 +131,7 @@ manage.post('/notify',
 const pageQuery = { page: Joi.number().integer().min(1).default(1), limit: Joi.number().integer().min(1).max(200).default(50) };
 
 manage.get('/logs/updates',
-  validate(Joi.object({ ...pageQuery, userId: Joi.number().integer().positive(), from: ymd, to: ymd }), 'query'),
+  validate(Joi.object({ ...pageQuery, userId: Joi.number().integer().positive(), from: ymd, to: ymd, actionId: Joi.number().integer().positive() }), 'query'),
   async (req, res, next) => {
     try {
       modernOk(res, await roster.listUpdateLog({ actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), ...req.query }));
@@ -153,18 +145,19 @@ manage.get('/logs/actions', validate(Joi.object(pageQuery), 'query'), async (req
 });
 
 /*
- * Export one month of a team as .xlsx — one row per member, one column per date
+ * Export a date range (≤ 93 days) as .xlsx — one row per employee, one column per date
  * (PR / WO), the layout of the monthly roster e-mail this replaces.
  */
-manage.get('/export', validate(Joi.object({ month: month.required(), teamOf: Joi.number().integer().positive() }), 'query'),
+const EXPORT_MAX_DAYS = 93; // "3 Months (From Today)" + a day of slack
+manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.required(), teamOf: Joi.number().integer().positive() }), 'query'),
   async (req, res, next) => {
     try {
-      const { start, end } = monthBounds(req.query.month);
+      const { from, to } = req.query;
       const grid = await roster.getGrid({
-        actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), from: start, to: shiftYmd(end, -1), teamOf: req.query.teamOf,
+        actorId: req.user.user_id, isAdmin: await isRosterAdmin(req), from, to, teamOf: req.query.teamOf, maxDays: EXPORT_MAX_DAYS,
       });
       const wb = new ExcelJS.Workbook();
-      const ws = wb.addWorksheet(`Roster ${req.query.month}`);
+      const ws = wb.addWorksheet('Roster');
       const dayLabel = (d) => `${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][roster.weekdayIndex(d)]} ${d.slice(8)}`;
       ws.addRow(['Team Member', 'Emp Code', 'Role', 'Shift', ...grid.dates.map(dayLabel)]).font = { bold: true };
       const hol = new Set(grid.holidays.map((h) => h.date));
@@ -176,13 +169,13 @@ manage.get('/export', validate(Joi.object({ month: month.required(), teamOf: Joi
       grid.dates.forEach((d, i) => { if (hol.has(d)) ws.getColumn(5 + i).eachCell((c) => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDECEA' } }; }); });
       ws.getColumn(1).width = 26;
       await roster.insertAction(pool, {
-        action: 'EXPORT', actorId: req.user.user_id, scope: `${grid.members.length} members · ${req.query.month}`,
+        action: 'EXPORT', actorId: req.user.user_id, scope: roster.rangeLabel(from, to),
         users: grid.members.length, cells: 0,
       });
       const buf = await wb.xlsx.writeBuffer();
-      logger.info('Roster exported · actor=' + req.user.user_id + ' · month=' + req.query.month + ' · members=' + grid.members.length);
+      logger.info('Roster exported · actor=' + req.user.user_id + ' · ' + from + '→' + to + ' · members=' + grid.members.length);
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="team-roster-${req.query.month}.xlsx"`);
+      res.setHeader('Content-Disposition', `attachment; filename="team-roster-${from}-to-${to}.xlsx"`);
       res.setHeader('Cache-Control', 'no-store');
       res.send(Buffer.from(buf));
     } catch (e) { sendError(res, next, e); }

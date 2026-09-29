@@ -15,7 +15,7 @@ const { todayIst, shiftYmd, shiftMonth, currentIstMonth, monthBounds } = require
  * There is no "on roster" flag: a user is on the roster for a date exactly when
  * a row exists for it. Holidays are display-only (ops works holidays).
  *
- * Writers: saveCells (GRID), fillPattern (PATTERN), copyMonth (COPY), resetRange
+ * Writers: saveCells (GRID), fillPattern (PATTERN), resetRange
  * (delete → back to weekly). Each is ONE transaction: action-log row, the row
  * writes, then one change-log row per value that really changed.
  */
@@ -158,10 +158,15 @@ function assertInWindow(win, dates) {
 }
 
 // ─── Reads ────────────────────────────────────────────────────────────
-async function getGrid({ actorId, isAdmin, from, to, teamOf }) {
+/*
+ * teamOf absent = "All Employees": a roster admin sees every active employee;
+ * anyone else sees themselves + their reporting line. teamOf = that manager +
+ * their hierarchy (within reach). maxDays: 62 for the grid, more for export.
+ */
+async function getGrid({ actorId, isAdmin, from, to, teamOf, maxDays = MAX_RANGE_DAYS }) {
   assertYmd(from, 'from'); assertYmd(to, 'to');
   if (from > to) throw mkErr(400, 'from must be on or before to');
-  if (listDates(from, to).length > MAX_RANGE_DAYS) throw mkErr(400, `Range cannot exceed ${MAX_RANGE_DAYS} days`);
+  if (listDates(from, to).length > maxDays) throw mkErr(400, `Range cannot exceed ${maxDays} days`);
 
   const reach = await actorReach(actorId, isAdmin);
   const root = teamOf ? Number(teamOf) : reach.actorId;
@@ -169,8 +174,16 @@ async function getGrid({ actorId, isAdmin, from, to, teamOf }) {
     throw mkErr(403, 'That team is outside your reporting line');
   }
   const { findDescendantUserIds } = require('./user.service');
-  const { descendants } = await findDescendantUserIds(root);
-  const users = await loadActiveUsers([root, ...descendants]);
+  let scopeIds;
+  if (!teamOf && reach.isAdmin) {
+    // ponytail: every active employee in one grid (71 on QA); page it if this grows to thousands.
+    const [all] = await pool.query('SELECT user_id FROM tbl_user WHERE user_status = 1 AND user_type_id = 5');
+    scopeIds = all.map((r) => Number(r.user_id));
+  } else {
+    const { descendants } = await findDescendantUserIds(root);
+    scopeIds = [root, ...descendants];
+  }
+  const users = await loadActiveUsers(scopeIds);
   const ids = users.map((u) => Number(u.user_id));
   const { byUser, prefs } = await resolveDays(ids, from, to);
   const win = editWindow({ canEditToday: reach.isAdmin });
@@ -239,8 +252,14 @@ async function getMine(userId, { days = 14 } = {}) {
 }
 
 // ─── Writes ───────────────────────────────────────────────────────────
-function summarise(action, userCount, cellCount, extra) {
-  return `${userCount} member${userCount === 1 ? '' : 's'} · ${cellCount} cell${cellCount === 1 ? '' : 's'}${extra ? ' · ' + extra : ''}`;
+/*
+ * Human summary for the Action Log (the UI adds the verb and the employee
+ * count): "01 Oct – 31 Dec 2026", optionally "· Week Off: Wed · Shift 01:00 PM".
+ */
+function rangeLabel(from, to) {
+  const d = (ymd) => `${ymd.slice(8)} ${MONTH_ABBR[Number(ymd.slice(5, 7)) - 1]}`;
+  if (from === to) return `${d(from)} ${from.slice(0, 4)}`;
+  return from.slice(0, 4) === to.slice(0, 4) ? `${d(from)} – ${d(to)} ${to.slice(0, 4)}` : `${d(from)} ${from.slice(0, 4)} – ${d(to)} ${to.slice(0, 4)}`;
 }
 
 async function insertAction(conn, { action, actorId, scope, params, users, cells, status = 200 }) {
@@ -369,7 +388,8 @@ async function saveCells({ actorId, isAdmin, cells }) {
 
   const changed = await inTransaction(async (conn) => {
     const actionId = await insertAction(conn, {
-      action: 'SAVE_GRID', actorId, scope: summarise('SAVE_GRID', users, list.length), users, cells: list.length,
+      action: 'SAVE_GRID', actorId, users, cells: list.length,
+      scope: rangeLabel(list.reduce((m, c) => (c.date < m ? c.date : m), list[0].date), list.reduce((m, c) => (c.date > m ? c.date : m), list[0].date)),
     });
     return applyCells(conn, { actorId, actionId, source: 'GRID', cells: list, empCodes });
   });
@@ -412,75 +432,17 @@ async function fillPattern({ actorId, isAdmin, userIds, from, to, weekOffDays, s
   };
   if (dryRun) return counts;
 
-  const dayNames = [...offs].sort().map((i) => attendancePref.DAY_KEYS[i].slice(0, 3)).map((s) => s[0].toUpperCase() + s.slice(1));
-  const extra = `${from} → ${to} · WO ${dayNames.join('/') || 'none'}${shift ? ' · ' + shift : ''}`;
+  const dayNames = [...offs].sort().map((i) => DAY_ABBR[i]);
+  const extra = `${rangeLabel(from, to)} · Week Off: ${dayNames.join(', ') || 'None'} · ${shift ? 'Shift ' + shift12(shift) : 'Default Shift'}`;
   await inTransaction(async (conn) => {
     const actionId = await insertAction(conn, {
-      action: 'FILL_PATTERN', actorId, scope: summarise('FILL_PATTERN', ids.length, cells.length, extra),
+      action: 'FILL_PATTERN', actorId, scope: extra,
       params: { userIds: ids, from, to, weekOffDays: [...offs], shiftStart: shift, keepManual }, users: ids.length, cells: cells.length,
     });
     await applyCells(conn, { actorId, actionId, source: 'PATTERN', cells, empCodes });
   });
   logger.info('Roster pattern filled · actor=' + actorId + ' · users=' + ids.length + ' · cells=' + cells.length);
   return counts;
-}
-
-/*
- * Copy Previous Month: for each member, take the weekday pattern of the LAST
- * FULL Mon–Sun week of fromMonth and repeat it across toMonth (clipped to the
- * editable window). Members with no planned day in that week are skipped —
- * they follow their weekly working days already. Hand-edited (GRID) cells in
- * the target are kept.
- */
-async function copyMonth({ actorId, isAdmin, userIds, fromMonth, toMonth }) {
-  const src = monthBounds(fromMonth);
-  const dst = monthBounds(toMonth);
-  const srcLast = shiftYmd(src.end, -1);
-  let weekEnd = srcLast;
-  while (weekdayIndex(weekEnd) !== 6) weekEnd = shiftYmd(weekEnd, -1);
-  const weekStart = shiftYmd(weekEnd, -6);
-  if (weekStart < src.start) throw mkErr(400, `${fromMonth} has no full week to copy`);
-
-  const win = editWindow({ canEditToday: isAdmin });
-  const from = dst.start > win.editFrom ? dst.start : win.editFrom;
-  const to = shiftYmd(dst.end, -1) < win.editTo ? shiftYmd(dst.end, -1) : win.editTo;
-  if (from > to) throw mkErr(400, `${toMonth} is outside the editable range ${win.editFrom} → ${win.editTo}`);
-
-  const reach = await actorReach(actorId, isAdmin);
-  const empCodes = await assertEditable(reach, userIds || []);
-  const ids = [...empCodes.keys()];
-  const { byUser } = await resolveDays(ids, weekStart, weekEnd);
-  const existing = await loadRosterRows(ids, from, to);
-  const manual = new Set(existing.filter((r) => r.source === 'GRID').map((r) => `${r.user_id}|${r.roster_date}`));
-
-  const cells = [];
-  let copiedUsers = 0;
-  let kept = 0;
-  const targetDates = listDates(from, to);
-  for (const uid of ids) {
-    const week = byUser.get(uid);
-    if (!Object.values(week).some((c) => c.source === 'ROSTER')) continue;
-    copiedUsers++;
-    const byWeekday = {};
-    for (const [d, c] of Object.entries(week)) byWeekday[weekdayIndex(d)] = c;
-    for (const d of targetDates) {
-      if (manual.has(`${uid}|${d}`)) { kept++; continue; }
-      const c = byWeekday[weekdayIndex(d)];
-      cells.push({ userId: uid, date: d, dayType: c.type, shift: c.source === 'ROSTER' ? c.shift : null });
-    }
-  }
-  if (!cells.length) return { users: copiedUsers, cells: 0, keptManual: kept, skipped: ids.length - copiedUsers };
-
-  await inTransaction(async (conn) => {
-    const actionId = await insertAction(conn, {
-      action: 'COPY_MONTH', actorId,
-      scope: summarise('COPY_MONTH', copiedUsers, cells.length, `${fromMonth} → ${toMonth}`),
-      params: { userIds: ids, fromMonth, toMonth, sourceWeek: [weekStart, weekEnd] }, users: copiedUsers, cells: cells.length,
-    });
-    await applyCells(conn, { actorId, actionId, source: 'COPY', cells, empCodes });
-  });
-  logger.info('Roster month copied · actor=' + actorId + ' · ' + fromMonth + '→' + toMonth + ' · cells=' + cells.length);
-  return { users: copiedUsers, cells: cells.length, keptManual: kept, skipped: ids.length - copiedUsers };
 }
 
 /** Reset To Weekly Days: delete planned rows in range. */
@@ -500,7 +462,7 @@ async function resetRange({ actorId, isAdmin, userIds, from, to }) {
       [...ids, from, to]
     );
     const actionId = await insertAction(conn, {
-      action: 'RESET', actorId, scope: summarise('RESET', ids.length, rows.length, `${from} → ${to}`),
+      action: 'RESET', actorId, scope: rangeLabel(from, to),
       params: { userIds: ids, from, to }, users: ids.length, cells: rows.length,
     });
     if (!rows.length) return 0;
@@ -559,7 +521,7 @@ async function notifyMembers({ actorId, isAdmin, userIds, from, to }) {
     await inbox.create({ userId: uid, title, desc: lines.join('\n') });
   }
   await insertAction(pool, {
-    action: 'NOTIFY', actorId, scope: summarise('NOTIFY', ids.length, dates.length * ids.length, `${start} → ${to}`),
+    action: 'NOTIFY', actorId, scope: rangeLabel(start, to),
     params: { userIds: ids, from: start, to }, users: ids.length, cells: dates.length * ids.length,
   });
   logger.info('Roster notified · actor=' + actorId + ' · users=' + ids.length + ' · ' + start + '→' + to);
@@ -573,7 +535,7 @@ function paging(page, limit) {
   return { limit: l, offset: (p - 1) * l };
 }
 
-async function listUpdateLog({ actorId, isAdmin, page, limit, userId, from, to }) {
+async function listUpdateLog({ actorId, isAdmin, page, limit, userId, from, to, actionId }) {
   const reach = await actorReach(actorId, isAdmin);
   const where = [];
   const params = [];
@@ -584,6 +546,7 @@ async function listUpdateLog({ actorId, isAdmin, page, limit, userId, from, to }
     params.push(...ids);
   }
   if (userId) { where.push('c.user_id = ?'); params.push(Number(userId)); }
+  if (actionId) { where.push('c.action_id = ?'); params.push(Number(actionId)); }
   if (from) { where.push('c.created_at >= ?'); params.push(assertYmd(from, 'from') + ' 00:00:00'); }
   if (to) { where.push('c.created_at < ?'); params.push(shiftYmd(assertYmd(to, 'to'), 1) + ' 00:00:00'); }
   const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
@@ -639,8 +602,8 @@ async function listActionLog({ actorId, isAdmin, page, limit }) {
     total: Number(total),
     items: rows.map((r) => ({
       id: Number(r.id), createdAt: r.created_at, action: r.action, actorUserId: Number(r.actor_user_id),
-      actorName: r.actor_name || null, scopeSummary: r.scope_summary, affectedUsers: Number(r.affected_users),
-      affectedCells: Number(r.affected_cells), statusCode: Number(r.status_code),
+      actorName: r.actor_name || null, summary: r.scope_summary || '', affectedUsers: Number(r.affected_users),
+      statusCode: Number(r.status_code),
     })),
   };
 }
@@ -658,11 +621,11 @@ module.exports = {
   getMine,
   saveCells,
   fillPattern,
-  copyMonth,
   resetRange,
   notifyMembers,
   listUpdateLog,
   listActionLog,
   logFailedAction,
   insertAction,
+  rangeLabel,
 };

@@ -180,11 +180,26 @@ async function upsertPreference(userId, empCode, values, actorId, runner = pool)
       actorId || null, now, now]
   );
   if (changes.length) {
+    /*
+     * One Action Log row per Working Days save ('WORKING_DAYS'), and the value
+     * changes hang off it — so an Edit User change shows up in Team Roster →
+     * Logs like any roster action and expands to its details. Written inline
+     * (not via roster.service) because roster.service requires this module.
+     */
+    const off = DAY_KEYS.filter((k) => after[k] === 'WO').map((k) => k[0].toUpperCase() + k.slice(1, 3));
+    const [h, m] = (after.default_shift_start || DEFAULT_SHIFT).split(':').map(Number);
+    const shift = `${String(h % 12 === 0 ? 12 : h % 12).padStart(2, '0')}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+    const [act] = await runner.query(
+      `INSERT INTO tbl_employee_roster_action_log
+         (action, actor_user_id, scope_summary, params, affected_users, affected_cells, status_code, created_at)
+       VALUES ('WORKING_DAYS', ?, ?, NULL, 1, 0, 200, ?)`,
+      [actorId || 0, `Week Off: ${off.join(', ') || 'None'} · Shift ${shift}`, now]
+    );
     await runner.query(
       `INSERT INTO tbl_employee_roster_change_log
          (action_id, user_id, roster_date, field, old_value, new_value, changed_by, created_at)
-       VALUES ${changes.map(() => '(NULL, ?, NULL, ?, ?, ?, ?, ?)').join(', ')}`,
-      changes.flatMap(([field, o, n]) => [uid, field, o, n, actorId || 0, now])
+       VALUES ${changes.map(() => '(?, ?, NULL, ?, ?, ?, ?, ?)').join(', ')}`,
+      changes.flatMap(([field, o, n]) => [act.insertId, uid, field, o, n, actorId || 0, now])
     );
   }
   logger.info('Working days saved · userId=' + uid + ' · workingDays=' + after.working_days
