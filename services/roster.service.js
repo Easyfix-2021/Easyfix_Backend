@@ -24,7 +24,7 @@ const DAY_TYPES = attendancePref.DAY_TYPES;
 const MAX_RANGE_DAYS = 62;
 const MAX_CELLS = 5000;
 const DEFAULT_HORIZON_MONTHS = 3;
-const ACTION_SOURCE = Object.freeze({ SAVE_GRID: 'GRID', FILL_PATTERN: 'PATTERN', COPY_MONTH: 'COPY', RESET: 'RESET' });
+const ACTION_SOURCE = Object.freeze({ SAVE_GRID: 'GRID', FILL_PATTERN: 'PATTERN', COPY_MONTH: 'COPY', RESET: 'RESET', BULK_UPLOAD: 'UPLOAD' });
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
@@ -417,7 +417,8 @@ async function fillPattern({ actorId, isAdmin, userIds, from, to, weekOffDays, s
   const ids = [...empCodes.keys()];
 
   const existing = await loadRosterRows(ids, from, to);
-  const manual = new Set(existing.filter((r) => r.source === 'GRID').map((r) => `${r.user_id}|${r.roster_date}`));
+  // Hand-made = the grid or a bulk upload; both survive "Keep cells already edited by hand".
+  const manual = new Set(existing.filter((r) => r.source === 'GRID' || r.source === 'UPLOAD').map((r) => `${r.user_id}|${r.roster_date}`));
   const cells = [];
   let kept = 0;
   for (const uid of ids) {
@@ -684,4 +685,9 @@ module.exports = {
   logFailedAction,
   insertAction,
   rangeLabel,
+  // for roster-bulk.service
+  actorReach,
+  loadActiveUsers,
+  applyCells,
+  inTransaction,
 };
