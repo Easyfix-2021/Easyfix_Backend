@@ -157,10 +157,12 @@ manage.get('/logs/actions', validate(Joi.object(pageQuery), 'query'), async (req
 });
 
 /*
- * Export a date range (≤ 93 days) as .xlsx — one row per employee, one column per date
+ * Export a date range (≤ 186 days) as .xlsx — one row per employee, one column per date
  * (PR / WO), the layout of the monthly roster e-mail this replaces.
  */
-const EXPORT_MAX_DAYS = 93; // "3 Months (From Today)" + a day of slack
+// ~6 months: the whole plan window (tomorrow → end of month+3, up to ~123 days)
+// plus a look back. The grid itself stays capped at 62 (MAX_RANGE_DAYS).
+const EXPORT_MAX_DAYS = 186;
 manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.required(), teamOf: Joi.number().integer().positive() }), 'query'),
   async (req, res, next) => {
     try {
@@ -170,7 +172,8 @@ manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.requir
       });
       const wb = new ExcelJS.Workbook();
       const ws = wb.addWorksheet('Roster');
-      const dayLabel = (d) => `${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][roster.weekdayIndex(d)]} ${d.slice(8)}`;
+      // DD/MM (Day) like the grid header — a bare "Mon 01" repeats across months.
+      const dayLabel = (d) => `${d.slice(8)}/${d.slice(5, 7)} (${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][roster.weekdayIndex(d)]})`;
       ws.addRow(['Team Member', 'Emp Code', 'Role', 'Shift', ...grid.dates.map(dayLabel)]).font = { bold: true };
       const hol = new Set(grid.holidays.map((h) => h.date));
       for (const m of grid.members) {
