@@ -2150,10 +2150,22 @@ router.get('/', validate(callListQuery, 'query'), async (req, res, next) => {
     // construction, excludes calls on the same number for other jobs.
     if (mobile) {
       const digits = String(mobile).replace(/\D/g, '').slice(-10);
-      if (digits.length === 10) {
-        where.push("(RIGHT(REPLACE(REPLACE(jci.reciever, '+', ''), ' ', ''), 10) = ? OR RIGHT(REPLACE(REPLACE(jci.caller, '+', ''), ' ', ''), 10) = ?)");
-        params.push(digits, digits);
+      /*
+       * A `mobile` that cannot yield 10 digits used to be dropped silently.
+       * With a jobId alongside it that merely widened the result to the whole
+       * job; on its own — the technician-profile call history — it left NO
+       * predicate at all, so a request for one number's calls answered with
+       * every call in the table. Refuse instead: a filter the caller asked for
+       * and did not get is never the safe default.
+       */
+      if (digits.length !== 10) {
+        return res.status(400).json({
+          success: false,
+          message: 'mobile must contain at least 10 digits',
+        });
       }
+      where.push("(RIGHT(REPLACE(REPLACE(jci.reciever, '+', ''), ' ', ''), 10) = ? OR RIGHT(REPLACE(REPLACE(jci.caller, '+', ''), ' ', ''), 10) = ?)");
+      params.push(digits, digits);
     }
     // Unified Call Analysis filters (all additive; call_flow is always present,
     // the analysis-based ones are guarded on the column existing).

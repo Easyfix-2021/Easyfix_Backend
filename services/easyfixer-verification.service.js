@@ -784,6 +784,26 @@ async function setLeadVerification(efrId, body, actor) {
   const v = Number(body.personal_details_filled);
   if (![0, 1, 2].includes(v)) { logger.warn('Lead verification rejected · invalid personal_details_filled=' + body.personal_details_filled + ' · efrId=' + efrId); const e = new Error('invalid personal_details_filled'); e.status = 400; throw e; }
 
+  /*
+   * IDENTITY MUST BE VERIFIED BEFORE A LEAD CAN BE ACCEPTED (Priyanka,
+   * 2026-09-29). Accepting now ACTIVATES the technician, so this is the last
+   * gate before he can be sent to a customer's home — it belongs in the
+   * backend, not only in the button's disabled state. The CRM marks the
+   * Aadhaar verified from the Onboarding tab, which sets this same flag.
+   */
+  if (v === 1) {
+    const [[identity]] = await pool.query(
+      'SELECT is_identity_details_verified_by_crm AS verified FROM tbl_easyfixer WHERE efr_id = ? LIMIT 1',
+      [efrId],
+    );
+    if (Number(identity?.verified) !== 1) {
+      logger.warn('Lead accept refused · identity not verified · efrId=' + efrId);
+      const e = new Error('the technician\'s identity must be verified before the lead can be accepted');
+      e.status = 409;
+      throw e;
+    }
+  }
+
   // A vertical id is only trustworthy if it names a live vertical — the column
   // carries no foreign key (house style on tbl_easyfixer), so this is the only
   // thing standing between a typo'd id and an unresolvable row.
