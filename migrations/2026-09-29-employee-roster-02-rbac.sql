@@ -14,10 +14,9 @@
 --    granted from Manage Roles.
 -- 4. Append the menu id to new.crm.visible.menu.ids (the new-CRM cutover gate).
 -- 5. easyfix_properties:
---      roster.manager.emails — the SECOND lock (services/feature-access.service.js
---        canManageRoster). Seeded EMPTY = deny-all. Fill with the TL / HR emails
---        confirmed by the owner BEFORE applying, e.g.
---        UPDATE easyfix_properties SET property_value = 'a@easyfix.in,b@easyfix.in' WHERE property_key = 'roster.manager.emails';
+--      (No email allowlist — access is role-based only, owner decision 2026-09-29.
+--       An earlier revision seeded roster.manager.emails; roster-03 removes it
+--       where that revision already ran.)
 --      roster.horizon.months — how far ahead a roster can be planned (default 3).
 -- Properties are cached at boot: restart / flush the properties cache after applying.
 -- ─────────────────────────────────────────────────────────────────────
@@ -33,7 +32,6 @@ INSERT INTO role_menu_action (role_id, menu_action_id, isDeleted) SELECT 2, ma.i
 
 UPDATE easyfix_properties p JOIN tbl_menu m ON m.url = 'teamRoster' SET p.property_value = CONCAT(COALESCE(p.property_value, ''), IF(p.property_value IS NULL OR p.property_value = '', '', ','), m.menu_id) WHERE p.property_key = 'new.crm.visible.menu.ids' AND NOT FIND_IN_SET(m.menu_id, COALESCE(p.property_value, ''));
 
-INSERT INTO easyfix_properties (property_key, property_value, updated_at) SELECT 'roster.manager.emails', '', NOW() FROM dual WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'roster.manager.emails');
 INSERT INTO easyfix_properties (property_key, property_value, updated_at) SELECT 'roster.horizon.months', '3', NOW() FROM dual WHERE NOT EXISTS (SELECT 1 FROM easyfix_properties WHERE property_key = 'roster.horizon.months');
 
 SELECT 'Team Roster menu present' AS what, COUNT(*) AS ok FROM tbl_menu WHERE url = 'teamRoster'
@@ -41,4 +39,4 @@ UNION ALL SELECT 'both action keys seeded (2)', COUNT(*) FROM menu_action WHERE 
 UNION ALL SELECT 'admin holds both keys (2)', COUNT(*) FROM role_menu_action rma JOIN menu_action ma ON ma.id = rma.menu_action_id WHERE rma.role_id = 2 AND rma.isDeleted = 0 AND ma.action_name IN ('isRosterManage', 'isRosterAdmin')
 UNION ALL SELECT 'admin sees the menu', COUNT(*) FROM tbl_role r JOIN tbl_menu m ON m.url = 'teamRoster' WHERE r.role_id = 2 AND FIND_IN_SET(m.menu_id, COALESCE(r.menu_ids, ''))
 UNION ALL SELECT 'visible-menu allowlist carries it (0 = allowlist inactive, also fine)', COUNT(*) FROM easyfix_properties p JOIN tbl_menu m ON m.url = 'teamRoster' WHERE p.property_key = 'new.crm.visible.menu.ids' AND FIND_IN_SET(m.menu_id, COALESCE(p.property_value, ''))
-UNION ALL SELECT 'roster properties seeded (2)', COUNT(*) FROM easyfix_properties WHERE property_key IN ('roster.manager.emails', 'roster.horizon.months');
+UNION ALL SELECT 'horizon property seeded', COUNT(*) FROM easyfix_properties WHERE property_key = 'roster.horizon.months';

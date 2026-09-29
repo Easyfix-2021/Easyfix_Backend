@@ -1,10 +1,9 @@
 /*
- * Team Roster route guards — TWO locks, AND never OR (routes/admin/roster.js):
- *   the easyfix_properties allowlist roster.manager.emails  (WHO may reach it)
- *   the RBAC action key isRosterManage                      (the screen EXISTS)
- * Each lock is tested failing ALONE with the other one satisfied — a test that
- * only ever fails both at once cannot tell AND from OR. /me needs neither.
- * A denied mutation still leaves an Action Log row.
+ * Team Roster route guards (routes/admin/roster.js) — ROLE-based only:
+ * the RBAC action key isRosterManage decides, and nothing else. Owner decision
+ * 2026-09-29: whoever sees the menu can use it, so there is NO email allowlist.
+ * Both directions are pinned: the key alone lets you in (whatever your email),
+ * no key keeps you out. /me needs no key. A denied mutation is still logged.
  */
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -12,7 +11,6 @@ const express = require('express');
 
 const { installFakePool } = require('./helpers/fake-pool');
 
-const ALLOWED = ['tl@easyfix.in', 'tl2@easyfix.in'];
 const ROLE_OF = { 1: 2, 5: 3, 6: 2, 7: 3 };                  // user → role
 const ACTIONS_OF_ROLE = { 2: ['isRosterManage'], 3: [] };    // role 2 holds the key, role 3 does not
 const ADJ = [
@@ -28,7 +26,6 @@ const fake = installFakePool([
     { role_id: 2, role_name: 'Admin', role_status: 1, menu_ids: '' },
     { role_id: 3, role_name: 'Executive Supply', role_status: 1, menu_ids: '' },
   ]],
-  [/FROM easyfix_properties/i, () => [{ property_key: 'roster.manager.emails', property_value: ALLOWED.join(',') }]],
   [/SELECT user_id, reporting_manager/i, ADJ],
   [/FROM tbl_user u LEFT JOIN tbl_role r/i, (_s, p) => p.map((id) => ({ user_id: id, user_name: 'U' + id, user_code: null, role_name: 'Ops' }))],
   [/INSERT INTO tbl_employee_roster_action_log/i, () => ({ insertId: 1 })],
@@ -55,22 +52,22 @@ async function call(user, path, init) {
 }
 const grid = '/?from=2026-10-05&to=2026-10-11';
 
-test('BOTH locks satisfied → the grid loads', async () => {
-  const r = await call({ user_id: 1, official_email: ALLOWED[0] }, grid);
+test('the isRosterManage key → the grid loads', async () => {
+  const r = await call({ user_id: 1, official_email: 'tl@easyfix.in' }, grid);
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual(r.body.data.members.map((m) => m.userId).sort(), [1, 2, 3]);
   assert.equal(r.body.data.members.find((m) => m.userId === 1).editable, false, 'own row is read-only');
 });
 
-test('allowlisted email WITHOUT the action key → 403', async () => {
-  const r = await call({ user_id: 5, official_email: ALLOWED[1] }, grid);
+test('no isRosterManage key → 403', async () => {
+  const r = await call({ user_id: 5, official_email: 'tl2@easyfix.in' }, grid);
   assert.equal(r.status, 403);
   assert.match(r.body.error, /isRosterManage/);
 });
 
-test('action key WITHOUT an allowlisted email → 403', async () => {
-  const r = await call({ user_id: 6, official_email: 'someone@easyfix.in' }, grid);
-  assert.equal(r.status, 403);
+test('the key is enough — no email list stands in the way (menu visible ⇒ page usable)', async () => {
+  const r = await call({ user_id: 6, official_email: 'anyone-at-all@easyfix.in' }, grid);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
 });
 
 test('/me needs neither lock — every CRM user sees their own roster', async () => {
@@ -82,7 +79,7 @@ test('/me needs neither lock — every CRM user sees their own roster', async ()
 test('a denied save (member outside the team) is 403 AND lands in the Action Log', async () => {
   fake.calls.length = 0;
   const { todayIst, shiftYmd } = require('../utils/ist-calendar');
-  const r = await call({ user_id: 1, official_email: ALLOWED[0] }, '/cells', {
+  const r = await call({ user_id: 1, official_email: 'tl@easyfix.in' }, '/cells', {
     method: 'PUT', body: JSON.stringify({ cells: [{ userId: 9, date: shiftYmd(todayIst(), 1), dayType: 'WO' }] }),
   });
   assert.equal(r.status, 403);

@@ -342,8 +342,8 @@ async function inTransaction(fn) {
 
 function normaliseShift(v, name) {
   if (v === undefined) return undefined;
-  const s = attendancePref.toHhMm(v);
-  if (s === undefined) throw mkErr(400, `${name} must be HH:MM`);
+  const s = attendancePref.toShift(v);
+  if (s === undefined) throw mkErr(400, `${name} must be a :00 or :30 time (HH:MM)`);
   return s;
 }
 

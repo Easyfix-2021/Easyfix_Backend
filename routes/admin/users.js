@@ -42,7 +42,7 @@ const dayType = Joi.string().valid('PR', 'WO').required();
 const attendancePreferenceField = Joi.object({
   monday: dayType, tuesday: dayType, wednesday: dayType, thursday: dayType,
   friday: dayType, saturday: dayType, sunday: dayType,
-  default_shift_start: Joi.string().trim().pattern(/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/).allow('', null).optional(),
+  default_shift_start: Joi.string().trim().pattern(/^([01]\d|2[0-3]):(00|30)(:00)?$/).allow('', null).optional(),
 }).allow(null).optional();
 
 /*
