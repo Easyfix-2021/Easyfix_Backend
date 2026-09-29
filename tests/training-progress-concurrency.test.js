@@ -1,4 +1,4 @@
-const { test, after } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
@@ -7,8 +7,15 @@ const fake = installFakePool([
   [UPSERT, { affectedRows: 2 }],
 ]);
 const profile = require('../services/mobile-profile-extra.service');
+const lms = require('../services/lms.service');
 
 after(() => fake.restore());
+
+// Pre-migration schema (the fake returns no probe rows): the watch-time check
+// is off and the hot path must be exactly the one upsert. The probe is primed
+// at boot in production, so it is primed here too rather than counted.
+// tests/training-watch-time.test.js covers the migrated path.
+before(async () => { await lms.lmsFlagColumns(); fake.reset(); });
 
 test('training progress is one atomic monotonic upsert', async () => {
   const result = await profile.setTrainingPercentage(8379, 3, 80);

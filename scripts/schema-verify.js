@@ -262,6 +262,8 @@ const EXPECTED = {
   training_videos: [
     'id', 'title', 'description', 'sub_title', 'sub_description',
     'training_video_id', 'is_global',
+    // migrations/2026-09-29-training-watch-time.sql; probed, listed strictly as above.
+    'duration_seconds',
   ],
   // ─── LMS (services/lms.service.js) ──────────────────────────────────────
   // `courses` and `easyfixer_courses` pre-date the LMS work; only
@@ -395,6 +397,7 @@ const EXPECTED = {
   ],
   easyfixer_watched_video: [
     'id', 'easyfixer_id', 'video_id', 'watched_percentage', 'update_date',
+    'first_watched_at', // 2026-09-29-training-watch-time.sql
   ],
   /*
    * The technician's Ratings screen. Its PK is `table_id`, NOT `id` — the query

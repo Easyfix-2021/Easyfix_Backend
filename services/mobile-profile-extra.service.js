@@ -538,23 +538,119 @@ async function getTrainingPercentages(efrId) {
 }
 
 /*
+ * ─── WATCH-TIME CHECK: A PERCENTAGE CANNOT OUTRUN THE CLOCK ───────────
+ *
+ * The app no longer lets a technician skip ahead or speed up, but this
+ * endpoint takes a bare number, so an API caller could still post 100 for a
+ * video they never played. So the credit is capped by how long it has been
+ * since the technician first reported on this video:
+ *
+ *   allowed = floor(elapsed / duration × 100) + WATCH_TOLERANCE_PCT, 0..100
+ *   credit  = min(requested, allowed)
+ *
+ * CAP, NEVER REJECT. The response stays 2xx and the credit simply catches up
+ * on a later ping, so a real viewer never sees an error — and an app replaying
+ * an offline queue is not punished for arriving late (late only raises
+ * elapsed).
+ *
+ * WHY THE TOLERANCE IS 30, NOT 10. The clock starts at the FIRST report, but
+ * the technician app does not report at 0%: both Expo training screens write
+ * checkpoints at 25/50/75/100 (PROGRESS_STEP = 25 in training-video.tsx and
+ * lms/course/[courseId].tsx). So an honest viewer's first report is already a
+ * quarter of the video in, and their 100% arrives only 75% of a duration
+ * later. Any tolerance under 25 strands every real viewer below 100 — at 85
+ * with a tolerance of 10. 25 is the app's head start; the other 5 absorbs
+ * network latency and the floor(). Lower it only together with the app's step.
+ *
+ * No cap when the video has no duration (NULL/0 — the operator has not entered
+ * one in the CRM), when either column is not migrated yet, or when elapsed is
+ * unknown. Unknown is not suspicious: this is an owner-approved soft check,
+ * and failing closed would lock technicians out of earning.
+ */
+const WATCH_TOLERANCE_PCT = 30;
+
+function allowedWatchPercent({ requested, elapsedSeconds, durationSeconds, tolerancePct = WATCH_TOLERANCE_PCT }) {
+  const req = Number(requested);
+  const dur = Number(durationSeconds);
+  if (!(dur > 0) || elapsedSeconds == null || !Number.isFinite(Number(elapsedSeconds))) return req;
+  const allowed = Math.floor((Math.max(0, Number(elapsedSeconds)) / dur) * 100) + tolerancePct;
+  return Math.min(req, Math.max(0, Math.min(100, allowed)));
+}
+
+// Once per video per process: pings arrive every few seconds during playback.
+const _noDurationWarned = new Set();
+
+/*
  * Upsert a single video's watched % — legacy
  * `training-video/update-watched-percentage`.
  *
  * migrations/executed/2026-08-11-02-training-progress-uniqueness.sql guarantees one
  * row per (easyfixer_id, video_id), and its database trigger prevents the
- * legacy Java writer from lowering an existing value. This single-statement
- * upsert is atomic for unified-backend concurrency; GREATEST also prevents a
+ * legacy Java writer from lowering an existing value. The upsert is a single
+ * atomic statement for unified-backend concurrency; GREATEST also prevents a
  * delayed offline replay from moving progress backwards.
+ *
+ * With the watch-time columns migrated there is ONE read before it (duration,
+ * existing progress, seconds since first_watched_at). The probe itself is
+ * cached and primed at boot, so pre-migration the hot path is still exactly
+ * the one upsert.
+ *
+ * first_watched_at is set on INSERT and never overwritten. A row that predates
+ * the column gets it on its next report, BACKDATED by the progress it already
+ * holds (existing% × duration): stamping it "now" would hold a technician who
+ * was 70% through at 70 until the clock caught up, even after they finished.
  */
 async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
   logger.info('Upsert training watched-% · videoId=' + videoId + ' watched=' + watchedPercentage);
   const now = new Date();
+  const { watchFirstAt, videoDuration } = await lms.lmsFlagColumns();
+  let credited = watchedPercentage;
+  let firstAt = now;
+
+  if (watchFirstAt && videoDuration) {
+    try {
+      const [[row]] = await pool.query(
+        `SELECT tv.duration_seconds AS duration_s,
+                w.id AS row_id,
+                w.watched_percentage AS pct,
+                TIMESTAMPDIFF(SECOND, w.first_watched_at, ?) AS elapsed_s
+           FROM training_videos tv
+           LEFT JOIN easyfixer_watched_video w
+             ON w.video_id = tv.id AND w.easyfixer_id = ?
+          WHERE tv.id = ?`,
+        [now, efrId, videoId],
+      );
+      const duration = Number(row?.duration_s) || 0;
+      let elapsed = row?.elapsed_s == null ? null : Number(row.elapsed_s);
+      if (row && row.row_id == null) elapsed = 0; // first ever report: starts now
+      if (row && row.row_id != null && elapsed == null && duration > 0) {
+        const backdate = Math.floor((Math.min(100, Number(row.pct) || 0) / 100) * duration);
+        firstAt = new Date(now.getTime() - backdate * 1000);
+        elapsed = backdate;
+      }
+      if (duration > 0) {
+        credited = allowedWatchPercent({ requested: watchedPercentage, elapsedSeconds: elapsed, durationSeconds: duration });
+        if (credited < watchedPercentage) {
+          logger.warn({ efrId, videoId, requested: watchedPercentage, credited, elapsed, duration },
+            'training watched-% capped by watch time');
+        }
+      } else if (!_noDurationWarned.has(videoId)) {
+        _noDurationWarned.add(videoId);
+        logger.warn('Training video ' + videoId + ' has no duration_seconds — watched-% is NOT time-checked');
+      }
+    } catch (e) {
+      // The check is advisory; progress recording is not. Skip it, never fail.
+      logger.warn({ err: e.message, efrId, videoId }, 'watch-time check failed — recording uncapped');
+    }
+  }
+
+  const stamp = watchFirstAt;
   await pool.query(
     `INSERT INTO easyfixer_watched_video
-       (easyfixer_id, video_id, watched_percentage, update_date)
-     VALUES (?, ?, ?, ?)
+       (easyfixer_id, video_id, watched_percentage, update_date${stamp ? ', first_watched_at' : ''})
+     VALUES (?, ?, ?, ?${stamp ? ', ?' : ''})
      ON DUPLICATE KEY UPDATE
+       ${stamp ? 'first_watched_at = COALESCE(first_watched_at, ?),' : ''}
        update_date = IF(
          VALUES(watched_percentage) > COALESCE(watched_percentage, 0),
          ?,
@@ -564,11 +660,13 @@ async function setTrainingPercentage(efrId, videoId, watchedPercentage) {
          COALESCE(watched_percentage, 0),
          VALUES(watched_percentage)
        )`,
-    [efrId, videoId, watchedPercentage, now, now],
+    stamp
+      ? [efrId, videoId, credited, now, firstAt, firstAt, now]
+      : [efrId, videoId, credited, now, now],
   );
-  logger.info('Training watched-% saved · videoId=' + videoId);
-  await maybeAdvanceTrainingLifecycle(efrId, watchedPercentage);
-  return { videoId, watchedPercentage };
+  logger.info('Training watched-% saved · videoId=' + videoId + ' credited=' + credited);
+  await maybeAdvanceTrainingLifecycle(efrId, credited);
+  return { videoId, watchedPercentage: credited };
 }
 
 /*
@@ -813,6 +911,8 @@ module.exports = {
   getRatings,
   getTrainingPercentages,
   setTrainingPercentage,
+  allowedWatchPercent,
+  WATCH_TOLERANCE_PCT,
   getAppVersion,
   logout,
   getUpiDetails,

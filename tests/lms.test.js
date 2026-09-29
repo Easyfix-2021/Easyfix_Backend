@@ -1,4 +1,4 @@
-const { test, after } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
@@ -33,6 +33,9 @@ const profile = require('../services/mobile-profile-extra.service');
 const lifecycle = require('../services/easyfixer-lifecycle.service');
 
 after(() => fake.restore());
+// Pre-migration schema: the watch-time check is off, so the hot path is the
+// one upsert. The probe is primed at boot in production; prime it here too.
+before(async () => { await lms.lmsFlagColumns(); fake.reset(); });
 
 // ─── isTrainingComplete ──────────────────────────────────────────────
 
