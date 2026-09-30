@@ -331,3 +331,39 @@ function route(routes) {
   };
   return () => { db.pool.query = previous; };
 }
+
+// ─── retireCourse ────────────────────────────────────────────────────
+
+/*
+ * A course technicians are still working through cannot be retired — by
+ * DELETE (retireCourse) or by PATCH { status: false } (updateCourse). The
+ * pending count is scoped to courses WITH content, so an empty course such as
+ * "Deepskill" (0 items, 4927 holders) can still be retired as cleanup.
+ */
+function retireRoutes(pending) {
+  return route([
+    [/FROM courses WHERE id = \?/i, [{ id: 7, name: 'Induction', status: 1 }]],
+    [/SELECT COUNT\(\*\) AS n\s+FROM easyfixer_courses ec\s+WHERE ec\.course_id = \?/i, [{ n: pending }]],
+    [/^\s*UPDATE courses SET/i, { affectedRows: 1 }],
+  ]);
+}
+
+test('retiring a course with pending assignees is refused, by DELETE and by PATCH', async () => {
+  fake.reset();
+  const restore = retireRoutes(3);
+  await assert.rejects(lms.retireCourse(7), (e) => e.status === 409 && /3 technicians have/.test(e.message));
+  await assert.rejects(lms.updateCourse(7, { status: false }), (e) => e.status === 409);
+  const writes = fake.calls.filter(({ sql }) => /^\s*UPDATE courses/i.test(sql));
+  restore();
+  assert.equal(writes.length, 0, 'a refused retire must write nothing');
+});
+
+test('retiring a course nobody is working through goes ahead', async () => {
+  fake.reset();
+  const restore = retireRoutes(0);
+  assert.deepEqual(await lms.retireCourse(7), { retired: true });
+  const [pendingQuery] = fake.calls.filter(({ sql }) => /WHERE ec\.course_id = \?/.test(sql));
+  restore();
+  assert.match(pendingQuery.sql, /FROM lms_content lc WHERE lc\.course_id = ec\.course_id/,
+    'pending counts only a course that CAN be completed');
+});

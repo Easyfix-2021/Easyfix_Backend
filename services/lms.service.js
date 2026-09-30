@@ -496,6 +496,7 @@ async function updateCourse(id, patch = {}) {
     params.push(patch.certificate_enabled ? 1 : 0);
   }
   if (patch.status !== undefined) {
+    if (!patch.status) await assertNothingPending(courseId);
     sets.push('status = ?');
     params.push(patch.status ? 1 : 0);
   }
@@ -515,6 +516,31 @@ async function updateCourse(id, patch = {}) {
 }
 
 /*
+ * A course technicians are still working through cannot be retired.
+ *
+ * Retiring hides it from the operator and stops it gating, but leaves every
+ * assignee holding an unfinished course they can no longer be chased on, so
+ * the operator must first let them finish or unassign them. "Pending" is
+ * counted only while the course HAS content: an empty course can never be
+ * completed, so nobody is working through it and retiring it is the cleanup.
+ */
+async function assertNothingPending(courseId) {
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS n
+       FROM easyfixer_courses ec
+      WHERE ec.course_id = ?
+        AND ec.completion_date IS NULL
+        AND ${COURSE_HAS_CONTENT}`,
+    [courseId],
+  );
+  const n = Number(row?.n) || 0;
+  if (n > 0) {
+    throw mkErr(409, `${n} technician${n === 1 ? ' has' : 's have'} this course pending — `
+      + 'unassign them or wait for them to complete it before retiring');
+  }
+}
+
+/*
  * Retire, never DELETE. The assignment and progress history that points at a
  * course outlives the course's usefulness — a technician who completed
  * "Induction 2025" still completed it after the course is withdrawn, and the
@@ -523,6 +549,7 @@ async function updateCourse(id, patch = {}) {
 async function retireCourse(id) {
   const courseId = Number(id);
   await getCourseById(courseId);
+  await assertNothingPending(courseId);
   await pool.query('UPDATE courses SET status = 0 WHERE id = ?', [courseId]);
   logger.info('Course retired · id=' + courseId);
   return { retired: true };
@@ -643,10 +670,6 @@ async function assertRefsExist(items) {
    * can never be passed; itemCompleteSql needs a PASSING attempt, so the
    * course never completes; and the overdue restriction eventually withdraws
    * work for training the technician had no way to finish.
-   *
-   * Checked here rather than in setCourseContent so the video-only save path
-   * (setCourseVideos, which re-submits the course's existing items) is covered
-   * by the same guard.
    */
   const assessmentIds = [...new Set(items.filter((i) => i.kind === 'assessment').map((i) => Number(i.ref_id)))];
   if (assessmentIds.length) {
@@ -745,47 +768,6 @@ async function setCourseContent(courseId, items = []) {
 
   logger.info('Course content saved · courseId=' + id);
   return getCourseContent(id);
-}
-
-async function getCourseVideos(courseId) {
-  const items = await getCourseContent(courseId);
-  // The legacy shape the CRM's video picker still reads: `video_id`, not
-  // `ref_id`. Kept as a projection over the same rows rather than a second
-  // query, so the two endpoints can never disagree about what a course holds.
-  return items
-    .filter((i) => i.kind === 'video')
-    .map((i) => ({
-      id: i.id,
-      video_id: i.ref_id,
-      sequence: i.sequence,
-      title: i.title,
-      sub_title: i.sub_title,
-      description: i.description,
-      video_url: i.video_url,
-    }));
-}
-
-/*
- * The video-only editor's save, expressed over the full content list.
- *
- * PUT /courses/:id/videos carries only videos, so it cannot express where a
- * document or an assessment sits relative to them. Rather than inventing an
- * answer, the submitted videos take the head positions and every other kind
- * keeps its existing relative order behind them — nothing is dropped, which is
- * the property that matters, and the full-content endpoint is where
- * interleaving is actually decided.
- */
-async function setCourseVideos(courseId, videoIds = []) {
-  const id = Number(courseId);
-  const ids = [...new Set(videoIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  const [rest] = await pool.query(
-    `SELECT kind, ref_id FROM lms_content
-      WHERE course_id = ? AND status = 1 AND kind <> 'video'
-      ORDER BY sequence ASC, id ASC`,
-    [id],
-  );
-  await setCourseContent(id, [...ids.map((v) => ({ kind: 'video', ref_id: v })), ...rest]);
-  return getCourseVideos(id);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1276,6 +1258,7 @@ async function stampCompletionsForCourse(courseId, easyfixerIds = []) {
  */
 async function pendingTraining(efrId) {
   const today = istToday();
+  const { courseMandatory } = await lmsFlagColumns();
   /*
    * videos_total / videos_done are now ITEM counts of every kind. The aliases
    * are kept because the technician app reads them by name and an installed
@@ -1283,7 +1266,8 @@ async function pendingTraining(efrId) {
    * "how much of this course is left", which is all the banner renders.
    */
   const [rows] = await pool.query(
-    `SELECT ec.course_id, c.name AS course_name, ec.due_date,
+    `SELECT ec.course_id, c.name AS course_name, ec.due_date, c.status AS course_status,
+            ${courseMandatory ? 'c.is_mandatory' : '0'} AS mandatory,
             ${COURSE_ITEMS_TOTAL} AS videos_total,
             ${COURSE_ITEMS_DONE} AS videos_done
        FROM easyfixer_courses ec
@@ -1304,6 +1288,11 @@ async function pendingTraining(efrId) {
       videos_total: Number(r.videos_total),
       videos_done: Number(r.videos_done),
       overdue: Boolean(r.due_date && String(r.due_date).slice(0, 10) < today),
+      // Same rule as overdueMandatorySql: only an overdue, mandatory, active
+      // course restricts new offers. Lets the overlay's reason list exactly
+      // the courses doing the blocking.
+      blocking: Boolean(r.due_date && String(r.due_date).slice(0, 10) < today)
+        && Number(r.mandatory) === 1 && Number(r.course_status) === 1,
     }));
 
   return {
@@ -1315,23 +1304,62 @@ async function pendingTraining(efrId) {
 }
 
 /*
- * Is this technician locked out of everything except training?
+ * THE overdue-training rule — the single definition behind both the offer gate
+ * (easyfixer-lifecycle.overdueTrainingSql, one per candidate row) and the
+ * display overlay (hasOverdueTraining below, one per technician).
  *
- * Deliberately a COUNT and nothing else: it runs on the mobile hot path (every
- * authenticated request resolves lifecycle capabilities), so it must not pull
- * rows or join the video tables. idx_efr_course_due covers it exactly.
+ * ONLY A MANDATORY, ACTIVE COURSE WITH CONTENT BLOCKS (2026-09-29). The first
+ * cut counted every assignment with a lapsed due_date, so an optional course
+ * ("Deepskill" — not mandatory, zero content, so uncompletable) handed out with
+ * a deadline stopped efr 3687 receiving offers under a "Mandatory training is
+ * overdue" message. An optional course may still go overdue in the Training
+ * Report; it just never restricts work.
+ *   - c.status = 1: retiring a course must actually stop it gating.
+ *   - COURSE_HAS_CONTENT: a course with nothing in it can never be completed,
+ *     so it must never be owed (pendingTraining drops the same rows).
+ *
+ * `efrRef` is either `<alias>.efr_id` (correlated, for row projections) or `?`
+ * (bound, for a single technician). Deadlines are calendar dates, so today is
+ * interpolated as a DATE literal — no timezone conversion.
+ *
+ * entitlement-guard: job gating, not an entitlement read. No badge or
+ * certificate is served from here; c.status only decides who is blocked.
+ */
+async function overdueMandatorySql(efrRef) {
+  if (!/^([A-Za-z_][A-Za-z0-9_]*\.efr_id|\?)$/.test(efrRef)) {
+    throw new Error('invalid SQL alias for lifecycle projection');
+  }
+  const today = istToday();
+  // Intl output, not user input, but interpolated rather than bound — prove it.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) {
+    throw new Error('istToday() did not return YYYY-MM-DD');
+  }
+  const { courseMandatory } = await lmsFlagColumns();
+  return `EXISTS (SELECT 1
+                    FROM easyfixer_courses ec
+                    JOIN courses c ON c.id = ec.course_id
+                   WHERE ec.easyfixer_id = ${efrRef}
+                     AND ${courseMandatory ? 'c.is_mandatory = 1' : '1=0'}
+                     AND c.status = 1
+                     AND ec.due_date IS NOT NULL
+                     AND ec.due_date < '${today}'
+                     AND ec.completion_date IS NULL
+                     AND ${COURSE_HAS_CONTENT})`;
+}
+
+/*
+ * Is this technician restricted to training-only for NEW offers?
+ *
+ * Runs on the mobile hot path (every authenticated request resolves lifecycle
+ * capabilities): one EXISTS over idx_efr_course_due plus a PK join, no rows
+ * pulled.
  */
 async function hasOverdueTraining(efrId) {
   const [[row]] = await pool.query(
-    `SELECT COUNT(*) AS n
-       FROM easyfixer_courses
-      WHERE easyfixer_id = ?
-        AND completion_date IS NULL
-        AND due_date IS NOT NULL
-        AND due_date < ?`,
-    [Number(efrId), istToday()],
+    `SELECT ${await overdueMandatorySql('?')} AS n`,
+    [Number(efrId)],
   );
-  return Number(row.n) > 0;
+  return Number(row?.n) > 0;
 }
 
 /*
@@ -3131,6 +3159,7 @@ module.exports = {
   stampCompletionsForCourse,
   pendingTraining,
   hasOverdueTraining,
+  overdueMandatorySql,
   parseYouTubeUrl,
   normalizeVideoUrl,
   setVideoLink,
@@ -3143,8 +3172,6 @@ module.exports = {
   createCourse,
   updateCourse,
   retireCourse,
-  getCourseVideos,
-  setCourseVideos,
   getCourseContent,
   setCourseContent,
   CONTENT_KINDS,
