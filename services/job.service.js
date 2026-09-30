@@ -6472,7 +6472,10 @@ function statusToEventName(prevStatus, newStatus) {
   // rely on NO event firing (see routes/mobile/index.js).
   if (Number(prevStatus) === Number(newStatus)) return null;
   if (newStatus === STATUS.IN_PROGRESS)   return 'TechStart';
-  if (COMPLETED_STATES.has(newStatus))    return 'TechVisitComplete';
+  // 3 → 5 (Feedback & Complete) closes nothing new: the visit was reported
+  // complete when the job ENTERED 3, so a second TechVisitComplete would be a
+  // duplicate at every webhook client.
+  if (COMPLETED_STATES.has(newStatus))    return COMPLETED_STATES.has(Number(prevStatus)) ? null : 'TechVisitComplete';
   if (newStatus === STATUS.CANCELLED)     return 'CancelJob';
   if (newStatus === STATUS.REVISIT)       return 'TechVisitInComplete';
   // Unreachable outcome → CustomerNotReachable. Legacy CRM didn't
@@ -6554,6 +6557,11 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   // name, and readers still see it on the job row, so the contract the
   // technician app depends on is unchanged.
   'material_sub_status', 'permission_required',
+  // Audit & Checkout (10 → 3, 2026-09-30) — ops confirm Collected By in the
+  // same call, as legacy's sp_ef_checkout_job_and_update_transaction writes it
+  // with the checkout. Inside the ledger transaction, so the posting reads the
+  // value just written. validators/job.validator.js statusBody admits it only on 3 / 5.
+  'collected_by',
 ]);
 
 /*
@@ -6893,6 +6901,12 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), crmUserId);
+    // Feedback & Complete (3 → 5): legacy sp_ef_job_update_job('Feedback')
+    // stamps who closed the feedback and when. COALESCE, like the checkout pair.
+    if (Number(status) === STATUS.COMPLETED_ALT) {
+      sets.push('feedback_date_time = COALESCE(feedback_date_time, ?)', 'fk_feedback_by = COALESCE(fk_feedback_by, ?)');
+      values.push(new Date(), crmUserId);
+    }
     // Sent-back lifecycle (mobile app spec): when a tech re-closes a
     // job that was sent back from the CRM, reset the flag so the
     // "Action Required" tile stops counting it. Conditionally
@@ -7127,6 +7141,11 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     }
     if (Number(status) === STATUS.REVISIT && Number(existing.job_status) !== STATUS.REVISIT) {
       await jobLog.logRevisitRequired(jobId, { reasonId: extras?.revisit_reason_id }, actor);
+    }
+    // Feedback & Complete: the technician's rating joins the average that
+    // grades and ranks technicians, as legacy's feedback SP inserts it.
+    if (Number(status) === STATUS.COMPLETED_ALT && Number(existing.job_status) !== STATUS.COMPLETED_ALT && crmUserId) {
+      await require('./job-feedback.service').recordTechnicianRating(jobId);
     }
   } catch (e) {
     logger.warn('Job history write failed (non-fatal) · id=' + jobId + ' · ' + e.message);

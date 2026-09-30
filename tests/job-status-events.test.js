@@ -57,3 +57,14 @@ test('transitions with no customer-facing event map to null', () => {
   assert.equal(statusToEventName(STATUS.CALL_LATER, STATUS.BOOKED), null);
   assert.equal(statusToEventName(STATUS.SCHEDULED, STATUS.ENQUIRY), null);
 });
+
+test('moving BETWEEN completed states (3 ↔ 5) fires no second TechVisitComplete', () => {
+  // Feedback & Complete (3 → 5, 2026-09-30): the visit was reported complete
+  // when the job entered 3; a repeat would reach every webhook client twice.
+  assert.equal(statusToEventName(STATUS.COMPLETED, STATUS.COMPLETED_ALT), null);
+  assert.equal(statusToEventName(STATUS.COMPLETED_ALT, STATUS.COMPLETED), null);
+  // Positive controls: ENTERING a completed state still fires, from any source.
+  assert.equal(statusToEventName(STATUS.REVISIT, STATUS.COMPLETED), 'TechVisitComplete');
+  assert.equal(statusToEventName(STATUS.IN_PROGRESS, STATUS.COMPLETED_ALT), 'TechVisitComplete');
+  assert.equal(statusToEventName('10', STATUS.COMPLETED), 'TechVisitComplete', 'a string prev status (DB row) must not read as completed');
+});

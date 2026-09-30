@@ -38,7 +38,16 @@ const { serviceChargeMap } = require('./job-service-breakdown.service');
  *     DATETIME column — NEVER SQL NOW() (see DATETIME IST convention).
  */
 
-const CHARGE_TYPES = ['Penalty', 'Travel', 'Incentive'];
+/*
+ * 'Material' (2026-09-30) — legacy's audit screen (appCheckoutJobDetail →
+ * MaterialAction.addAndUpdateMaterial → MaterialDaoImpl.saveMaterialWithType)
+ * adds and re-prices material lines at checkout: units x Tx / Cx unit price.
+ * 84.7k of QA's job_material rows are this type, against 17.7k Travel and
+ * single digits of the other two. The completion ledger already pays tx_charge
+ * on them (job-ledger.service materialSign), so a row written here posts.
+ */
+const CHARGE_TYPES = ['Penalty', 'Travel', 'Incentive', 'Material'];
+const TYPE_IN = CHARGE_TYPES.map(() => '?').join(', ');
 // image_category values (canonical labels). Stored lowercased by the shared
 // job-image.service; compared case-insensitively on read/delete.
 const DOC_CATEGORIES = ['JobSheet', 'PurchaseOrder'];
@@ -71,11 +80,11 @@ async function getCharges(jobId) {
   logger.info('Load job charges · jobId=' + id);
 
   const [materials] = await pool.query(
-    `SELECT id, type, tx_charge, client_charge, reason,
+    `SELECT id, type, name, description, unit, uom, tx_charge, client_charge, reason,
             from_city_name, to_city_name, total_distance,
             tx_unit, cx_unit, document_name, is_client_approval_needed
        FROM job_material
-      WHERE job_id = ? AND type IN (?, ?, ?)
+      WHERE job_id = ? AND type IN (${TYPE_IN})
       ORDER BY id DESC`,
     [id, ...CHARGE_TYPES]
   );
@@ -219,14 +228,38 @@ async function createIncentive(jobId, b, userId) {
   return { id: ins.insertId, type: 'Incentive' };
 }
 
+/*
+ * Material — legacy saveMaterialWithType's columns. The two charges are DERIVED,
+ * units x unit price, as legacy's screen computes them before posting; taking
+ * them from the caller would let a total disagree with its own units.
+ */
+function materialCharges(b) {
+  return { txCharge: b.unit * b.txUnit, clientCharge: b.unit * b.clientUnit };
+}
+
+async function createMaterial(jobId, b, userId) {
+  const { txCharge, clientCharge } = materialCharges(b);
+  assertChargeOrder(txCharge, clientCharge);
+  const [ins] = await pool.query(
+    `INSERT INTO job_material
+       (job_id, type, name, description, unit, uom, tx_unit, cx_unit,
+        tx_charge, client_charge, is_pre_approved, inserted_by, inserted_date_time)
+     VALUES (?, 'Material', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    [Number(jobId), b.name, b.description ?? null, b.unit, b.uom ?? null,
+     b.txUnit, b.clientUnit, txCharge, clientCharge, String(userId), new Date()]
+  );
+  logger.info('Material created · id=' + ins.insertId + ' · jobId=' + jobId);
+  return { id: ins.insertId, type: 'Material' };
+}
+
 // ─── EDIT (type resolved from the row) ───────────────────────────────
 // The edit endpoint is type-agnostic at the route; here we load the row (which
-// also enforces job ownership + that it's one of the 3 charge types) and update
+// also enforces job ownership + that it's one of the CHARGE_TYPES) and update
 // only the columns that belong to that type. Missing required fields → 400.
 async function editCharge(jobId, chargeId, b, userId) {
   const [[row]] = await pool.query(
     `SELECT id, type, is_client_approval_needed FROM job_material
-      WHERE id = ? AND job_id = ? AND type IN (?, ?, ?) LIMIT 1`,
+      WHERE id = ? AND job_id = ? AND type IN (${TYPE_IN}) LIMIT 1`,
     [Number(chargeId), Number(jobId), ...CHARGE_TYPES]
   );
   if (!row) { const e = new Error('charge not found'); e.status = 404; throw e; }
@@ -241,12 +274,30 @@ async function editCharge(jobId, chargeId, b, userId) {
 
   const missing = [];
   const num = (v) => (v == null || v === '' ? null : Number(v));
+  const now = new Date();
+  if (row.type === 'Material') {
+    for (const k of ['name', 'unit', 'txUnit', 'clientUnit']) if (b[k] == null || b[k] === '') missing.push(k);
+    if (missing.length) { const e = new Error('Missing required fields: ' + missing.join(', ')); e.status = 400; e.missing = missing; throw e; }
+    const m = materialCharges(b);
+    assertChargeOrder(m.txCharge, m.clientCharge);
+    await pool.query(
+      `UPDATE job_material
+          SET name = ?, description = ?, unit = ?, uom = ?, tx_unit = ?, cx_unit = ?,
+              tx_charge = ?, client_charge = ?, is_client_approval_needed = ?,
+              updated_by = ?, updated_date_time = ?
+        WHERE id = ? AND job_id = ?`,
+      [b.name, b.description ?? null, b.unit, b.uom ?? null, b.txUnit, b.clientUnit,
+       m.txCharge, m.clientCharge, approvalFlag, String(userId), now,
+       Number(chargeId), Number(jobId)]
+    );
+    logger.info('Charge edited · id=' + chargeId + ' · type=Material · jobId=' + jobId);
+    return { id: Number(chargeId), type: row.type };
+  }
   const txCharge = num(b.txCharge);
   const clientCharge = num(b.clientCharge);
   if (txCharge == null || !Number.isFinite(txCharge)) missing.push('txCharge');
   if (clientCharge == null || !Number.isFinite(clientCharge)) missing.push('clientCharge');
 
-  const now = new Date();
   if (row.type === 'Travel') {
     if (b.totalDistance == null) missing.push('totalDistance');
     if (b.txUnit == null) missing.push('txUnit');
@@ -300,7 +351,7 @@ async function setChargeApproval(jobId, chargeId, isClientApprovalNeeded, userId
   const [r] = await pool.query(
     `UPDATE job_material
         SET is_client_approval_needed = ?, updated_by = ?, updated_date_time = ?
-      WHERE id = ? AND job_id = ? AND type IN (?, ?, ?)`,
+      WHERE id = ? AND job_id = ? AND type IN (${TYPE_IN})`,
     [bit, String(userId), new Date(), Number(chargeId), Number(jobId), ...CHARGE_TYPES]
   );
   if (r.affectedRows === 0) { const e = new Error('charge not found'); e.status = 404; throw e; }
@@ -308,11 +359,11 @@ async function setChargeApproval(jobId, chargeId, isClientApprovalNeeded, userId
   return { id: Number(chargeId), is_client_approval_needed: bit === 1 };
 }
 
-// ─── DELETE (only Penalty/Travel/Incentive rows) ─────────────────────
+// ─── DELETE (only the CHARGE_TYPES rows) ─────────────────────
 async function deleteCharge(jobId, chargeId) {
   const [r] = await pool.query(
     `DELETE FROM job_material
-      WHERE id = ? AND job_id = ? AND type IN (?, ?, ?)`,
+      WHERE id = ? AND job_id = ? AND type IN (${TYPE_IN})`,
     [Number(chargeId), Number(jobId), ...CHARGE_TYPES]
   );
   if (r.affectedRows === 0) { const e = new Error('charge not found'); e.status = 404; throw e; }
@@ -338,6 +389,7 @@ module.exports = {
   imageUrl,
   getCharges,
   createPenalty,
+  createMaterial,
   createTravel,
   createIncentive,
   editCharge,
