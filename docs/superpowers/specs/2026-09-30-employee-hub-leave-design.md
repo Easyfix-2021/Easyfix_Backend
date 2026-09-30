@@ -88,7 +88,7 @@ No new action key: who may approve is data (RH / `isRosterAdmin`), not a role.
   - PENDING (any duration) → the planned day plus `leave: { id, kind, duration, status: 'PENDING' }`.
   One extra indexed query per resolve.
 - **Grid rendering:** the label slot under the circle carries the leave, short so it never wraps
-  (`whitespace-nowrap`) — pending (amber): "Requested" / "Req · ½ LV · 1st Half"; approved half
+  (`whitespace-nowrap`) — pending (amber): "Requested" (full day) / "Req · 1st Half" (half day); approved half
   day (blue): "½ LV · 2nd Half" / "½ SL · 1st Half". Full-day approved leave replaces the circle
   with a locked LV / SL chip.
 - **Lock:** `saveCells` / `fillPattern` / `bulk` / `resetRange` skip dates with an APPROVED
