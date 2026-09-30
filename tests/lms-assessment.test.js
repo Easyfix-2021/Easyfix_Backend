@@ -642,23 +642,6 @@ test('an unknown ref id is refused before anything is written', async () => {
   assert.equal(call(/INSERT INTO lms_content/i), undefined);
 });
 
-test('the video-only save leaves documents and assessments in place', async () => {
-  fake.reset();
-  scenario = [
-    // What the course already holds besides videos.
-    [/SELECT kind, ref_id FROM lms_content/i, [
-      { kind: 'document', ref_id: 9 },
-      { kind: 'assessment', ref_id: 5 },
-    ]],
-    ...contentScenario(),
-  ];
-  await lms.setCourseVideos(4, [3]);
-  const written = callsMatching(/INSERT INTO lms_content/i).map((c) => c.params.slice(1, 4));
-  assert.deepEqual(written, [['video', 3, 1], ['document', 9, 2], ['assessment', 5, 3]],
-    'the legacy payload carries only videos, so it must not be read as "delete '
-    + 'everything else" — they keep their relative order behind the videos');
-});
-
 // ─── Unfinishable content cannot be attached to a course ─────────────
 
 /*

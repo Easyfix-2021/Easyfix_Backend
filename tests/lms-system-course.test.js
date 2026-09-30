@@ -63,7 +63,6 @@ test('its name and description stay editable', async () => {
 
 test('saving it with no videos, or with anything but videos, is refused', async () => {
   await assert.rejects(lms.setCourseContent(9, []), code(400));
-  await assert.rejects(lms.setCourseVideos(9, []), code(400));
   await assert.rejects(lms.setCourseContent(9, [{ kind: 'video', ref_id: 4 }, { kind: 'document', ref_id: 2 }]), code(400));
   assert.deepEqual(writes(), []);
   await lms.setCourseContent(9, [{ kind: 'video', ref_id: 4 }]);

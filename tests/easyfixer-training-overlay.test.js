@@ -40,6 +40,13 @@ let openJobCount = 0;
 let pendingRows = [];   // rows, or an Error instance to make the lookup throw
 
 const fake = installFakePool([
+  // hasOverdueTraining() is `SELECT EXISTS (… FROM easyfixer_courses ec JOIN
+  // courses c …)`, so it would also match the pendingTraining route below —
+  // it has to be caught first.
+  [/^\s*SELECT EXISTS/i, () => {
+    if (overdueCount instanceof Error) throw overdueCount;
+    return [{ n: overdueCount }];
+  }],
   // MUST precede the bare easyfixer_courses route: pendingTraining's statement
   // also selects FROM easyfixer_courses, and first-match-wins would otherwise
   // hand it the COUNT row and silently produce an empty course list.
@@ -65,8 +72,10 @@ const snapshotFor = (status) => Object.freeze({
 
 // A course row shaped like pendingTraining()'s SELECT. Dates are far enough in
 // the past that "overdue" is true on any day this suite ever runs.
-const courseRow = (course_id, course_name, due_date) => ({
+// Mandatory and active by default: only such a course is a blocking reason.
+const courseRow = (course_id, course_name, due_date, extra = {}) => ({
   course_id, course_name, due_date, videos_total: 3, videos_done: 1,
+  mandatory: 1, course_status: 1, ...extra,
 });
 
 test('overdue training withdraws receiveNewJobs and NOTHING else', async () => {
@@ -204,6 +213,24 @@ test('a course that is not yet overdue is not listed as a reason', async () => {
   const result = await lifecycle.overlayTrainingRestriction(snapshotFor('ACTIVE'), 8379);
   assert.equal(result.trainingOverdueDetail.count, 1);
   assert.deepEqual(result.trainingOverdueDetail.courses.map((c) => c.id), [21]);
+});
+
+test('an overdue OPTIONAL or RETIRED course is never listed as a reason', async () => {
+  // efr 3687, 2026-09-29: "Deepskill" (not mandatory) was overdue and named
+  // as "Mandatory training is overdue". Only the mandatory one may appear.
+  overdueCount = 1;
+  pendingRows = [
+    courseRow(41, 'Deepskill', '2020-01-05', { mandatory: 0 }),
+    courseRow(42, 'Retired Mandatory', '2020-01-06', { course_status: 0 }),
+    courseRow(43, 'Electrician Assessment', '2020-01-07'),
+  ];
+
+  const result = await lifecycle.overlayTrainingRestriction(snapshotFor('ACTIVE'), 8379);
+  assert.equal(result.trainingOverdueDetail.count, 1);
+  assert.deepEqual(result.trainingOverdueDetail.courses.map((c) => c.id), [43]);
+
+  pendingRows = [];
+  overdueCount = 0;
 });
 
 test('the detail is OMITTED, never an empty husk, when the courses cannot be listed', async () => {

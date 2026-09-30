@@ -669,31 +669,21 @@ function resetSchemaProbeForTests() {
  * one query per row, and the server-authoritative offer gate
  * (job.service.assertTechniciansCanReceiveJobs) never calls the overlay at all
  * — it projects rows and asks easyfixer-work-eligibility.fromRow(). So the same
- * condition is expressed once more here, as SQL, and shipped to every one of
- * those rows through readProjection() below.
+ * condition is shipped, as a correlated SQL fragment, to every one of those
+ * rows through readProjection() below.
  *
- * The DATE is not restated: lms.istToday() is the single definition of "which
- * calendar day is today" and this reuses it. Deadlines are calendar dates, not
- * instants (see the note on lms.service.js istToday), so there is deliberately
- * no timezone conversion here — a plain DATE < DATE comparison.
- *
- * Column order matches idx_efr_course_due (easyfixer_id, due_date,
- * completion_date), so this is an index-only probe per row.
+ * ASYNC since 2026-09-29: the fragment names courses.is_mandatory, a probed
+ * column, so building it needs lms.lmsFlagColumns(). Only mandatory courses
+ * block — see lms.overdueMandatorySql for the rule and why.
  */
 function overdueTrainingSql(alias = 'e') {
+  // Asserted here, synchronously, so a bad alias throws at the call rather
+  // than surfacing later as a rejected promise.
   assertSqlAlias(alias);
-  const today = lms.istToday();
-  // istToday() is Intl output, not user input, but this is interpolated rather
-  // than bound (a projection string has no parameter slots), so prove it.
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) {
-    throw new Error('istToday() did not return YYYY-MM-DD');
-  }
-  return `EXISTS (SELECT 1
-                    FROM easyfixer_courses ec
-                   WHERE ec.easyfixer_id = ${alias}.efr_id
-                     AND ec.due_date IS NOT NULL
-                     AND ec.due_date < '${today}'
-                     AND ec.completion_date IS NULL)`;
+  // The rule itself (mandatory + active + has content + lapsed + unfinished)
+  // lives in lms.overdueMandatorySql, shared with lms.hasOverdueTraining, so
+  // the offer gate and the overlay cannot disagree about who is blocked.
+  return lms.overdueMandatorySql(`${alias}.efr_id`);
 }
 
 function assertSqlAlias(alias) {
@@ -766,7 +756,7 @@ async function readProjection(alias = 'e') {
    * deadline must not decide which CRM transitions are legal.
    */
   const training = (await hasTrainingDeadlineSchema())
-    ? `${overdueTrainingSql(alias)} AS training_overdue`
+    ? `${await overdueTrainingSql(alias)} AS training_overdue`
     : '0 AS training_overdue';
   if (!(await hasLifecycleSchema())) {
     return `NULL AS lifecycle_status,
@@ -1075,7 +1065,9 @@ async function overlayTrainingRestriction(snapshot, efrId) {
 async function overdueTrainingDetail(efrId) {
   try {
     const { courses } = await lms.pendingTraining(efrId);
-    const overdue = courses.filter((course) => course.overdue);
+    // Only the courses that actually block — an optional overdue course is
+    // not a reason, and listing it would name the wrong thing to finish.
+    const overdue = courses.filter((course) => course.blocking);
     if (!overdue.length) return null;
     const dueDate = (course) => String(course.due_date).slice(0, 10);
     return {

@@ -66,7 +66,7 @@ function assertAlias(alias) {
 async function sqlPredicate(alias = 'e') {
   assertAlias(alias);
   const training = (await lifecycleService.hasTrainingDeadlineSchema())
-    ? ` AND NOT ${lifecycleService.overdueTrainingSql(alias)}`
+    ? ` AND NOT ${await lifecycleService.overdueTrainingSql(alias)}`
     : '';
   if (!(await lifecycleService.hasLifecycleSchema())) {
     // No lifecycle columns to consult, and none to contradict the legacy bit.

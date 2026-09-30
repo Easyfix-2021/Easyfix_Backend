@@ -45,7 +45,7 @@ const logger = require('../../logger');
  *   per-request object computed once in routes/admin/index.js and is passed
  *   into the service exactly as routes/admin/easyfixers.js does.
  *
- *   /courses and /courses/:id/videos are deliberately NOT scoped. A course
+ *   /courses and /courses/:id/content are deliberately NOT scoped. A course
  *   is master data with no city, and inventing one would hide content from
  *   the very people who have to assign it.
  *
@@ -124,16 +124,6 @@ const updateCourseBody = Joi.object({
 }).min(1);
 
 /*
- * The content payload is the FULL ordered list, not a delta — the handler
- * replaces the course's content with exactly what arrives. An empty array is
- * explicitly allowed: clearing a course's content is a legitimate edit, and
- * rejecting it would leave an operator unable to undo a mistaken add.
- */
-const setContentBody = Joi.object({
-  video_ids: Joi.array().items(Joi.number().integer().positive()).max(100).required(),
-});
-
-/*
  * The kind-aware version of the same thing. ORDER IS ARRAY ORDER — the payload
  * carries no `sequence`, because two clients disagreeing about whether
  * sequence is 0- or 1-based is a bug that only shows up as a mis-ordered
@@ -143,7 +133,10 @@ const setCourseContentBody = Joi.object({
   items: Joi.array().items(Joi.object({
     kind: Joi.string().valid(...svc.CONTENT_KINDS).required(),
     ref_id: Joi.number().integer().positive().required(),
-  })).max(100).required(),
+  // min(1): a course with no content can never be completed, so saving one
+  // empty is refused — the CRM blocks it too, this is the authority.
+  })).min(1).max(100).required()
+    .messages({ 'array.min': 'add at least one video, document or assessment to the course' }),
 });
 
 // ─── Documents ───────────────────────────────────────────────────────
@@ -380,26 +373,11 @@ router.post('/courses/:id/assign-all', requireLmsManage, validate(idParam, 'para
     } catch (e) { next(e); }
   });
 
-router.get('/courses/:id/videos', validate(idParam, 'params'), async (req, res, next) => {
-  try {
-    modernOk(res, await svc.getCourseVideos(req.params.id));
-  } catch (e) { next(e); }
-});
-
-router.put('/courses/:id/videos', requireLmsManage, validate(idParam, 'params'), validate(setContentBody), async (req, res, next) => {
-  try {
-    modernOk(res, await svc.setCourseVideos(req.params.id, req.body.video_ids));
-  } catch (e) { next(e); }
-});
-
 /*
- * The kind-aware content list. GET/PUT /videos above are the same course seen
- * through a video-only lens and are kept working for the existing CRM screen;
- * these two are what the Content page uses.
- *
- * There is no third table behind them — both pairs read and write lms_content,
- * so an operator cannot end up with a course that looks different depending on
- * which screen opened it.
+ * The course's full, kind-aware content list (videos, documents, assessments)
+ * in lms_content. The video-only GET/PUT /courses/:id/videos pair was removed
+ * 2026-09-29: the CRM stopped calling it on 2026-08-26 (845d9b8), and its PUT
+ * could silently empty a video-only course.
  */
 router.get('/courses/:id/content', validate(idParam, 'params'), async (req, res, next) => {
   try {
