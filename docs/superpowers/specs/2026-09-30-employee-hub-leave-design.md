@@ -81,16 +81,23 @@ No new action key: who may approve is data (RH / `isRosterAdmin`), not a role.
 
 ## 5. Roster integration (`services/roster.service.js`)
 
-- `resolveDays` gains a top layer: an APPROVED leave covering the date → `{ type: 'LV'|'SL',
-  half: FULL|FIRST_HALF|SECOND_HALF, leaveId, source: 'LEAVE' }`; PENDING → the planned day plus
-  `pendingLeave: { id, kind, half }`. One extra indexed query per resolve.
+- `resolveDays` gains a top layer:
+  - APPROVED **full-day** leave → `{ type: 'LV'|'SL', leaveId, source: 'LEAVE' }` (replaces the day).
+  - APPROVED **half-day** leave → the planned day is KEPT (type stays `PR` — they work the other
+    half) plus `leave: { id, kind, duration, status: 'APPROVED' }`. Owner, 2026-09-30.
+  - PENDING (any duration) → the planned day plus `leave: { id, kind, duration, status: 'PENDING' }`.
+  One extra indexed query per resolve.
+- **Grid rendering:** the label slot under the circle carries the leave — "Requested" (pending,
+  amber) or "½ Leave · 1st Half" / "½ SL · 2nd Half" (approved half day, blue). Full-day approved
+  leave replaces the circle with a locked LV / SL chip.
 - **Lock:** `saveCells` / `fillPattern` / `bulk` / `resetRange` skip dates with an APPROVED
   full-day leave (grid cell disabled; Update Roster preview counts "N Leave Days Kept"; Bulk
   Update reports them as "Locked — approved leave"; a direct PUT on one → 409).
 - Headcount + routing: full-day leave = off duty. Lookup users gain `on_leave_today` next to the
   existing `week_off_today` (not renamed — the transfer dialogs read it); bulk-reassign skips
-  both. Half day = available.
-- Export: LV / SL / ½LV / ½SL in the cell. My Roster + dashboard show the leave.
+  both. Half day = available (on duty; the cell stays PR and editable).
+- Export: LV / SL for full days; `PR (½LV)` / `PR (½SL)` for approved half days. My Roster +
+  dashboard show the leave the same way.
 
 ## 6. API (`routes/admin/leave.js`, mounted `/api/admin/leave`, every CRM user)
 
@@ -127,7 +134,7 @@ from the popup). Server query: `status='PENDING' AND kind='SL' AND approver = me
 
 ## 8. CRM screens
 
-- `/employee-hub/attendance` — month calendar (P / W / HO / LV / SL / ½, pending badge, legend),
+- `/employee-hub/attendance` — month calendar (P / W / HO / LV / SL; a half day shows P with a "½ Leave" note; pending badge; legend),
   Monthly Summary cards (Total Days · Elapsed · Planned Present · Leaves · Week Offs & Holidays),
   **Request Leave** dialog (Kind toggle LV/SL, dates, Duration, reason, live "N working days"),
   My Requests table (status chip, Withdraw / Cancel with confirm).
