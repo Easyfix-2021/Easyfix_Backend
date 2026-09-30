@@ -305,16 +305,11 @@ async function recordingCallback(req, res) {
       logger.warn('Plivo recording-callback: invalid/expired token · ignoring');
       return res.status(200).type('text/plain').send('ok');
     }
-    // <Record> element: RecordUrl/RecordingID. Conference (MPC record="true"):
-    // RecordingURL/RecordingUUID + EventName, for Initiated/Paused/…/Completed —
-    // only Completed is a finished file (see operatorAnswerXml).
-    const event = src.EventName || null;
-    const url = src.RecordUrl || src.RecordingURL || src.recording_url || null;
-    const id = src.RecordingID || src.RecordingUUID || src.recording_id || null;
+    const url = src.RecordUrl || src.recording_url || null;
+    const id = src.RecordingID || src.recording_id || null;
     const duration = src.RecordingDuration || src.recording_duration || null;
-    logger.info('Plivo recording-callback · jci=' + claims.jci + ' · event=' + (event || '-') + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url
-      + (url ? '' : ' · keys=' + Object.keys(src).filter((k) => k !== 't').join(',')));
-    if (url && (!event || event === 'MPCRecordingCompleted')) await plivoLog.setRecording(claims.jci, { url, id, duration });
+    logger.info('Plivo recording-callback · jci=' + claims.jci + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url);
+    if (url) await plivoLog.setRecording(claims.jci, { url, id, duration });
     return res.status(200).type('text/plain').send('ok');
   } catch (e) {
     // Header above: ALWAYS 200 so Plivo doesn't retry-storm. A failed store is
