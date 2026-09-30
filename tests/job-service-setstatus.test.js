@@ -27,6 +27,8 @@ const fake = installFakePool(
     [/INFORMATION_SCHEMA/i, () => [{ n: 3 }]],
     // getJobMeta's single-row existence + prev-status read.
     [/FROM\s+tbl_job\s+WHERE\s+job_id/i, () => (scenario.jobMeta ? [scenario.jobMeta] : [])],
+    // The after-work-photo gate on a close (10 → 3): one proof photo present.
+    [/FROM\s+tbl_job_image/i, () => [{ 1: 1 }]],
   ],
   { stopOn: /UPDATE\s+tbl_job\s+SET/i },
 );
@@ -141,4 +143,32 @@ test('extras: checkin_date_time is WRITE-ONCE — a revisit cannot move the TAT 
     'the anchor must keep its FIRST value');
   assert.match(upd.sql, /checkin_pincode = \?/,
     'ordinary extras still overwrite — only the anchor is write-once');
+});
+
+/*
+ * Audit & Checkout / Feedback & Complete (2026-09-30) — the two CRM moves that
+ * finish a job, matching legacy's checkout SP and sp_ef_job_update_job('Feedback').
+ */
+test('10 → 3 writes the confirmed collected_by with the checkout stamps, and no feedback stamps', async () => {
+  scenario.jobMeta = { ...META, job_status: 10 };
+  try {
+    await jobSvc.setStatus(42, { status: 3, extras: { collected_by: 2 } }, { user_id: 1 });
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd, 'an UPDATE tbl_job should have been issued');
+  assert.match(upd.sql, /collected_by = \?/, 'Collected By rides the checkout UPDATE');
+  assert.ok(upd.params.includes(2), 'the confirmed value is bound');
+  assert.match(upd.sql, /checkout_date_time = COALESCE/);
+  assert.doesNotMatch(upd.sql, /feedback_date_time/, 'a checkout is not the feedback');
+});
+
+test('3 → 5 stamps feedback_date_time and fk_feedback_by, write-once', async () => {
+  scenario.jobMeta = { ...META, job_status: 3 };
+  try {
+    await jobSvc.setStatus(42, { status: 5 }, { user_id: 1 });
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd, 'an UPDATE tbl_job should have been issued');
+  assert.match(upd.sql, /feedback_date_time = COALESCE\(feedback_date_time, \?\)/);
+  assert.match(upd.sql, /fk_feedback_by = COALESCE\(fk_feedback_by, \?\)/);
 });
