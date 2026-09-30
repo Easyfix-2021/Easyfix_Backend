@@ -140,6 +140,7 @@ let conferencesById = {};
 let participants = [];
 let creatingRows = [];
 let stuckLegRows = [];
+let opRecLegs = [];
 
 /* ──────────────────────────────── fake DB ──────────────────────────────── */
 
@@ -155,6 +156,9 @@ const fake = installFakePool([
 
   // The conference-column probe in plivo-call-log.service. Present ⇒ post-migration.
   [/information_schema\.columns/i, () => [{ 1: 1 }]],
+
+  // startRoomRecording: the operator leg flagged to record (none = not flagged).
+  [/participant_role = 'operator' AND recording_requested = 1/i, () => opRecLegs],
 
   /*
    * ── reaper pass C — the stuck-leg join.
@@ -292,6 +296,7 @@ beforeEach(() => {
   participants = [participant()];
   creatingRows = [];
   stuckLegRows = [];
+  opRecLegs = [{ job_caller_info_id: 5001 }];
 });
 
 /* ────────────────────────────── helpers ────────────────────────────────── */
@@ -382,6 +387,63 @@ test('a ringing event moves initiated → ringing ONLY', async () => {
   // after the answer callback cannot pull a live leg backwards.
   assert.match(upd.sql, /WHERE id = \? AND status IN \(\?\)/i);
   assert.ok(upd.params.includes('initiated'), "the guarded FROM status, in the call log's vocabulary");
+});
+
+/* ═════════ 1b. ROOM RECORDING STARTS WHEN THE RECEIVER ANSWERS ═══════════ */
+
+// startRoomRecording is once-per-room for the process, so each test uses its
+// own room id. It runs off the response path — let it finish.
+let nextRecConf = 9000;
+async function joinIn(kind, confId = nextRecConf++) {
+  conferencesById[confId] = conference({ id: confId });
+  participants = [participant({ conference_id: confId, target_kind: kind })];
+  const res = await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 }, token({ confId }));
+  await new Promise((r) => setTimeout(r, 25));
+  return { res, confId };
+}
+const recStarts = () => wire.filter((w) => /\/Record\/$/.test(w.url));
+
+test('the customer answering starts the ROOM recording via the MPC Record API', async () => {
+  const { res } = await joinIn('customer');
+  assert.equal(res.status, 200);
+  const rec = recStarts();
+  assert.equal(rec.length, 1, 'exactly one start');
+  assert.match(rec[0].url, /\/MultiPartyCall\/name_efxctestconf01\/Record\/$/,
+    'the MPC-level API — NOT /Call/{uuid}/Record/ (records nothing inside an MPC, c6d163a)');
+  assert.equal(/\/Call\//.test(rec[0].url), false);
+  assert.equal(rec[0].method, 'POST');
+  assert.equal(rec[0].body.file_format, 'mp3');
+  assert.equal(rec[0].body.recording_callback_method, 'POST');
+  const t = decodeURIComponent(rec[0].body.recording_callback_url.split('t=')[1]);
+  assert.equal(require('../services/plivo.service').verifyRecordingToken(t).jci, 5001,
+    "signed for the OPERATOR leg's jci — where the room's one recording belongs");
+});
+
+test('the OPERATOR joining starts nothing — that is ringback time', async () => {
+  await joinIn('operator');
+  assert.equal(recStarts().length, 0);
+});
+
+test('a second answer in the same room does not start a second recording', async () => {
+  const { confId } = await joinIn('customer');
+  await joinIn('technician', confId);
+  assert.equal(recStarts().length, 1);
+});
+
+test('not flagged to record (recording off) → no start', async () => {
+  opRecLegs = [];
+  await joinIn('customer');
+  assert.equal(recStarts().length, 0);
+});
+
+test('a failed start is logged, released for a later join to retry, and the webhook still 200s', async () => {
+  plivoHandler = (u) => (/\/Record\/$/.test(u) ? { status: 400, body: '{"error":"nope"}' } : { status: 200, body: '{}' });
+  const { res, confId } = await joinIn('customer');
+  assert.equal(res.status, 200);
+  assert.match(logText(), /room recording NOT started[^\n]*http=400[^\n]*nope/);
+  plivoHandler = () => ({ status: 202, body: '{}' });
+  await joinIn('technician', confId);
+  assert.equal(recStarts().length, 2, 'the later join retried');
 });
 
 /* ═════════ 2. THE WEBHOOK — the events that end things ══════════════════ */

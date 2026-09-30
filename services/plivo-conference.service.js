@@ -87,7 +87,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
-const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC } = require('./plivo.service');
+const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC, recordingCallbackUrl } = require('./plivo.service');
 const legs = require('./plivo-call-log.service');
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -196,6 +196,9 @@ const PATHS = {
     `${BASE}/Account/${encodeURIComponent(authId)}/MultiPartyCall/name_${encodeURIComponent(name)}/Participant/`,
   participantOne: (authId, name, memberId) =>
     `${BASE}/Account/${encodeURIComponent(authId)}/MultiPartyCall/name_${encodeURIComponent(name)}/Participant/${encodeURIComponent(memberId)}/`,
+  // POST — the MPC-level Start Recording API (plivo-node startRecording → `${mpc}/Record/`).
+  record: (authId, name) =>
+    `${BASE}/Account/${encodeURIComponent(authId)}/MultiPartyCall/name_${encodeURIComponent(name)}/Record/`,
 };
 
 // ── Request bodies. snake_case, per the REST API.
@@ -698,6 +701,62 @@ function operatorAnswerXml(friendlyName, opts = {}) {
       + ` callbackUrl="${xmlAttr(opts.recordingCallbackUrl)}" callbackMethod="POST"/>`;
   }
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}<MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
+}
+
+/*
+ * startRoomRecording(conference, pool) — the conference recording that starts
+ * when the RECEIVER ANSWERS (2026-09-30). Called by the conference webhook on
+ * every non-operator ParticipantJoin; once per room.
+ *
+ * The <Record> element above still runs and remains the SAFETY NET — it
+ * records from operator join (ringback included) and is proven in Prod. This
+ * adds a second, room-level recording that starts at answer; the
+ * recording-callback stores it OVER the <Record> one when (and only when) its
+ * MPCRecordingCompleted arrives, while a <Record> callback only fills an empty
+ * row. So the worst case is the old behaviour, never silence.
+ *
+ * Two dead ends already paid for on Prod — do not retry them:
+ *  - c6d163a (2026-09-24): the CALL Record API on the operator's leg. A leg
+ *    inside an MPC 2xx's it and records NOTHING (36/36 calls lost).
+ *  - 05a268a (2026-09-30): `record="true" recordMinMemberCount="2"` on the
+ *    operator's <MultiPartyCall>. Six Prod conferences, zero recordings, no
+ *    error. Likely cause: addParticipant (which sends no record params) races
+ *    the operator's XML and creates the room ("still in 'creating'" warning),
+ *    so the room never took the operator's record settings.
+ * This API addresses the room directly after it is live, and — unlike an XML
+ * attribute — answers, so success or failure is LOGGED either way.
+ *
+ * Only for calls the answer route flagged recording_requested=1 on the
+ * operator leg (plivo.recording.enabled). Fail-soft: never disturbs the call.
+ */
+// ponytail: per-process once-guard; another instance's duplicate start only
+// earns a logged Plivo 4xx. Released on failure so a later join can retry.
+const roomRecordingStarted = new Set();
+async function startRoomRecording(conference, pool) {
+  if (!conference || !conference.id || !conference.friendly_name || !pool) return { ok: false, started: false };
+  if (roomRecordingStarted.has(conference.id)) return { ok: true, started: false };
+  roomRecordingStarted.add(conference.id);
+  const [[op] = []] = await pool.query(
+    `SELECT job_caller_info_id FROM tbl_plivo_call_log
+      WHERE conference_id = ? AND participant_role = 'operator' AND recording_requested = 1 LIMIT 1`,
+    [conference.id]);
+  const cbUrl = op ? recordingCallbackUrl(op.job_caller_info_id) : null;
+  if (!cbUrl) return { ok: true, started: false };
+
+  const r = await mpcRequest('start-recording', 'POST', PATHS.record(process.env.PLIVO_AUTH_ID, conference.friendly_name), {
+    file_format: 'mp3',
+    recording_callback_url: cbUrl,
+    recording_callback_method: 'POST',
+  });
+  if (!r.ok) {
+    roomRecordingStarted.delete(conference.id);
+    logger.warn(`⚠ Conference room recording NOT started · conf=${conference.id} · jci=${op.job_caller_info_id}`
+      + ` · http=${r.httpStatus} · ${String(r.text || r.error || '').slice(0, 300)}`);
+    return { ok: false, started: false };
+  }
+  logger.info(`🎙 Conference room recording started on answer · conf=${conference.id} · jci=${op.job_caller_info_id}`
+    + ` · http=${r.httpStatus} · ${String(r.text || '').slice(0, 300)}`);
+  return { ok: true, started: true };
 }
 
 // ─────────────────────────── DB: create ────────────────────────────────────
@@ -1537,6 +1596,7 @@ module.exports = {
   listStaleConferences,
   // call control
   operatorAnswerXml,
+  startRoomRecording,
   // provider read-backs (reconciliation)
   fetchConference,
   listParticipants,

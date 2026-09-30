@@ -64,6 +64,11 @@ function findSites(src) {
     // `/Record/` — the start-recording endpoint. `/Recording/` (the list/fetch
     // API) records nothing and does not match.
     if (!/\/Record\//.test(l)) return;
+    // The MPC room-recording API (…/MultiPartyCall/name_x/Record/) has NO
+    // time_limit parameter (plivo-node startRecording accepts file format +
+    // callback only); sending an unknown field risks a 400 = no recording.
+    // Its site is listed separately so it cannot vanish unnoticed.
+    if (/MultiPartyCall\/name_[^/]*\/Record\//.test(l)) { sites.push({ line: i + 1, kind: 'mpc-api', ok: true }); return; }
     let a = i;
     while (a > 0 && !/^\S/.test(lines[a])) a -= 1;
     let b = i + 1;
@@ -149,6 +154,7 @@ test('EVERY recording site in the codebase sets a length', (t) => {
   assert.ok(has(path.join('services', 'plivo.service.js'), 'xml'), 'bridge <Record> not found — the scanner is broken');
   assert.ok(has(path.join('services', 'plivo-conference.service.js'), 'xml'), 'MPC <Record> not found — the scanner is broken');
   assert.ok(has(path.join('services', 'plivo-ai-call.service.js'), 'api'), 'AI Record API not found — the scanner is broken');
+  assert.ok(has(path.join('services', 'plivo-conference.service.js'), 'mpc-api'), 'MPC room Record API not found — the scanner is broken');
 
   const bad = sites.filter((s) => !s.ok);
   assert.deepEqual(bad.map((s) => `${s.file}:${s.line} (${s.kind})`), [],
