@@ -1088,7 +1088,16 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
 // stores the CSV directly in a `pincodes` TEXT column (one row per efr) —
 // no GROUP_CONCAT needed; a simple LEFT JOIN suffices.
 /*
- * Jobs completed by ONE technician, split by service category and by vertical.
+ * Jobs completed by ONE technician IN THE LAST 12 MONTHS, split by service
+ * category and by vertical.
+ *
+ * WHY A YEAR, not lifetime (Priyanka, 2026-09-30). The window is what makes
+ * the card honest: measured on QA, of 47,153 jobs completed in the last 12
+ * months, ZERO have a missing vertical, ZERO have a missing category and ZERO
+ * sit in a retired category. Lifetime, those three account for 42,188 / 59,309
+ * / 2,212 rows respectively — every one of them a bar the reader cannot act on.
+ * The lifetime total still has its own tile at the top of Overview; this card
+ * answers "what has he been doing lately".
  *
  * WHICH JOBS COUNT. Completed (job_status 3/5) AND carrying a
  * tbl_job_transaction row. That second condition is what lets the card be read
@@ -1120,10 +1129,22 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
 async function jobCategorySummary(efrId) {
   const id = Number(efrId);
   logger.info('Job category summary · efrId=' + id);
-  if (!Number.isInteger(id) || id <= 0) return { total_completed: 0, by_category: [], by_vertical: [] };
+  if (!Number.isInteger(id) || id <= 0) {
+    return { window_months: 12, total_completed: 0, by_category: [], by_vertical: [] };
+  }
+  // Bound ONCE and bind it to both queries: two NOW() calls a millisecond
+  // apart can straddle a job's checkout and make the two breakdowns disagree.
+  const now = new Date();
 
+  /*
+   * checkout_date_time is when the job actually finished, and is non-null for
+   * status 3/5 (see the job-service stage map). Bounding on it — rather than
+   * on created/scheduled — means the window says "work DONE in the last year",
+   * which is what the card claims.
+   */
   const COUNTED = `j.fk_easyfixter_id = ?
        AND j.job_status IN (3, 5)
+       AND j.checkout_date_time >= DATE_SUB(?, INTERVAL 1 YEAR)
        AND EXISTS (SELECT 1 FROM tbl_job_transaction t WHERE t.fk_job_id = j.job_id)`;
 
   const [byCategory, byVertical] = await Promise.all([
@@ -1137,7 +1158,7 @@ async function jobCategorySummary(efrId) {
         WHERE ${COUNTED}
         GROUP BY j.fk_service_catg_id, sc.service_catg_name, sc.service_catg_status
         ORDER BY jobs DESC`,
-      [id],
+      [id, now],
     ).then(([rows]) => rows),
     pool.query(
       `SELECT cl.vertical_id, v.vertical_name, COUNT(*) AS jobs
@@ -1145,9 +1166,10 @@ async function jobCategorySummary(efrId) {
          LEFT JOIN tbl_client   cl ON cl.client_id  = j.fk_client_id
          LEFT JOIN tbl_vertical v  ON v.vertical_id = cl.vertical_id
         WHERE ${COUNTED}
+          AND cl.vertical_id IS NOT NULL
         GROUP BY cl.vertical_id, v.vertical_name
         ORDER BY jobs DESC`,
-      [id],
+      [id, now],
     ).then(([rows]) => rows),
   ]);
 
@@ -1158,6 +1180,7 @@ async function jobCategorySummary(efrId) {
     + ' categories=' + byCategory.length + ' verticals=' + byVertical.length);
 
   return {
+    window_months: 12,
     total_completed: total,
     by_category: byCategory.map((r) => ({
       category_id: Number(r.category_id) || null,
