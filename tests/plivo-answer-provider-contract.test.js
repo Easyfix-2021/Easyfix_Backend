@@ -458,21 +458,6 @@ test('/recording-callback stores the recording against the jci from the token', 
     'keyed by jci, not by call_uuid — that is what makes web/WebRTC legs populate');
 });
 
-test('/recording-callback stores a CONFERENCE recording only on MPCRecordingCompleted', async () => {
-  // The MPC's own recording (record="true" on <MultiPartyCall>) posts
-  // RecordingURL/RecordingUUID + EventName for every lifecycle step.
-  const stored = [];
-  plivoLog.setRecording = async (jci, payload) => { stored.push({ jci, payload }); };
-  const mpc = (EventName) => call('/recording-callback', 'post', {
-    query: { t: recToken() },
-    body: { EventName, RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'ruuid-1', RecordingDuration: '95' },
-  });
-  assertPlainOk(await mpc('MPCRecordingInitiated'));
-  assert.equal(stored.length, 0, 'Initiated has no finished file yet');
-  assertPlainOk(await mpc('MPCRecordingCompleted'));
-  assert.deepEqual(stored, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' } }]);
-});
-
 test('⚠ an invalid token acks 200 and stores NOTHING', async () => {
   let called = 0;
   plivoLog.setRecording = async () => { called += 1; };

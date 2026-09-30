@@ -87,7 +87,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
-const { normaliseIndianPhone, maskForDisplay, callingEnabled } = require('./plivo.service');
+const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC } = require('./plivo.service');
 const legs = require('./plivo-call-log.service');
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -640,32 +640,27 @@ async function listParticipants(friendlyName) {
  * Call History UI still offered a Play button. Verified on job #528792: five
  * legs, five blank recording_urls.
  *
- * RECORDING STARTS WHEN THE RECEIVER ANSWERS (2026-09-30). Until then a
- * <Record recordSession> element sat before <MultiPartyCall>; it recorded from
- * the operator's join, so every recording opened with ringback + room noise
- * (call 1059906: ~12 s) the customer never heard. Now the MPC records ITSELF:
- * `record="true" recordMinMemberCount="2"` — Plivo starts the room recording
- * when the second member (the first receiver to answer) joins. No webhook, no
- * extra API call, no race.
+ * WHY THE ELEMENT AND NOT AN ATTRIBUTE. This codebase has already paid for that
+ * lesson once: `<Dial record="true">` is not a real attribute, Plivo ignored it
+ * silently, and every recording was NULL for months (see buildAnswerXml's note
+ * in plivo.service.js). Adding `record="true"` to <MultiPartyCall> would be the
+ * same bet on the same table. <Record> is a documented element whose behaviour
+ * is already proven in production on the bridge path, and it needs no new API
+ * call, no `name_`-prefix guesswork, and no new endpoint.
  *
- * ⚠ DO NOT use the CALL Record API on the operator's leg instead. That was
- * c6d163a (2026-09-24): a leg inside an MPC accepts POST .../Call/{uuid}/Record/
- * with a 2xx, fires an instant callback with no record_url, and records
- * NOTHING — 36/36 Prod calls, ~16 h of recordings lost, reverted in e24bb19.
- * Room recording must be requested from the MPC itself.
+ * WHY NO startOnDialAnswer. On the bridge path that defers recording until the
+ * B-leg answers, skipping ring-time dead air. There is no <Dial> here, so the
+ * flag has nothing to key on; recordSession begins with the operator's session.
+ * A few seconds of the operator alone is the correct trade — participants join
+ * later and MUST be inside the recording.
  *
- * Unlike the 2026-08-17 fear that `record` here would be a `<Dial record>`-
- * style fiction: these attributes ARE on Plivo's <MultiPartyCall> XML
- * reference (plivo.com/docs/voice/xml/multiparty-call, checked 2026-09-30).
- * They are still only proven by a REAL QA call — the doc lists no stereo /
- * channel option, so ch0-agent/ch1-customer (Call Analytics) must be measured
- * on that recording, not assumed.
- *
- * The MPC recording callback sends RecordingURL / RecordingUUID /
- * RecordingDuration (not RecordUrl / RecordingID) plus EventName;
- * /recording-callback reads both vocabularies and stores only on
- * MPCRecordingCompleted, via plivoLog.setRecording() onto the operator's leg
- * ("A Multi-Party Call has ONE recording of the room").
+ * recordSession/maxLength/stereo/fileFormat and the callbackUrl are the same
+ * values the bridge uses (maxLength: without it Plivo cuts the recording at 60 s
+ * — see RECORD_MAX_SEC; job #538806 was this path), so the EXISTING
+ * /api/public/plivo/recording-callback handler and
+ * plivoLog.setRecording() persist this with no change — and setRecording is
+ * already written for this case ("A Multi-Party Call has ONE recording of the
+ * room… it belongs on the operator's leg").
  *
  * `opts` is optional so the documented one-argument call still works, and
  * omitting recordingCallbackUrl yields byte-for-byte the previous XML — so a
@@ -692,12 +687,17 @@ function operatorAnswerXml(friendlyName, opts = {}) {
     attrs.push(`statusCallbackMethod="${xmlAttr(XML.statusCallbackMethod)}"`);
     attrs.push(`statusCallbackEvents="${xmlAttr(XML.statusCallbackEvents)}"`);
   }
-  // MPC-level recording, started by Plivo when the 2nd member joins (see header).
+  /*
+   * <Record> is background + non-blocking, so placing it first starts the
+   * session recording and Plivo proceeds straight into <MultiPartyCall>. Same
+   * ordering and the same attribute set the bridge path uses.
+   */
+  let recordEl = '';
   if (opts.recordingCallbackUrl) {
-    attrs.push('record="true"', 'recordFileFormat="mp3"', 'recordMinMemberCount="2"');
-    attrs.push(`recordingCallbackUrl="${xmlAttr(opts.recordingCallbackUrl)}"`, 'recordingCallbackMethod="POST"');
+    recordEl = `<Record recordSession="true" maxLength="${RECORD_MAX_SEC}" fileFormat="mp3" recordChannelType="stereo"`
+      + ` callbackUrl="${xmlAttr(opts.recordingCallbackUrl)}" callbackMethod="POST"/>`;
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response><MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${recordEl}<MultiPartyCall ${attrs.join(' ')}>${xmlText(name)}</MultiPartyCall></Response>`;
 }
 
 // ─────────────────────────── DB: create ────────────────────────────────────
