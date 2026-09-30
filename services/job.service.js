@@ -3981,6 +3981,27 @@ async function getByIdCore(jobId) {
             ow.user_name AS owner_name,
             cr.user_name AS created_by_name,
             (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            /*
+             * WHO authorized the job, as a NAME. The CRM's Audit & History card
+             * was rendering the raw j.approved_by_client_contact integer in its
+             * "Approved By" cell, so an authorized job showed a number (1639).
+             *
+             * The approver is the CLIENT CONTACT, not a tbl_user: the client
+             * approval path writes approved_by_client_contact alongside
+             * approved_on_date_time (routes/client/index.js), and the public
+             * estimate route already resolves it through the same table.
+             *
+             * NOT j.approved_by_client, which looks like a person and is not —
+             * it is a status flag holding 0/1/2 (job-export.service.js filters
+             * on = 0 / = 2), and joining it to tbl_user coincidentally
+             * resolves id 2 to a real operator on 94k rows.
+             *
+             * Correlated subquery rather than a JOIN because tbl_client_contacts
+             * is already joined once on a DIFFERENT column (reporting_contact_id)
+             * — same shape as cancelled_by_name above.
+             */
+            (SELECT cc.contact_name FROM tbl_client_contacts cc
+              WHERE cc.id = j.approved_by_client_contact LIMIT 1) AS approved_by_name,
             (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
             /* The two app-REQUEST reason texts (see buildAppRequest below).
                Separate aliases, not one COALESCE like the LIST's
