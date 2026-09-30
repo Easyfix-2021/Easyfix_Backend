@@ -8629,9 +8629,10 @@ async function listOffers(jobId, { sweep = true } = {}) {
  *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
  *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
  *      so a tech must not be able to accept a now-stale appointment)
- * Then a tbl_job_comment audit row (comment_on=1, enum_reason_id, remarks) is
- * added outside the txn (addComment also mirrors to tbl_job.remarks). Returns
- * the refreshed job detail.
+ * Then a tbl_job_comment audit row (comment_on=21 'ReScheduled', enum_reason_id,
+ * remarks, job_stage = the status it was rescheduled FROM) is added outside the
+ * txn (addComment also mirrors to tbl_job.remarks). Returns the refreshed job
+ * detail.
  */
 async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason, remarks }, actor) {
   logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
@@ -8641,7 +8642,7 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   // being REPLACED in the 'Re-Scheduling' history row at the end; both are
   // overwritten by the UPDATE below, so they have to be captured up front.
   const [[existing]] = await pool.query(
-    'SELECT job_id, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job WHERE job_id = ? LIMIT 1',
+    'SELECT job_id, job_status, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId],
   );
   if (!existing) { const err = new Error('job not found'); err.status = 404; throw err; }
@@ -8753,16 +8754,38 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
     logger.warn('Reschedule scheduling_history insert failed (non-fatal) · id=' + jobId + ' · ' + e.message);
   }
 
-  // Comment audit — addComment uses the pool + mirrors the latest remark to
-  // tbl_job.remarks. comment_on=1 (lifecycle/schedule), reason FK in enum_reason_id,
-  // new promised time in appointment_on, actor = CRM user.
+  /*
+   * Comment audit — addComment uses the pool + mirrors the latest remark to
+   * tbl_job.remarks. Reason FK in enum_reason_id, new promised time in
+   * appointment_on, actor = CRM user.
+   *
+   * comment_on = 21 ('ReScheduled'), NOT 1 ('Scheduling') — changed 2026-09-30
+   * per ops. This reverses the parity pinned by
+   * tests/job-reschedule-comment-parity.test.js, deliberately: that test's
+   * premise was that a reschedule and an Add Remarks are "one kind of event"
+   * and should store identical rows. They are not. A reschedule moves the
+   * appointment; a remark says something about the job. Legacy agreed and had
+   * a dedicated bucket for it (70,347 rows under 21, every one carrying
+   * appointment_on, right up to the 2026-04-29 Node cutover) — filing them
+   * under 1 made every reschedule read as a generic "Scheduling" row in the
+   * CRM's Comments tab, indistinguishable from an ordinary remark.
+   *
+   * job_stage = the job's status AT THE MOMENT OF THE RESCHEDULE, which is the
+   * question ops actually asks ("it was rescheduled while in Pending to
+   * Close"). Read off `existing` above rather than re-queried, and correct
+   * either way: the reschedule UPDATE does not touch job_status.
+   *
+   * Consequence to know about: reports grouping on comment_on = 1 no longer
+   * see reschedules in that bucket.
+   */
   try {
     await require('./job-comment.service').addComment(jobId, {
       comments: remarks,
-      comment_on: 1,
+      comment_on: 21,
       commented_by: actor?.user_id || null,
       appointment_on: newRequested,
       enum_reason_id: reasonId || null,
+      job_stage: existing.job_status ?? null,
     });
   } catch (e) {
     logger.warn('Reschedule audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
