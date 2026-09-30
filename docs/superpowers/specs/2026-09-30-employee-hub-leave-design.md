@@ -87,9 +87,10 @@ No new action key: who may approve is data (RH / `isRosterAdmin`), not a role.
     half) plus `leave: { id, kind, duration, status: 'APPROVED' }`. Owner, 2026-09-30.
   - PENDING (any duration) → the planned day plus `leave: { id, kind, duration, status: 'PENDING' }`.
   One extra indexed query per resolve.
-- **Grid rendering:** the label slot under the circle carries the leave — "Requested" (pending,
-  amber) or "½ Leave · 1st Half" / "½ SL · 2nd Half" (approved half day, blue). Full-day approved
-  leave replaces the circle with a locked LV / SL chip.
+- **Grid rendering:** the label slot under the circle carries the leave, short so it never wraps
+  (`whitespace-nowrap`) — pending (amber): "Requested" / "Req · ½ LV · 1st Half"; approved half
+  day (blue): "½ LV · 2nd Half" / "½ SL · 1st Half". Full-day approved leave replaces the circle
+  with a locked LV / SL chip.
 - **Lock:** `saveCells` / `fillPattern` / `bulk` / `resetRange` skip dates with an APPROVED
   full-day leave (grid cell disabled; Update Roster preview counts "N Leave Days Kept"; Bulk
   Update reports them as "Locked — approved leave"; a direct PUT on one → 409).
@@ -134,7 +135,7 @@ from the popup). Server query: `status='PENDING' AND kind='SL' AND approver = me
 
 ## 8. CRM screens
 
-- `/employee-hub/attendance` — month calendar (P / W / HO / LV / SL; a half day shows P with a "½ Leave" note; pending badge; legend),
+- `/employee-hub/attendance` — month calendar (P / W / HO / LV / SL; a half day shows P with a "½ LV" note; pending badge; legend),
   Monthly Summary cards (Total Days · Elapsed · Planned Present · Leaves · Week Offs & Holidays),
   **Request Leave** dialog (Kind toggle LV/SL, dates, Duration, reason, live "N working days"),
   My Requests table (status chip, Withdraw / Cancel with confirm).
