@@ -19,16 +19,18 @@ const { pool } = require('../db');
 async function createForOwner(item) {
   await inbox.create(item);
   try {
-    const off = await require('./roster.service').weekOffSet([item.userId]);
-    if (!off.has(Number(item.userId))) return;
+    // Off duty today = week off OR full-day approved leave (Employee Hub, 2026-09-30).
+    const { weekOff, onLeave } = await require('./roster.service').offDutySets([item.userId]);
+    const reason = weekOff.has(Number(item.userId)) ? 'Week Off' : onLeave.has(Number(item.userId)) ? 'Leave' : null;
+    if (!reason) return;
     const [[rm]] = await pool.query(
       `SELECT m.user_id FROM tbl_user u JOIN tbl_user m ON m.user_id = u.reporting_manager
         WHERE u.user_id = ? AND m.user_status = 1 LIMIT 1`,
       [item.userId]
     );
     if (!rm) return;
-    await inbox.create({ ...item, userId: rm.user_id, title: `${item.title} (Owner On Week Off)` });
-    logger.info('Inbox copied to reporting manager · owner on week off · owner=' + item.userId + ' · rm=' + rm.user_id + ' · jobId=' + item.jobId);
+    await inbox.create({ ...item, userId: rm.user_id, title: `${item.title} (Owner On ${reason})` });
+    logger.info('Inbox copied to reporting manager · owner on ' + reason + ' · owner=' + item.userId + ' · rm=' + rm.user_id + ' · jobId=' + item.jobId);
   } catch (e) {
     logger.warn('Week-off inbox copy skipped · owner=' + item.userId + ' · ' + e.message);
   }

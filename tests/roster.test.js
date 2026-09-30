@@ -167,7 +167,7 @@ test('Fill From Pattern dry run counts and keeps hand edits, writing nothing', a
   rosterRows = [{ user_id: 2, roster_date: shiftYmd(from, 2), day_type: 'PR', shift_start: null, source: 'GRID' }];
   const off = roster.weekdayIndex(shiftYmd(from, 3));     // the weekday 3 days out
   const r = await roster.fillPattern({ actorId: 1, isAdmin: false, userIds: [2, 3], from, to, weekOffDays: [off], keepManual: true, dryRun: true });
-  assert.deepEqual(r, { users: 2, cells: 13, keptManual: 1, wo: 2, pr: 11 });
+  assert.deepEqual(r, { users: 2, cells: 13, keptManual: 1, keptLeave: 0, wo: 2, pr: 11 });
   assert.equal(writes(/INSERT|DELETE/i).length, 0, 'a dry run must not write');
 });
 
