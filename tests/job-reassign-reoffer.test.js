@@ -64,6 +64,9 @@ const fake = installFakePool(
   [
     [/FROM easyfix_properties/i, () =>
       Object.entries(scenario.props).map(([property_key, property_value]) => ({ property_key, property_value }))],
+    // closed_reason is migrated everywhere (migrations/executed/); the probe
+    // result is memoised, so it has to answer PRESENT for the whole file.
+    [/SHOW COLUMNS FROM tbl_job_offer LIKE 'closed_reason'/i, [{ Field: 'closed_reason' }]],
     [/SHOW COLUMNS/i, []],
     [/FROM information_schema/i, [{ column_count: 6, history_count: 1 }]],
     [/SELECT 1 FROM tbl_job_offer LIMIT 1/i, [{ 1: 1 }]],
@@ -136,6 +139,27 @@ test('(a) the outgoing claim is released: fk cleared and the job returns to BOOK
   assert.ok(history, 'the outgoing technician gets their own scheduling_history row');
   assert.equal(history.params[1], 99);
   assert.equal(history.params[3], 'Reassigned to another technician');
+});
+
+test('(a2) the outgoing technician\'s ACCEPTED offer is stamped released, and stays ACCEPTED', async () => {
+  // Job 543336 (2026-09-30): after a reassign 11599's accepted row still read
+  // as a live acceptance of a job they no longer held.
+  await assert.rejects(
+    () => jobSvc.assign(100, { easyfixerId: 42 }, { user_id: 9 }),
+    stopped,
+  );
+
+  const stamp = find(/UPDATE tbl_job_offer\s+SET closed_reason = \?/);
+  assert.ok(stamp, 'the outgoing technician\'s accepted row must be marked released');
+  assert.deepEqual(stamp.params, ['released_for_reoffer', 100, 99], 'scoped to the job and the OUTGOING technician');
+  assert.match(stamp.sql, /offer_status = 1\b/, 'only an ACCEPTED row is stamped');
+  const setClause = stamp.sql.split(/\bWHERE\b/)[0];
+  assert.doesNotMatch(setClause, /offer_status/, 'the status itself is never rewritten');
+  assert.doesNotMatch(stamp.sql, /responded_at/, 'the first-accept time is kept');
+  const releaseAt = calls.findIndex((c) => RELEASE_UPDATE.test(c.sql));
+  const offerAt = calls.findIndex((c) => /INSERT INTO tbl_job_offer/.test(c.sql));
+  const stampAt = calls.indexOf(stamp);
+  assert.ok(releaseAt < stampAt && stampAt < offerAt, 'stamped inside the release, before the new offer');
 });
 
 test('(a) the offer is issued against the RELEASED job, never the owned one', async () => {
