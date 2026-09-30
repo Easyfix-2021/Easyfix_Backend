@@ -109,6 +109,8 @@ function mapKnownError(res, next, e) {
 // FILE_BASE_URL env. Returning a path (not a full URL) means dev/QA
 // envs can override via NEXT_PUBLIC_FILE_BASE_URL without redeploying
 // the backend.
+const imageDelivery = require('../../services/job-image-delivery');
+
 function estimatePdfPath(jobId) {
   return `/easydoc/estimateapproval/Estimate_Approval_${jobId}.pdf`;
 }
@@ -188,6 +190,11 @@ router.get('/:token', peekToken, tokenRateLimit, async (req, res, next) => {
       service_category: row.service_catg_name,
       client_name:      row.client_name,
       pdf_path:         estimatePdfPath(row.job_id),
+      // Absolute, HEAD-verified on the legacy file host, or null (2026-09-30).
+      // pdf_path is relative: the portal joined it onto its OWN host — which
+      // serves no /easydoc — and with a FILE_BASE of `/easydoc` it also
+      // doubled the prefix (/easydoc/easydoc/…). Kept for older bundles.
+      pdf_url:          await imageDelivery.resolveLegacyFile('estimateapproval', `Estimate_Approval_${row.job_id}.pdf`),
       services,
       materials,
       totals,

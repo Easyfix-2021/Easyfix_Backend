@@ -43,7 +43,10 @@ const { installFakePool } = require('./helpers/fake-pool');
 
 const ROOT = path.join(__dirname, '..');
 const FILES = {
-  finance: path.join(ROOT, 'routes/admin/finance.js'),
+  // loadInvoiceArtifactData — the invoice-line projection — moved out of
+  // routes/admin/finance.js into this service on 2026-09-30 (shared with the
+  // client portal's invoice PDF). The guards follow the code, not the filename.
+  finance: path.join(ROOT, 'services/invoice-artifact.service.js'),
   mobileLifecycle: path.join(ROOT, 'services/mobile-job-lifecycle.service.js'),
 };
 const SRC = Object.fromEntries(
@@ -276,7 +279,8 @@ test('finance.js invoice lines still read the row off the `customer_name` alias'
 });
 
 test('finance.js customer-name change touched no write path', () => {
-  const jobWrites = SRC.finance.match(/\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+tbl_job\b/gi) || [];
+  const both = SRC.finance + fs.readFileSync(path.join(ROOT, 'routes/admin/finance.js'), 'utf8');
+  const jobWrites = both.match(/\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+tbl_job\b/gi) || [];
   assert.deepEqual(jobWrites, [], 'finance.js must not write tbl_job at all — this was a read-only change');
 });
 
