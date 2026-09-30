@@ -221,7 +221,7 @@ async function getVerificationPage(efrId) {
     leadComments, profComments, persComments,
     bankComments, idComments, actComments,
     deepSkillCountRow, serviceablePincodesRow,
-    kycDocRow, mandatoryTrainingRows] = await Promise.all([
+    kycDocRow, mandatoryTrainingRows, trainingAssignmentRow] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -283,6 +283,21 @@ async function getVerificationPage(efrId) {
         ORDER BY t.id ASC`,
       [efrId],
     ).then(([rows]) => rows).catch((e) => { logger.warn({ efrId, err: e }, 'verification: mandatory training read failed — rendering none'); return []; }),
+    /*
+     * Training ASSIGNED vs COMPLETED (Priyanka, 2026-09-30) — the Profile
+     * strength score for training is that ratio, not a count of global videos.
+     * easyfixer_courses is the assignment table; completion_date is stamped
+     * when the technician finishes one. All 2,636 active technicians have at
+     * least one assigned, so this is a live signal rather than a mostly-empty
+     * one.
+     */
+    pool.query(
+      `SELECT COUNT(*) AS assigned,
+              SUM(completion_date IS NOT NULL) AS completed
+         FROM easyfixer_courses WHERE easyfixer_id = ?`,
+      [efrId],
+    ).then(([rows]) => rows[0] || { assigned: 0, completed: 0 })
+      .catch((e) => { logger.warn({ efrId, err: e }, 'verification: training assignment read failed'); return { assigned: 0, completed: 0 }; }),
   ]);
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
@@ -525,6 +540,83 @@ async function getVerificationPage(efrId) {
       pincodes_progress: serviceablePincodesCount > 0 ? 100 : 0,
       is_complete: deepSkillsCount > 0 && serviceablePincodesCount > 0,
     },
+
+    /*
+     * PROFILE STRENGTH, five sections (Priyanka, 2026-09-30). Each section
+     * scores in two steps — FILLED is half, CONFIRMED is full — so the card
+     * distinguishes "he gave us this" from "someone checked it". The previous
+     * breakdown listed mandatory registration fields, which are all 100% by
+     * the time anyone looks, and so told the reader nothing.
+     *
+     * This is NOT the Accept gate. The gate (see `completion` above) asks
+     * whether a registering technician has filled the six mandatory fields;
+     * this asks how complete an ACTIVE technician's record is, which includes
+     * bank and training that no new registrant could have yet. Two questions,
+     * two numbers, deliberately.
+     *
+     * Professional is skills + serviceable pincodes at half each, per the
+     * owner: there is no CRM verification step for it, so "filled" is all
+     * there is to measure.
+     *
+     * Training is completed/assigned, not a count of global videos — a
+     * technician owes what was assigned to him.
+     */
+    profile_sections: (() => {
+      const half = (filled, confirmed) => (confirmed ? 100 : filled ? 50 : 0);
+      // `banking` is the RAW tbl_easyfixer_bank_details row (getBanking does
+      // SELECT tb.*) — the friendly names account_number / ifsc_code only
+      // exist further down, in the payload this object is about to build.
+      const bankFilled = String(banking?.efr_bank_acc_num || '').trim() !== ''
+        && String(banking?.efr_bank_ifsc || '').trim() !== '';
+      const identityFilled = String(e.adhaar_card_number || '').trim() !== ''
+        && String(e.efr_profile_img || '').trim() !== ''
+        && e.date_of_birth != null;
+      const assigned = Number(trainingAssignmentRow.assigned) || 0;
+      const completedCourses = Number(trainingAssignmentRow.completed) || 0;
+
+      const sections = [
+        {
+          key: 'bank',
+          label: 'Bank details',
+          percent: half(bankFilled, Number(e.is_bank_details_verified_by_crm) === 1),
+          detail: Number(e.is_bank_details_verified_by_crm) === 1
+            ? 'Verified by Finance'
+            : bankFilled ? 'Filled — awaiting Finance' : 'Not provided',
+        },
+        {
+          key: 'personal',
+          label: 'Personal details',
+          percent: half(bool(e.is_personal_detail_filled), Number(e.is_personal_details_verified_by_crm) === 1),
+          detail: Number(e.is_personal_details_verified_by_crm) === 1
+            ? 'Verified' : bool(e.is_personal_detail_filled) ? 'Filled — not verified' : 'Not provided',
+        },
+        {
+          key: 'identity',
+          label: 'Identity details',
+          percent: half(identityFilled, Number(e.is_identity_details_verified_by_crm) === 1),
+          detail: Number(e.is_identity_details_verified_by_crm) === 1
+            ? 'Verified' : identityFilled ? 'Filled — not verified' : 'Incomplete',
+        },
+        {
+          key: 'professional',
+          label: 'Professional details',
+          // Half each: no CRM confirmation step exists for this one.
+          percent: (deepSkillsCount > 0 ? 50 : 0) + (serviceablePincodesCount > 0 ? 50 : 0),
+          detail: `${deepSkillsCount > 0 ? 'Skills mapped' : 'No skills'} · ${serviceablePincodesCount > 0 ? `${serviceablePincodesCount} pincodes` : 'No pincodes'}`,
+        },
+        {
+          key: 'training',
+          label: 'Training',
+          // Nothing assigned means nothing outstanding — not a gap in the record.
+          percent: assigned === 0 ? 100 : Math.round((completedCourses / assigned) * 100),
+          detail: assigned === 0 ? 'None assigned' : `${completedCourses} of ${assigned} completed`,
+        },
+      ];
+      return {
+        sections,
+        percent: Math.round(sections.reduce((n, x) => n + x.percent, 0) / sections.length),
+      };
+    })(),
 
     // ─ Mandatory training (read-only; never gates a decision) ─
     training: {
