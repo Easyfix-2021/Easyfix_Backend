@@ -1313,26 +1313,54 @@ async function getSpocRevenue({ pf }) {
     ...params,          // client guard ids (may be empty when applyClientFilter=false)
   ];
 
+  /*
+   * ── ATTRIBUTION COMES OFF THE JOB, NOT OFF THE MAPPING ─────────────────
+   *
+   * This used to start FROM tbl_vertical_mapping and re-derive each client's
+   * Primary SPOC AT REPORT TIME. That inverted the product rule: the SPOC who
+   * earns a job's revenue is decided WHEN THE JOB IS BOOKED and never moves
+   * again (tbl_job.job_primary_spoc, stamped once in job.service.js create();
+   * absent from MUTABLE_COLUMNS, and changeOwner() deliberately leaves it
+   * alone — ownership transfers move job_client_owner, revenue does not
+   * follow). Re-deriving it meant that the day a client's SPOC changed, every
+   * closed job that client ever had silently re-credited to the new person —
+   * so last month's report stopped agreeing with last month.
+   *
+   * Reading the stamp fixes four things at once, and each was a real defect:
+   *
+   *   FROZEN       — history stays where it was earned.
+   *   COUNTED ONCE — a client with two user_type=1 rows fanned its jobs out
+   *                  across both, and `totalRevenue` (a sum over the returned
+   *                  rows) counted that revenue twice. A job has exactly one
+   *                  job_primary_spoc, so the total is now arithmetically
+   *                  forced to equal the sum of the tiles.
+   *   NOTHING LOST — the INNER JOIN dropped every job whose client has no
+   *                  mapping row today. They are now their own bucket.
+   *   LEAVERS KEPT — `TU.user_status = 1` deleted a departed SPOC's revenue
+   *                  from the report entirely. tbl_user is now a LEFT JOIN
+   *                  used ONLY to resolve a name.
+   *
+   * The vertical / zonal / client guards stay on tbl_job exactly as before,
+   * so the report is scoped identically — only the attribution changed.
+   */
   const sql =
     `SELECT
-        TU.user_id                           AS userId,
+        TJ.job_primary_spoc                  AS userId,
         TU.user_name                         AS userName,
+        (TU.user_id IS NOT NULL AND TU.user_status <> 1) AS isFormer,
         COUNT(DISTINCT TJ.job_id)            AS jobs_completed,
         COALESCE(SUM(TJT.total_charge), 0)   AS revenue
-     FROM tbl_vertical_mapping TVM
-     INNER JOIN tbl_user   TU  ON TU.user_id  = TVM.user_id
-                               AND TU.user_status = 1
-     INNER JOIN tbl_job    TJ  ON TJ.fk_client_id = TVM.client_id
+     FROM tbl_job TJ
+     LEFT  JOIN tbl_user            TU  ON TU.user_id    = TJ.job_primary_spoc
      LEFT  JOIN tbl_job_transaction TJT ON TJT.fk_job_id = TJ.job_id
      LEFT  JOIN tbl_address         TA  ON TA.address_id = TJ.fk_address_id
      LEFT  JOIN tbl_city            TC  ON TC.city_id    = TA.city_id
      LEFT  JOIN tbl_client          TCL ON TCL.client_id = TJ.fk_client_id
-     WHERE TVM.user_type = 1
-       AND TJ.job_status IN (3, 5)
+     WHERE TJ.job_status IN (3, 5)
        AND TJ.checkout_date_time BETWEEN ? AND ?
        AND ((? IS NULL) OR TCL.vertical_id = ?)
        AND ((? IS NULL) OR TC.state_user = ?)${clientFrag}
-     GROUP BY TU.user_id, TU.user_name
+     GROUP BY TJ.job_primary_spoc, TU.user_name, TU.user_id, TU.user_status
      ORDER BY revenue DESC
      LIMIT ${GROUPED_CAP}`;
 
@@ -1346,19 +1374,65 @@ async function getSpocRevenue({ pf }) {
     );
   }
 
-  const spocs = rows.map((r) => ({
+  /*
+   * ── EXTRAS — closed jobs carrying no SPOC stamp ────────────────────────
+   *
+   * A SURFACED BUCKET, NOT A FILTER. These jobs were completed and billed;
+   * the only thing missing is who to credit. Dropping them would make the
+   * card's total quietly smaller than the revenue it is reporting on, which
+   * is the failure this whole change exists to remove — and it would hide the
+   * data problem instead of showing it.
+   *
+   * Every route into this bucket is a question worth answering, which is why
+   * it is a visible tile someone can work through:
+   *   • booked before job_primary_spoc auto-stamping shipped (2026-06-04) and
+   *     only closed inside this window — the window is on checkout_date_time,
+   *     so an old job can still land here;
+   *   • the client had no user_type = 1 mapping at booking time;
+   *   • the lookup failed and stamped NULL (create() is fail-soft on purpose:
+   *     "no owner is better than a wrong one, because a wrong one looks right").
+   *
+   * It is EXCLUDED from spocCount and from avgRevenue — it is not a person,
+   * and averaging over it would drag every SPOC's average down by a phantom
+   * head — but INCLUDED in totalRevenue and totalJobs, which must describe
+   * every closed job in scope.
+   */
+  const named = rows.filter((r) => Number(r.userId) > 0);
+  const unattributed = rows.filter((r) => !(Number(r.userId) > 0));
+
+  const spocs = named.map((r) => ({
     userId:        Number(r.userId),
     userName:      r.userName || '',
+    // Departed SPOCs keep their revenue; the flag lets the UI say so rather
+    // than presenting them as current staff.
+    isFormer:      Boolean(Number(r.isFormer)),
     jobsCompleted: Number(r.jobs_completed) || 0,
     revenue:       Number(r.revenue)        || 0,
   }));
 
-  const spocCount    = spocs.length;
-  const totalRevenue = spocs.reduce((sum, s) => sum + s.revenue, 0);
-  const totalJobs    = spocs.reduce((sum, s) => sum + s.jobsCompleted, 0);
-  const avgRevenue   = spocCount > 0 ? Math.round(totalRevenue / spocCount) : 0;
+  const extras = {
+    jobsCompleted: unattributed.reduce((n, r) => n + (Number(r.jobs_completed) || 0), 0),
+    revenue:       unattributed.reduce((n, r) => n + (Number(r.revenue) || 0), 0),
+  };
 
-  return { spocs, totalRevenue, avgRevenue, totalJobs, spocCount };
+  const spocCount    = spocs.length;
+  // Totals span EVERY closed job in scope, Extras included, so the headline
+  // can never be smaller than the tiles beneath it add up to.
+  const totalRevenue = spocs.reduce((sum, s) => sum + s.revenue, 0) + extras.revenue;
+  const totalJobs    = spocs.reduce((sum, s) => sum + s.jobsCompleted, 0) + extras.jobsCompleted;
+  // Average is per NAMED SPOC — Extras has no head to divide by.
+  const avgRevenue   = spocCount > 0
+    ? Math.round(spocs.reduce((sum, s) => sum + s.revenue, 0) / spocCount)
+    : 0;
+
+  if (extras.jobsCompleted > 0) {
+    logger.warn(
+      { report: 'spoc-revenue', jobs: extras.jobsCompleted, revenue: extras.revenue },
+      'SPOC Revenue · closed jobs with no job_primary_spoc stamp — shown as Extras',
+    );
+  }
+
+  return { spocs, extras, totalRevenue, avgRevenue, totalJobs, spocCount };
 }
 
 module.exports = {

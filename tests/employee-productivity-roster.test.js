@@ -215,3 +215,54 @@ test('getJobMeta selects fk_created_by, or the guard silently inverts', () => {
   assert.ok(select.includes('fk_created_by'),
     'getJobMeta must project fk_created_by for setStatus to test it');
 });
+
+/* ───────────────── SPOC REVENUE — FROZEN ATTRIBUTION ───────────────── */
+
+test('SPOC revenue reads the frozen stamp, not the live mapping', () => {
+  // Product rule: the SPOC who earns a job's revenue is decided WHEN THE JOB
+  // IS BOOKED and never moves. Re-deriving it at report time meant the day a
+  // client's SPOC changed, every closed job that client ever had re-credited
+  // to the new person — last month's report stopped agreeing with last month.
+  const fn = SERVICE.slice(SERVICE.indexOf('async function getSpocRevenue'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(body, /TJ\.job_primary_spoc\s+AS userId/,
+    'attribution comes off tbl_job.job_primary_spoc');
+  assert.ok(!/FROM tbl_vertical_mapping TVM/.test(body),
+    'the live mapping must not drive attribution any more');
+  assert.match(body, /FROM tbl_job TJ/, 'the job is the base table');
+});
+
+test('a departed SPOC keeps the revenue they earned', () => {
+  // tbl_user is a name lookup here, nothing more. Filtering it to active users
+  // deleted a leaver's revenue from the report outright.
+  const fn = SERVICE.slice(SERVICE.indexOf('async function getSpocRevenue'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.ok(!/tbl_user\s+TU\s+ON[^\n]*\n[^\n]*user_status = 1/.test(body),
+    'no user_status filter on the name join');
+  assert.match(body, /LEFT\s+JOIN tbl_user\s+TU\s+ON TU\.user_id\s+= TJ\.job_primary_spoc/);
+});
+
+test('Extras is counted in the totals but is not a SPOC', () => {
+  // Dropping unstamped jobs would make the headline smaller than the revenue
+  // it reports on — the exact failure this change removes.
+  const fn = SERVICE.slice(SERVICE.indexOf('async function getSpocRevenue'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(body, /const named = rows\.filter\(\(r\) => Number\(r\.userId\) > 0\)/);
+  assert.match(body, /const spocCount\s+= spocs\.length/,
+    'spocCount counts named SPOCs only');
+  assert.match(body, /totalRevenue = spocs\.reduce[\s\S]{0,80}\+ extras\.revenue/,
+    'totalRevenue includes Extras');
+  assert.match(body, /totalJobs\s+= spocs\.reduce[\s\S]{0,90}\+ extras\.jobsCompleted/,
+    'totalJobs includes Extras');
+  assert.match(body, /return \{ spocs, extras,/, 'extras is returned to the FE');
+});
+
+test('the average divides by named SPOCs only', () => {
+  // Extras is not a person. Averaging over it drags every SPOC down by a
+  // phantom head.
+  const fn = SERVICE.slice(SERVICE.indexOf('async function getSpocRevenue'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.ok(!/avgRevenue\s+= spocCount > 0\s*\?\s*Math\.round\(totalRevenue \/ spocCount\)/.test(body),
+    'avgRevenue must not divide the Extras-inclusive total by the SPOC count');
+  assert.match(body, /avgRevenue[\s\S]{0,140}spocs\.reduce[\s\S]{0,60}\/ spocCount/);
+});
