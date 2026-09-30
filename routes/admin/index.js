@@ -179,6 +179,8 @@ router.use('/notices',           require('./notices'));
 router.use('/holidays',          require('./holidays'));
 // Team Roster (2026-09-29) — /me for everyone; management behind allowlist + isRosterManage.
 router.use('/roster',            require('./roster'));
+// Employee Hub leave (2026-09-30) — every CRM user; approver = RH snapshot or isRosterAdmin.
+router.use('/leave',             require('./leave'));
 // LMS (added 2026-08-13) — courses, course content, assignment, completion
 // report. The training VIDEO catalogue stays on /aux/training-videos; this
 // router deliberately does not restate it.

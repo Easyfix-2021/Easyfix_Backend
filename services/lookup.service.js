@@ -272,14 +272,19 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
    * roster read error must never empty the picker, and "not on week off" is the
    * safe default (it never hides anyone).
    */
+  // on_leave_today — an APPROVED full-day leave today (Employee Hub); same fail-soft.
   let off = new Set();
+  let leave = new Set();
   try {
-    off = await require('./roster.service').weekOffSet(rows.map((r) => Number(r.user_id)));
+    ({ weekOff: off, onLeave: leave } = await require('./roster.service').offDutySets(rows.map((r) => Number(r.user_id))));
   } catch (e) {
-    logger.warn('Lookup users · week-off flag skipped · ' + e.message);
+    logger.warn('Lookup users · week-off / leave flags skipped · ' + e.message);
   }
-  for (const r of rows) r.week_off_today = off.has(Number(r.user_id));
-  logger.info(`Found ${rows.length} users · ${off.size} on week off today`);
+  for (const r of rows) {
+    r.week_off_today = off.has(Number(r.user_id));
+    r.on_leave_today = leave.has(Number(r.user_id));
+  }
+  logger.info(`Found ${rows.length} users · ${off.size} on week off · ${leave.size} on leave today`);
   return rows;
 }
 
