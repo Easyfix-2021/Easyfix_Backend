@@ -81,10 +81,22 @@ const baseFilter = {
 };
 
 // Main table — adds pagination (FE [10,50,80]; size capped at 500).
+/*
+ * sortBy is validated against the SERVICE's frozen allow-list rather than a
+ * second list written out here. Two copies would drift, and the copy that lost
+ * a column would reject a sort the table still offers — Joi is the right place
+ * to say no, but not the right place to decide what the columns ARE.
+ *
+ * Both default at the service layer too (DEFAULT_SORT_BY / _DIR): the XLSX
+ * branch and any future caller reach getEmployeeProductivity() without passing
+ * through this schema, and they must order rows the same way the screen does.
+ */
 const productivitySchema = Joi.object({
   ...baseFilter,
   page: Joi.number().integer().min(1).default(1),
   size: Joi.number().integer().min(1).max(500).default(10),
+  sortBy: Joi.string().valid(...service.SORTABLE_COLUMN_KEYS).default(service.DEFAULT_SORT_BY),
+  sortDir: Joi.string().valid('asc', 'desc').default(service.DEFAULT_SORT_DIR),
 });
 
 // KRA / dashboard / cancellation share the windowed base filter.
@@ -132,6 +144,11 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
         pf,
         page: 1,
         size: XLSX_EXPORT_SIZE,
+        // The export inherits the SCREEN's sort. A file whose rows arrive in a
+        // different order from the table it was downloaded from is a file
+        // nobody can reconcile against what they were looking at.
+        sortBy: req.query.sortBy,
+        sortDir: req.query.sortDir,
       });
       const exportRows = fullResult.data || [];
       logger.info('Streaming Employee Productivity xlsx · ' + exportRows.length + ' employees');
@@ -175,6 +192,8 @@ router.get('/employee-productivity', validate(productivitySchema, 'query'), asyn
       pf,
       page: req.query.page,
       size: req.query.size,
+      sortBy: req.query.sortBy,
+      sortDir: req.query.sortDir,
     });
     logger.info('Returning ' + ((result && result.data ? result.data.length : 0)) + ' employees · total=' + (result && result.total != null ? result.total : 'n/a'));
     return modernOk(res, result);

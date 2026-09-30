@@ -4512,7 +4512,15 @@ async function getJobMeta(jobId) {
     // requested_date_time as a STRING (DATE_FORMAT) so setStatus's slot
     // derivation reads the IST wall-clock hour regardless of connection tz;
     // booking_cut_off_time_slot so the BOOKED confirm can COALESCE-backfill it.
+    //
+    // fk_created_by is REQUIRED, not decorative: setStatus's BOOKED branch
+    // re-credits the booking to the confirming user, and the "is there already
+    // a creator to protect" half of that test reads THIS column. Drop it from
+    // the projection and `existing.fk_created_by` becomes undefined, which
+    // `== null` scores as "no creator" on every job — turning a guarded
+    // re-credit into an unconditional overwrite of whoever booked it first.
     `SELECT job_id, job_status, fk_easyfixter_id, fk_customer_id, fk_client_id,
+            fk_created_by,
             DATE_FORMAT(requested_date_time, '%Y-%m-%d %H:%i:%s') AS requested_date_time,
             booking_cut_off_time_slot, ${otpCol}
        FROM tbl_job WHERE job_id = ? LIMIT 1`,
@@ -6908,17 +6916,58 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
         values.push(String(generateOtp()));
       }
     }
-    // Stamp fk_created_by on confirmation when the row has none yet — e.g. an
-    // Unconfirmed/integration job, or one created by a technician (no tbl_user
-    // creator). COALESCE preserves a real creator already set by create()
-    // (Book-New-Call). fk_created_by is a tbl_user FK, so coerce the actor id
-    // the same way create() does: a technician actor ("efr:NNN" → NaN) resolves
-    // to null rather than corrupting the column. This also fixes the legacy
-    // "Booking Confirmed" window, which shows the name via
-    // fk_created_by → tbl_user.user_name (so a NULL left the name blank).
+    /*
+     * ── WHO BOOKED THIS ORDER ──────────────────────────────────────────────
+     *
+     * Stamp fk_created_by with the user who actually confirmed the order.
+     *
+     * THIS USED TO BE `COALESCE(fk_created_by, ?)` — "fill it only if empty" —
+     * and the assumption underneath it was that an integration job arrives with
+     * NO creator. It does not. A partner API authenticates AS A tbl_user, so
+     * create() writes that account's id and the COALESCE guard never fires:
+     * measured on Production 2026-09, the Decathlon API (user 53 "System-crm")
+     * held fk_created_by on all 79 jobs it raised, while the ops staff who
+     * confirmed them got nothing. Employee Productivity then credited 80
+     * bookings to a robot and none to the people who did the work — and user 53
+     * is deactivated, so the rows were invisible on top of that.
+     *
+     * So the stamp is now a REAL assignment, not a fill-if-empty. Every
+     * confirmation re-credits the order to the human who clicked Book Call,
+     * whatever created it and whichever integration it came from — which also
+     * drains the integration accounts out of the report over time, with no
+     * per-account deny-list to maintain.
+     *
+     * ⚠ SCOPED TO AN ACTUAL CONFIRMATION, AND THAT SCOPE IS LOAD-BEARING.
+     *
+     * This block is the `status === BOOKED` branch, which is EVERY transition
+     * into status 0 — not just 9 → 0. Two of those must not reassign anything:
+     *   • a re-book (a booked job reverted to 0 by someone else) would hand
+     *     that second user the first one's booking;
+     *   • the mobile ETA / reschedule routes deliberately pass the CURRENT
+     *     status to ride the extras path (see the tbl_job_logs note below), so
+     *     a job already at 0 re-enters here on an ETA ping.
+     * An unconditional overwrite would silently rewrite history in both. The
+     * FROM-state is therefore part of the condition: only a job arriving from
+     * Unconfirmed or Enquiry is being booked for the first time.
+     *
+     * `fk_created_by IS NULL` stays as a second trigger — that is the original
+     * case this code was written for (a technician-created job, no tbl_user
+     * creator) and it is still right: nobody's credit can be taken when there
+     * is none to take.
+     *
+     * fk_created_by is a tbl_user FK, so the actor id is coerced the same way
+     * create() does: a technician actor ("efr:NNN" → NaN) resolves to null
+     * rather than corrupting the column. This also keeps the legacy "Booking
+     * Confirmed" window working, which shows the name via
+     * fk_created_by → tbl_user.user_name (a NULL left the name blank).
+     */
     const bookedActorId = (() => { const n = Number(actorId); return Number.isFinite(n) && n > 0 ? n : null; })();
-    if (bookedActorId) {
-      sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
+    const isFirstConfirmation =
+      Number(existing.job_status) === STATUS.UNCONFIRMED ||
+      Number(existing.job_status) === STATUS.ENQUIRY ||
+      existing.fk_created_by == null;
+    if (bookedActorId && isFirstConfirmation) {
+      sets.push('fk_created_by = ?');
       values.push(bookedActorId);
     }
     /*

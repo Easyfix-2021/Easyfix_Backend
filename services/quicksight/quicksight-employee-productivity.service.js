@@ -48,6 +48,41 @@ const LIST_CAP = 50000;     // job-level / per-query
 const GROUPED_CAP = 5000;   // grouped rows (per-user metrics, RM lists)
 const MAX_PAGE_SIZE = 500;  // FE [10,50,80]; legacy used the BE page size as-is
 
+/*
+ * ── SORTABLE COLUMNS ───────────────────────────────────────────────────────
+ *
+ * Maps the wire name (what the FE sends, matching the visible column header)
+ * to the response field it orders by. 'employee' is the odd one out: it sorts
+ * on the NAME, so it is handled separately rather than mapped to a number.
+ *
+ * A FROZEN ALLOW-LIST, and it must stay one. The sort key reaches an object
+ * index; accepting whatever arrives would let a caller order by any property on
+ * the row — including one added later that was never meant to be exposed. An
+ * unknown key falls back to the default rather than erroring, because a stale
+ * bookmark asking for a column that has been renamed should still render the
+ * report.
+ */
+const SORTABLE_COLUMNS = {
+  employee: 'userName',
+  booked: 'booked',
+  scheduled: 'scheduled',
+  audit: 'audit',
+  closed: 'closedCount',
+  revenue: 'revenue',
+  cancelled: 'cancelCount',
+};
+
+/*
+ * Default order: REVENUE, HIGHEST FIRST (ops, 2026-09-30). The table's job is
+ * "who earned what", and alphabetical put Abhishek above everyone for no reason
+ * but his initial. Descending is the default DIRECTION too — for every column
+ * here, including the counts, "most" is the interesting end. Name is the only
+ * one a reader expects A→Z, and asking for it explicitly is how you get that.
+ */
+const DEFAULT_SORT_BY = 'revenue';
+const DEFAULT_SORT_DIR = 'desc';
+const DEFAULT_SORT_DIR_MULT = -1;
+
 /* ── manage_clients / rmTeam resolution helpers (legacy FloorDisciplineServiceImpl) ── */
 
 /*
@@ -55,11 +90,24 @@ const MAX_PAGE_SIZE = 500;  // FE [10,50,80]; legacy used the BE page size as-is
  *   SELECT user_id FROM tbl_user
  *    WHERE user_status = 1 AND user_type_id = 5 AND reporting_manager = :rmId
  */
+/*
+ * ⚠ `user_status = 1` IS DELIBERATELY ABSENT — the legacy query had it.
+ *
+ * This list is what forceOwnHierarchy pins a non-Admin to, so it decides which
+ * people a reporting manager may see AT ALL. Filtering it to active users meant
+ * a manager could never see a team member who had left — and the whole point of
+ * the report including ex-staff (see getEmployeeProductivity) is that their work
+ * did not leave with them. Keeping the filter here would have delivered the fix
+ * to Admins only, which is the audience least likely to notice it was missing.
+ *
+ * Widening this does NOT widen what anyone can see: a leaver still reported to
+ * this manager, so they were always inside that manager's hierarchy. The scope
+ * is unchanged; it simply no longer forgets its own members.
+ */
 async function findUsersByReportingManagerId(rmId) {
   const sql =
     `SELECT user_id FROM tbl_user
-      WHERE user_status = 1
-        AND user_type_id = 5
+      WHERE user_type_id = 5
         AND reporting_manager = ?`;
   const [rows] = await pool.query(sql, [rmId]);
   return rows.map((r) => Number(r.user_id));
@@ -252,72 +300,188 @@ function clientGuard(col, pf, params) {
  * Zero-metric users are LEFT-joined in JS (legacy createEmptyProductivity):
  * every STEP1 user appears, with 0s when they have no STEP3 row.
  */
-async function getEmployeeProductivity({ pf, page, size }) {
-  logger.info('Building Employee Productivity · page=' + page + ' size=' + size + ' dateMode=' + pf.dateMode);
+/*
+ * Order the roster IN PLACE, and report back which order was actually applied.
+ *
+ * Extracted from getEmployeeProductivity so it can be tested without a
+ * database: every property worth asserting here — the default, the fallback,
+ * the tie-break — is pure, and a test that needs a live pool to check that
+ * Rs.0 rows do not shuffle is a test nobody runs.
+ *
+ * Returns the RESOLVED key/dir rather than mutating a caller variable, because
+ * the response echoes them back and the header arrow on the FE must show what
+ * the server did, not what the request asked for.
+ */
+function sortProductivityRows(rows, sortBy, sortDir) {
+  /*
+   * Object.hasOwn, NOT a truthiness test on the lookup.
+   *
+   * `SORTABLE_COLUMNS[sortBy]` is truthy for anything inherited from
+   * Object.prototype — 'constructor', 'toString', 'valueOf', '__proto__' — so a
+   * plain lookup ACCEPTS those as sort keys. Nothing crashes: the mapped
+   * "field" is a function, `row[Function]` is undefined, every comparison
+   * scores 0 and the table quietly falls back to name order while echoing
+   * sortBy:'constructor' to the FE, which then draws its arrow on no column at
+   * all. An own-property test is the difference between an allow-list and a
+   * suggestion.
+   */
+  const key = Object.hasOwn(SORTABLE_COLUMNS, sortBy) ? sortBy : DEFAULT_SORT_BY;
+  const dir = sortDir === 'asc' ? 1 : (sortDir === 'desc' ? -1 : DEFAULT_SORT_DIR_MULT);
+  // localeCompare with sensitivity:'base' so 'anand' and 'Anand' cannot sort
+  // either side of 'Bhawana' — a case-sensitive compare puts every capitalised
+  // name above every lowercase one, which reads as a broken alphabet.
+  const byName = (a, b) => String(a.userName || '').localeCompare(String(b.userName || ''), 'en', { sensitivity: 'base' });
+  rows.sort((a, b) => {
+    if (key === 'employee') return dir * byName(a, b);
+    const diff = (Number(a[SORTABLE_COLUMNS[key]]) || 0) - (Number(b[SORTABLE_COLUMNS[key]]) || 0);
+    // Tie-break ALWAYS ascending by name, whatever the primary direction: the
+    // point is a deterministic order across requests, and flipping the
+    // tie-break with the primary would make the equal rows reshuffle again.
+    return diff !== 0 ? dir * diff : byName(a, b);
+  });
+  return { key, dir };
+}
+
+async function getEmployeeProductivity({ pf, page, size, sortBy, sortDir }) {
+  logger.info('Building Employee Productivity · page=' + page + ' size=' + size
+    + ' dateMode=' + pf.dateMode + ' sortBy=' + (sortBy || DEFAULT_SORT_BY)
+    + ' sortDir=' + (sortDir || DEFAULT_SORT_DIR));
   const offset = (page - 1) * size;
 
-  // ── STEP1 — getActiveUserList (FloorDisciplineRepository:182-204) ──
-  // verticalId: legacy used (:verticalId IS NULL OR manage_verticals='0' OR
-  // FIND_IN_SET(:verticalId, manage_verticals)). userId>0 wins; else the
-  // rmTeam list guard (-1 IN (:rmTeam) OR user_id IN (:rmTeam)).
-  const userListSql =
-    `SELECT TU.user_id, TU.user_name
-       FROM tbl_user TU
-      WHERE TU.user_type_id = 5
-        AND TU.user_status = 1
-        AND TU.user_role NOT IN (1)
-        AND ( ? IS NULL
+  /*
+   * ── THE SCOPE PREDICATE, WRITTEN ONCE ──────────────────────────────────
+   *
+   * vertical guard + the user/RM guard, shared VERBATIM by both halves of the
+   * roster union below.
+   *
+   * ⚠ SHARED BECAUSE IT IS A SECURITY BOUNDARY, not for tidiness. A non-Admin
+   * has reportingManagerId pinned to themselves by forceOwnHierarchy
+   * (middleware/quicksight-admin-or-rm.js), so this predicate is the only thing
+   * standing between "my team" and "everybody". The second half of the union
+   * selects people by WHAT THEY DID rather than by who they report to — so if
+   * it were allowed to skip this, a reporting manager would silently gain every
+   * ex-employee in the company who happened to work in the window. Two copies
+   * of a boundary is one copy that gets forgotten.
+   */
+  const rmPh = placeholders(pf.rmTeamUserIds);
+  const scopePredicate =
+    `        AND ( ? IS NULL
               OR TU.manage_verticals = '0'
               OR FIND_IN_SET(?, TU.manage_verticals) )
         AND ( ( ? IS NOT NULL AND ? > 0 AND TU.user_id = ? )
-              OR ( ( ? IS NULL OR ? = 0 ) AND ( -1 IN (${placeholders(pf.rmTeamUserIds)}) OR TU.user_id IN (${placeholders(pf.rmTeamUserIds)}) ) ) )
-      ORDER BY TU.user_name ASC
-      LIMIT ? OFFSET ?`;
-  const userListParams = [
+              OR ( ( ? IS NULL OR ? = 0 ) AND ( -1 IN (${rmPh}) OR TU.user_id IN (${rmPh}) ) ) )`;
+  const scopeParams = () => [
     pf.verticalId, pf.verticalId,
     pf.userId, pf.userId, pf.userId,
     pf.userId, pf.userId,
     ...pf.rmTeamUserIds, ...pf.rmTeamUserIds,
-    size, offset,
+  ];
+
+  /*
+   * ── WHO TOUCHED ANYTHING IN THE WINDOW ─────────────────────────────────
+   *
+   * There is no one column that says "this user worked". Work is recorded in
+   * six different places depending on what KIND of work it was, so the six are
+   * stacked and de-duplicated: one row per person, whatever they did.
+   *
+   * These are exactly the six columns STEP3 aggregates — deliberately, so a
+   * person can never be admitted to the list by an activity the table then has
+   * no column to show, nor be excluded while one of their numbers is non-zero.
+   *
+   * `BETWEEN NULL AND NULL` matches nothing, which is the existing convention
+   * for an unset range (see the STEP3 note). So a dateless request yields an
+   * EMPTY worked-set and the list degrades to exactly the active roster —
+   * today's behaviour — rather than to everyone who ever worked.
+   */
+  const WORKED_IN_WINDOW = `
+        SELECT DISTINCT actor FROM (
+          SELECT fk_created_by    AS actor FROM tbl_job              WHERE created_date_time             BETWEEN ? AND ?
+          UNION SELECT fk_scheduled_by     FROM tbl_job              WHERE original_scheduling_date_time BETWEEN ? AND ?
+          UNION SELECT cancel_by           FROM tbl_job              WHERE cancel_date_time              BETWEEN ? AND ?
+          UNION SELECT full_fillment_by    FROM tbl_job              WHERE full_fillment_created_time    BETWEEN ? AND ?
+          UNION SELECT sent_by             FROM tbl_estimate_details WHERE sent_on                       BETWEEN ? AND ?
+          UNION SELECT updated_by          FROM tbl_job_transaction  WHERE insert_date                   BETWEEN ? AND ?
+        ) A WHERE actor > 0`;
+  const workedParams = () => {
+    const p = [];
+    for (let i = 0; i < 6; i += 1) p.push(pf.startDate, pf.endDate);
+    return p;
+  };
+
+  /*
+   * ── STEP1 — THE ROSTER, AS A UNION OF TWO POPULATIONS ──────────────────
+   *
+   * Legacy listed ONLY active staff (getActiveUserList,
+   * FloorDisciplineRepository:182-204) while the numbers beside them describe a
+   * DATE WINDOW. Those are two different populations the moment anybody leaves,
+   * and the report had no way to say so: measured on Production for
+   * 2026-09-01..29, six departed employees took 687 booked, 578 scheduled, 34
+   * closed and Rs.72,860 of revenue out of the table with them — absent from the
+   * page, the KPI row, the chart AND the export, with nothing on screen
+   * admitting it. The KRA tile, which is job-scoped and never looks at
+   * tbl_user, kept counting them, so the same page disagreed with itself.
+   *
+   *   A — every ACTIVE employee, INCLUDING zero-activity ones. Not an
+   *       oversight: "this person did nothing all month" is a finding, and
+   *       dropping them would hide it. This is the half legacy had.
+   *   B — every EX-employee who actually worked in the window. Gated on real
+   *       activity, so a quiet range adds nobody and the list stays the roster.
+   *
+   * UNION ALL, not UNION: A is user_status = 1 and B is user_status <> 1, so
+   * they cannot overlap and there is nothing to de-duplicate. Keeping the two
+   * halves disjoint is what earns the cheaper operator.
+   *
+   * `user_role NOT IN (1)` is now NULL-safe. In SQL `NULL NOT IN (1)` is NULL,
+   * not TRUE, so a user with no role set was being dropped from this report
+   * with no resignation required — silently, and with their numbers.
+   *
+   * NO LIMIT/OFFSET HERE ANY MORE — see the sort note below.
+   */
+  const userListSql =
+    `SELECT TU.user_id, TU.user_name, 0 AS is_former
+       FROM tbl_user TU
+      WHERE TU.user_type_id = 5
+        AND TU.user_status = 1
+        AND ( TU.user_role IS NULL OR TU.user_role NOT IN (1) )
+${scopePredicate}
+      UNION ALL
+     SELECT TU.user_id, TU.user_name, 1 AS is_former
+       FROM tbl_user TU
+       JOIN (${WORKED_IN_WINDOW}) W ON W.actor = TU.user_id
+      WHERE TU.user_type_id = 5
+        AND TU.user_status <> 1
+${scopePredicate}`;
+  const userListParams = [
+    ...scopeParams(),
+    ...workedParams(),
+    ...scopeParams(),
   ];
   const [userRows] = await pool.query(userListSql, userListParams);
-  logger.info('Found ' + userRows.length + ' users on this page');
 
-  if (userRows.length >= MAX_PAGE_SIZE) {
+  // STEP2 — the count is now simply the union's size. It MUST be derived from
+  // the very rows we are about to page, not from a second query: a count query
+  // that drifted from the list query by one predicate would print a page total
+  // the table cannot fill.
+  const totalRecords = userRows.length;
+  const formerCount = userRows.reduce((n, r) => n + (Number(r.is_former) ? 1 : 0), 0);
+  logger.info('Employee Productivity roster · ' + totalRecords + ' employees ('
+    + formerCount + ' former, ' + (totalRecords - formerCount) + ' active)');
+
+  if (userRows.length >= GROUPED_CAP) {
     logger.warn(
-      { report: 'employee-productivity', returned: userRows.length, cap: MAX_PAGE_SIZE },
-      'Employee Productivity page hit the max page-size — verify pagination',
+      { report: 'employee-productivity', returned: userRows.length, cap: GROUPED_CAP },
+      'Employee Productivity roster hit the grouped-rows cap — verify the date range',
     );
   }
 
-  // ── STEP2 — getTotalUserCount (FloorDisciplineRepository:206-224) ──
-  const countSql =
-    `SELECT COUNT(TU.user_id) AS total
-       FROM tbl_user TU
-      WHERE TU.user_type_id = 5
-        AND TU.user_status = 1
-        AND TU.user_role NOT IN (1)
-        AND ( ? IS NULL
-              OR TU.manage_verticals = '0'
-              OR FIND_IN_SET(?, TU.manage_verticals) )
-        AND ( ( ? IS NOT NULL AND ? > 0 AND TU.user_id = ? )
-              OR ( ( ? IS NULL OR ? = 0 ) AND ( -1 IN (${placeholders(pf.rmTeamUserIds)}) OR TU.user_id IN (${placeholders(pf.rmTeamUserIds)}) ) ) )`;
-  const countParams = [
-    pf.verticalId, pf.verticalId,
-    pf.userId, pf.userId, pf.userId,
-    pf.userId, pf.userId,
-    ...pf.rmTeamUserIds, ...pf.rmTeamUserIds,
-  ];
-  const [countRows] = await pool.query(countSql, countParams);
-  const totalRecords = Number(countRows[0]?.total) || 0;
-
-  // Build the page user map (name + zero-row default).
+  // Metrics are fetched for the WHOLE roster, not one page — see the sort note.
   const userIds = userRows.map((r) => Number(r.user_id));
   const userNameMap = new Map(userRows.map((r) => [Number(r.user_id), r.user_name]));
+  const formerMap = new Map(userRows.map((r) => [Number(r.user_id), Boolean(Number(r.is_former))]));
 
-  // No users on this page → empty data with the real totals.
+  // Nobody in scope → empty data with the real totals.
   if (userIds.length === 0) {
-    logger.info('No users on page · totalRecords=' + totalRecords);
+    logger.info('No users in scope · totalRecords=' + totalRecords);
     return {
       totalRecords,
       pageNumber: page,
@@ -342,12 +506,16 @@ async function getEmployeeProductivity({ pf, page, size }) {
   const metricMap = new Map();
   for (const r of metricRows) metricMap.set(Number(r.user_id), productivityCounts(r));
 
-  // LEFT-join in JS: every page user appears (zero-row default for no metrics).
-  const data = userIds.map((uid) => {
+  // LEFT-join in JS: every roster user appears (zero-row default for no metrics).
+  const allRows = userIds.map((uid) => {
     const m = metricMap.get(uid);
     return {
       userId: uid,
       userName: userNameMap.get(uid) || '',
+      // isFormer drives the "Ex" chip. Shipped per row rather than inferred on
+      // the FE from a zero-count: a current employee can legitimately have all
+      // zeros, and the two states must not render the same.
+      isFormer: formerMap.get(uid) === true,
       booked: m ? m.booked : 0,
       scheduled: m ? m.scheduled : 0,
       audit: m ? m.audit : 0,
@@ -357,12 +525,40 @@ async function getEmployeeProductivity({ pf, page, size }) {
     };
   });
 
-  logger.info('Returning ' + data.length + ' productivity rows · totalRecords=' + totalRecords);
+  /*
+   * ── SORT, THEN PAGE — AND THAT ORDER IS THE WHOLE POINT ────────────────
+   *
+   * Legacy paged the USER LIST in SQL (ORDER BY user_name, LIMIT/OFFSET) and
+   * only then fetched metrics for those ten. That order makes sorting by any
+   * metric IMPOSSIBLE: revenue does not exist yet when the page is chosen, so
+   * "top earner first" could only ever have re-ordered the ten names that
+   * alphabetical paging happened to hand over. Sorting a page is not sorting.
+   *
+   * So the roster is fetched whole, scored, sorted, and only then sliced. The
+   * cost is bounded by the roster (tens of people, capped at GROUPED_CAP), not
+   * by the job tables — and the XLSX path already fetched every employee this
+   * way, so this is the shape that was already being paid for.
+   *
+   * THE TIE-BREAK IS LOAD-BEARING. Most employees have revenue 0, and
+   * Array.prototype.sort is only stable within one call — across two requests
+   * the equal rows may be handed to it in a different order, so a page boundary
+   * falling inside that block of zeros could show the same person twice, or
+   * nobody, as you page. Name is the tie-break because it is unique enough and
+   * it is the order a reader expects when the metric cannot separate two rows.
+   */
+  const { key, dir } = sortProductivityRows(allRows, sortBy, sortDir);
+
+  const data = allRows.slice(offset, offset + size);
+
+  logger.info('Returning ' + data.length + ' productivity rows · totalRecords=' + totalRecords
+    + ' · sorted by ' + key + ' ' + (dir === 1 ? 'asc' : 'desc'));
   return {
     totalRecords,
     pageNumber: page,
     pageSize: size,
     totalPages: size > 0 ? Math.ceil(totalRecords / size) : 0,
+    sortBy: key,
+    sortDir: dir === 1 ? 'asc' : 'desc',
     data,
   };
 }
@@ -1034,12 +1230,26 @@ async function getRmTeamUsers({ verticalId, reportingManagerId }) {
   const rm = reportingManagerId != null ? Number(reportingManagerId) : 0;
   logger.info('Listing RM team users · verticalId=' + v + ' reportingManagerId=' + rm);
   const sql =
-    `SELECT TU.user_id, TU.user_name, TU.manage_verticals, TU.reporting_manager, TU1.user_name AS rm_name
+    /*
+     * INACTIVE USERS ARE INCLUDED, and flagged rather than filtered.
+     *
+     * This feeds the Employee dropdown that filters the table. The table now
+     * lists ex-employees who worked in the window, so excluding them here left
+     * a row on screen that could not be selected in the control directly above
+     * it — which reads as a broken filter, not as a policy.
+     *
+     * is_former rides along so the FE can mark them; the caller decides how to
+     * present it, but it can no longer be unaware of it. Same NULL-safe role
+     * test as the roster query, for the same reason: `NULL NOT IN (1)` is NULL,
+     * and a user with no role set is not a user with role 1.
+     */
+    `SELECT TU.user_id, TU.user_name, TU.manage_verticals, TU.reporting_manager,
+            TU1.user_name AS rm_name,
+            (TU.user_status <> 1) AS is_former
        FROM tbl_user TU
        LEFT JOIN tbl_user TU1 ON TU1.user_id = TU.reporting_manager
       WHERE TU.user_type_id = 5
-        AND TU.user_role NOT IN (1)
-        AND TU.user_status = 1
+        AND ( TU.user_role IS NULL OR TU.user_role NOT IN (1) )
         AND ( ? = 0
               OR TU.manage_verticals = '0'
               OR FIND_IN_SET(?, TU.manage_verticals) > 0 )
@@ -1055,6 +1265,7 @@ async function getRmTeamUsers({ verticalId, reportingManagerId }) {
     manage_verticals: r.manage_verticals,
     reporting_manager: r.reporting_manager == null ? null : Number(r.reporting_manager),
     rm_name: r.rm_name || '',
+    is_former: Boolean(Number(r.is_former)),
   }));
 }
 
@@ -1165,4 +1376,11 @@ module.exports = {
   // Cap surfaced so the route's xlsx export can request the full set
   // symbolically (avoids a hardcoded 5000 literal drifting from this cap).
   GROUPED_CAP,
+  // Sort contract, surfaced so the route's Joi schema validates against THIS
+  // allow-list instead of a second copy that would drift from it.
+  SORTABLE_COLUMN_KEYS: Object.keys(SORTABLE_COLUMNS),
+  DEFAULT_SORT_BY,
+  DEFAULT_SORT_DIR,
+  // Exported for tests: pure, and the ordering rules are worth asserting.
+  sortProductivityRows,
 };
