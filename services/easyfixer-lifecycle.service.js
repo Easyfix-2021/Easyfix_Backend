@@ -1723,6 +1723,29 @@ async function finalizeMobileRegistrationGate1(efrId) {
   if (!(await hasLifecycleSchema())) {
     return { schemaInstalled: false, changed: false, lifecycle: null };
   }
+  /*
+   * Give a new technician the mandatory catalogue as it stands today, BEFORE
+   * probing completion — otherwise they finalize with nothing assigned.
+   *
+   * OUTSIDE transition(), never inside its _resolveStatus. transition() holds
+   * this technician's tbl_easyfixer row FOR UPDATE on its own connection, and
+   * this INSERT runs on the pool: easyfixer_courses has a foreign key to
+   * tbl_easyfixer, so the insert waits for that very row lock while the
+   * transaction waits for the insert — a self-deadlock that only
+   * innodb_lock_wait_timeout (50 s) breaks. It stayed hidden while no course
+   * was mandatory (the INSERT..SELECT matched nothing, so no FK check ran) and
+   * surfaced the day Introduction to Easyfix became one: every identity save
+   * that finalized Gate 1 took ~50 s and the app reported it failed
+   * (QA 2026-09-30, efrId 10798).
+   *
+   * Best-effort and idempotent; failing here must never block a registration
+   * that is otherwise valid.
+   */
+  try {
+    await lms.assignMandatoryCourses(efrId);
+  } catch (e) {
+    logger.warn({ err: e.message, efrId }, 'gate1: mandatory course assignment failed');
+  }
   let clearIdentityRejection = false;
   const result = await transition(efrId, {
     source: 'SYSTEM',
@@ -1738,22 +1761,6 @@ async function finalizeMobileRegistrationGate1(efrId) {
       // per registration — not a hot path. `required > 0` matters: a
       // technician with nothing assigned is not "outstanding", they simply
       // have no training, and must still finalize to UNDER_VERIFICATION.
-      /*
-       * Give a new technician the mandatory catalogue as it stands today,
-       * BEFORE probing completion — otherwise they finalize with nothing
-       * assigned and the gate has nothing to hold them to.
-       *
-       * Best-effort and idempotent. It writes on the pool rather than this
-       * transaction's connection, so a rollback leaves the assignment rows
-       * behind; that is the harmless direction (re-running assigns nothing new,
-       * and an assignment without a finalized registration simply waits).
-       * Failing here must never block a registration that is otherwise valid.
-       */
-      try {
-        await lms.assignMandatoryCourses(efrId);
-      } catch (e) {
-        logger.warn({ err: e.message, efrId }, 'gate1: mandatory course assignment failed');
-      }
       /*
        * ONE definition of "training complete" (owner, 2026-09-28): the app's
        * own, fetchTrainingCompletedTime — every MANDATORY item done. This used
