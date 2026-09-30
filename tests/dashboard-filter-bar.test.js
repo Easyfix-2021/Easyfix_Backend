@@ -22,8 +22,11 @@
  *       be on both.
  *    3. JOINS FOLLOW THE FILTERS. City reads ad.city_id, Zonal Manager reads
  *       ct.state_user THROUGH it — so a ZM filter must add BOTH joins. Client
- *       and Project Manager must add NEITHER: the point of the EXISTS form is
- *       that it costs no join and cannot multiply a row.
+ *       and Project Manager must add NEITHER: Vertical and PM resolve to the
+ *       client ids they map to BEFORE the query (resolveDashboardFilters), so
+ *       they arrive as a plain `j.fk_client_id IN (…)` — no join, no row
+ *       multiplication, and the same text list() emits (2026-09-30: the
+ *       correlated EXISTS cost 22-45 s on the Manage Jobs page).
  *    4. PLACEHOLDERS AND PARAMS AGREE, in both of the two queries /counts runs
  *       — they share one `params` array, so a clause pushed without its params
  *       (or vice versa) silently shifts every later binding.
@@ -51,7 +54,14 @@ const fake = installFakePool([
   [/SELECT magic_link_delivery_status FROM tbl_job LIMIT 1/i, [{ magic_link_delivery_status: null }]],
   // list(countOnly) destructures [[{ total }]] — it needs a row, not [].
   [/COUNT\(\*\) AS total/i, [{ total: 0 }]],
+  // The mapping resolver, deterministic so a test can see WHICH filter a bound
+  // id came from: vertical v → client v*10, project manager u → client u*100.
+  [/^SELECT DISTINCT client_id FROM tbl_vertical_mapping WHERE vertical_id IN/i,
+    (sql, params) => params.map((v) => ({ client_id: v * 10 }))],
+  [/^SELECT DISTINCT client_id FROM tbl_vertical_mapping WHERE user_type = 1/i,
+    (sql, params) => params.map((u) => ({ client_id: u * 100 }))],
 ]);
+const resolverCall = (re) => fake.calls.find((c) => /^SELECT DISTINCT client_id FROM tbl_vertical_mapping/i.test(c.sql) && re.test(c.sql));
 
 const jobSvc = require('../services/job.service');
 const { listQuery, dashboardCountsQuery, dashboardAttentionQuery, DASHBOARD_FILTERS } = require('../validators/job.validator');
@@ -105,12 +115,14 @@ test('city filter: ad.city_id IN, and joins tbl_address only', async () => {
   assert.deepEqual(params, [7, 9]);
 });
 
-test('vertical filter: a self-contained EXISTS on vertical_id, and NO join', async () => {
+test('vertical filter: resolved to its clients first, then a plain client IN, and NO join', async () => {
   await jobSvc.getStatusCounts({ filters: { verticalId: '12,13' } });
+  assert.deepEqual(resolverCall(/vertical_id IN \(\?,\?\)/).params, [12, 13], 'one lookup for both verticals');
   const { sql, params } = statusQuery();
-  assert.match(squash(sql), /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.vertical_id IN \(\?,\?\)\)/);
-  assert.ok(!/tbl_address|LEFT JOIN tbl_client/.test(sql), 'the EXISTS form must cost no join: ' + sql);
-  assert.deepEqual(params, [12, 13]);
+  assert.match(squash(sql), /j\.fk_client_id IN \(\?,\?\)/);
+  assert.ok(!/tbl_vertical_mapping/.test(sql), 'no correlated mapping subquery in the count: ' + sql);
+  assert.ok(!/tbl_address|LEFT JOIN tbl_client/.test(sql), 'the vertical filter must cost no join: ' + sql);
+  assert.deepEqual(params, [120, 130]);
 });
 
 /*
@@ -121,7 +133,10 @@ test('vertical filter: a self-contained EXISTS on vertical_id, and NO join', asy
  */
 test('vertical filter does not pin user_type — that is the PM filter, not this one', async () => {
   await jobSvc.getStatusCounts({ filters: { verticalId: '12' } });
-  assert.ok(!/user_type/.test(statusQuery().sql), 'vertical filter must not constrain user_type');
+  const lookup = resolverCall(/vertical_id IN/);
+  assert.ok(lookup, 'the vertical lookup must have run');
+  assert.ok(!/user_type/.test(lookup.sql), 'vertical lookup must not constrain user_type');
+  assert.ok(!/user_type/.test(statusQuery().sql), 'nor may the count');
 });
 
 /*
@@ -131,9 +146,11 @@ test('vertical filter does not pin user_type — that is the PM filter, not this
  */
 test('project manager predicate is still available, and still pins user_type 1', async () => {
   await jobSvc.getStatusCounts({ filters: { projectManagerId: '12' } });
+  assert.match(resolverCall(/user_type = 1/).sql, /WHERE user_type = 1 AND user_id IN \(\?\)$/);
+  assert.deepEqual(resolverCall(/user_type = 1/).params, [12]);
   const { sql, params } = statusQuery();
-  assert.match(squash(sql), /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.user_type = 1 AND vm\.user_id IN \(\?\)\)/);
-  assert.deepEqual(params, [12]);
+  assert.match(squash(sql), /j\.fk_client_id IN \(\?\)/);
+  assert.deepEqual(params, [1200], 'the PM\'s mapped client, not the user id');
 });
 
 test('zonal manager filter: ct.state_user IN, and joins BOTH tbl_address and tbl_city', async () => {
@@ -154,14 +171,14 @@ test('both of /counts\' queries carry the filters, with placeholders and params 
   for (const [label, call] of [['status', status], ['booked-split', booked]]) {
     assert.match(call.sql, /j\.fk_client_id IN/, label);
     assert.match(call.sql, /ad\.city_id IN/, label);
-    assert.match(call.sql, /vm\.vertical_id IN/, label);
+    assert.equal((call.sql.match(/j\.fk_client_id IN/g) || []).length, 2, `${label}: client + vertical`);
     assert.match(call.sql, /ct\.state_user IN/, label);
     // The two queries share ONE params array; a clause pushed without its
     // params shifts every binding after it, which binds silently and wrongly.
     assert.equal(placeholders(call.sql), call.params.length,
       `${label}: ${placeholders(call.sql)} placeholders vs ${call.params.length} params`);
   }
-  assert.deepEqual(status.params, [3, 7, 9, 12, 11, 12]);  // client, city x2, vertical, zm x2
+  assert.deepEqual(status.params, [3, 7, 9, 120, 11, 12]);  // client, city x2, vertical 12's client, zm x2
   assert.deepEqual(booked.params, status.params, 'both queries bind the same values');
 });
 
@@ -196,9 +213,9 @@ test('the WHERE is the LIST\'s own — whole clause + params, so neither side ca
   // to each other would pass if BOTH lost a predicate.
   assert.match(dash, /j\.fk_client_id IN \(\?\)/);
   assert.match(dash, /ad\.city_id IN \(\?,\?\)/);
-  assert.match(dash, /EXISTS \(SELECT 1 FROM tbl_vertical_mapping vm WHERE vm\.client_id = j\.fk_client_id AND vm\.vertical_id IN \(\?\)\)/);
+  assert.match(dash, /ad\.city_id IN \(\?,\?\) AND j\.fk_client_id IN \(\?\)/, 'the vertical, resolved');
   assert.match(dash, /ct\.state_user IN \(\?,\?\)/);
-  assert.deepEqual(dashCall.params, [3, 7, 9, 12, 11, 12]);
+  assert.deepEqual(dashCall.params, [3, 7, 9, 120, 11, 12]);
 });
 
 test('filters NARROW an RBAC scope, they never replace it', async () => {
@@ -236,7 +253,7 @@ test('every attention tile narrows with the bar — all six, not some', async ()
   for (const c of calls) {
     assert.match(c.sql, /j\.fk_client_id IN/, c.sql.slice(0, 120));
     assert.match(c.sql, /ad\.city_id IN/, c.sql.slice(0, 120));
-    assert.match(c.sql, /vm\.vertical_id IN/, c.sql.slice(0, 120));
+    assert.ok(c.params.includes(120), 'the vertical\'s resolved client must be bound: ' + c.sql.slice(0, 120));
     assert.match(c.sql, /ct\.state_user IN/, c.sql.slice(0, 120));
     assert.equal(placeholders(c.sql), c.params.length,
       'tile placeholders/params out of step: ' + c.sql.slice(0, 200));
