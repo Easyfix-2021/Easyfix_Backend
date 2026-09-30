@@ -147,7 +147,7 @@ test('EVERY recording site in the codebase sets a length', (t) => {
   // would otherwise pass in silence.
   const has = (file, kind) => sites.some((s) => s.file === file && s.kind === kind);
   assert.ok(has(path.join('services', 'plivo.service.js'), 'xml'), 'bridge <Record> not found — the scanner is broken');
-  assert.ok(has(path.join('services', 'plivo-conference.service.js'), 'xml'), 'MPC <Record> not found — the scanner is broken');
+  // (The MPC no longer uses <Record> — it records via record="true"; see conference-recording-xml.test.js.)
   assert.ok(has(path.join('services', 'plivo-ai-call.service.js'), 'api'), 'AI Record API not found — the scanner is broken');
 
   const bad = sites.filter((s) => !s.ok);
@@ -176,10 +176,11 @@ test('bridge <Record> emits maxLength in every recorded shape', () => {
   }
 });
 
-test('MPC <Record> emits maxLength', () => {
+test('MPC records via record="true", not a <Record> — no maxLength to carry', () => {
+  // The 60 s cap is a <Record>/Record API default; the MPC room recording runs
+  // for the MPC's life. Confirm duration > 60 s on the QA call anyway.
   const els = recordEls(conference.operatorAnswerXml('efxconf1234abcd', { confId: 7, recordingCallbackUrl: CB }));
-  assert.equal(els.length, 1);
-  assert.match(els[0], /\bmaxLength="86400"/);
+  assert.equal(els.length, 0);
 });
 
 test('AI-call Record API sends time_limit', async () => {
