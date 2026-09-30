@@ -4130,7 +4130,7 @@ router.put('/:id/feedback',
   async (req, res, next) => {
     try {
       logger.info('Save job feedback · jobId=' + req.params.id);
-      const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body);
+      const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body, req.user?.user_id || null);
       logger.info('Job feedback saved · jobId=' + req.params.id);
       modernOk(res, row, 'Feedback saved');
     } catch (e) { next(e); }
