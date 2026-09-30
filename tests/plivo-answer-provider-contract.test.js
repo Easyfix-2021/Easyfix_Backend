@@ -458,19 +458,20 @@ test('/recording-callback stores the recording against the jci from the token', 
     'keyed by jci, not by call_uuid — that is what makes web/WebRTC legs populate');
 });
 
-test('/recording-callback stores a CONFERENCE recording only on MPCRecordingCompleted', async () => {
-  // The MPC's own recording (record="true" on <MultiPartyCall>) posts
-  // RecordingURL/RecordingUUID + EventName for every lifecycle step.
+test('/recording-callback: <Record> is the safety net (fill-if-empty); the ROOM recording wins on Completed', async () => {
   const stored = [];
-  plivoLog.setRecording = async (jci, payload) => { stored.push({ jci, payload }); };
-  const mpc = (EventName) => call('/recording-callback', 'post', {
-    query: { t: recToken() },
-    body: { EventName, RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'ruuid-1', RecordingDuration: '95' },
-  });
-  assertPlainOk(await mpc('MPCRecordingInitiated'));
-  assert.equal(stored.length, 0, 'Initiated has no finished file yet');
+  plivoLog.setRecording = async (jci, payload, opts) => { stored.push({ jci, payload, opts }); };
+  const post = (body) => call('/recording-callback', 'post', { query: { t: recToken() }, body });
+
+  assertPlainOk(await post({ RecordUrl: 'https://rec.plivo.com/x.mp3', RecordingID: 'rid-1', RecordingDuration: '42' }));
+  assert.deepEqual(stored.pop().opts, { onlyIfEmpty: true }, 'the <Record> file must never clobber the room recording');
+
+  const mpc = (EventName) => post({ EventName, RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'ruuid-1', RecordingDuration: '95' });
+  for (const e of ['MPCRecordingInitiated', 'MPCRecordingPaused', 'MPCRecordingFailed']) assertPlainOk(await mpc(e));
+  assert.equal(stored.length, 0, 'only a COMPLETED room recording is a finished file');
   assertPlainOk(await mpc('MPCRecordingCompleted'));
-  assert.deepEqual(stored, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' } }]);
+  assert.deepEqual(stored, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' }, opts: undefined }],
+    'stored with overwrite — it replaces the ringback-laden <Record> file');
 });
 
 test('⚠ an invalid token acks 200 and stores NOTHING', async () => {
