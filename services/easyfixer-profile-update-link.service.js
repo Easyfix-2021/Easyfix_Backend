@@ -1174,4 +1174,8 @@ module.exports = {
   // magic-link form needed it first; both callers must resolve that CSV the
   // SAME way, and a second implementation is how they would drift apart.
   resolveServiceCategories,
+  // Exposed for the public feedback page's technician photo
+  // (routes/public/feedback.js) — the one prefix-agnostic efr_profile_img
+  // presigner; a second would be how the two avatars drifted apart.
+  presignProfileImage,
 };

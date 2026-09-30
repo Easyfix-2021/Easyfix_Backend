@@ -107,6 +107,22 @@ test('a RELATIVE FILE_BASE_URL is never used as a redirect base', async () => {
   delete process.env.FILE_BASE_URL;
 });
 
+test('a bare-filename VIDEO on the legacy host is served, not refused for its content-type', async () => {
+  // Job 545900 (2026-09-30): the legacy uploader stored `…_4.mp4` beside four
+  // .jpg rows. The host answered 200 video/mp4, but the probe accepted only
+  // image/* and PDF, so the "Play video" tile 404'd while the file was there.
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  stubFetch((url) => Promise.resolve(String(url).includes('/upload_jobs/')
+    ? { ok: true, status: 200, headers: new Map([['content-type', 'video/mp4']]) }
+    : { ok: false, status: 404, headers: new Map([['content-type', 'text/html']]) }));
+  const r = await delivery.resolve('545900_20260930132025_4.mp4');
+  assert.equal(r.kind, 'legacy');
+  assert.match(r.url, /\/upload_jobs\/545900_20260930132025_4\.mp4$/);
+
+  const stored = await delivery.resolve('https://core.easyfix.in/easydoc/upload_jobs/clip.mp4');
+  assert.equal(stored.kind, 'legacy', 'the stored-URL branch must accept video too');
+});
+
 test('an empty stored value resolves to nothing', async () => {
   const r = await delivery.resolve('   ');
   assert.equal(r.kind, 'none');
@@ -165,4 +181,24 @@ test('PROBING is strict: an unverifiable candidate is NOT accepted', async () =>
   const r = await delivery.resolve('530707_checkin_x.jpg');
   assert.equal(r.kind, 'none', 'an unreachable host must not yield a redirect to an unconfirmed URL');
   delete process.env.FILE_BASE_URL;
+});
+
+test('resolveLegacyFile returns the verified legacy-host URL for a job-keyed PDF, else null', async () => {
+  process.env.LEGACY_FILE_HOSTS = 'core.easyfix.in';
+  delete process.env.FILE_BASE_URL;
+  const seen = [];
+  stubFetch((url) => {
+    seen.push(String(url));
+    return Promise.resolve(String(url).endsWith('/feedback_jobs/feedback530707.pdf')
+      ? { ok: true, status: 200, headers: new Map([['content-type', 'application/pdf']]) }
+      : { ok: false, status: 404, headers: new Map([['content-type', 'text/html']]) });
+  });
+  assert.equal(
+    await delivery.resolveLegacyFile('feedback_jobs', 'feedback530707.pdf'),
+    'https://core.easyfix.in/easydoc/feedback_jobs/feedback530707.pdf',
+  );
+  assert.equal(await delivery.resolveLegacyFile('estimateapproval', 'Estimate_Approval_1.pdf'), null,
+    'an HTML 404 must never become a link');
+  assert.ok(seen.includes('https://core.easyfix.in/easydoc/estimateapproval/Estimate_Approval_1.pdf'),
+    'positive control: the null came from probing the right path, not from skipping it');
 });
