@@ -558,6 +558,10 @@ async function getVerificationPage(efrId) {
      * owner: there is no CRM verification step for it, so "filled" is all
      * there is to measure.
      *
+     * Personal details was dropped (Priyanka, 2026-09-30): it reads verified
+     * for all 2,636 active technicians, so it was a bar that could only ever
+     * be full — the same objection that retired the old breakdown.
+     *
      * Training is completed/assigned, not a count of global videos — a
      * technician owes what was assigned to him.
      */
@@ -582,13 +586,6 @@ async function getVerificationPage(efrId) {
           detail: Number(e.is_bank_details_verified_by_crm) === 1
             ? 'Verified by Finance'
             : bankFilled ? 'Filled — awaiting Finance' : 'Not provided',
-        },
-        {
-          key: 'personal',
-          label: 'Personal details',
-          percent: half(bool(e.is_personal_detail_filled), Number(e.is_personal_details_verified_by_crm) === 1),
-          detail: Number(e.is_personal_details_verified_by_crm) === 1
-            ? 'Verified' : bool(e.is_personal_detail_filled) ? 'Filled — not verified' : 'Not provided',
         },
         {
           key: 'identity',
