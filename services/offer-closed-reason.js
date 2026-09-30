@@ -24,6 +24,10 @@
  * a second, redundant encoding that could disagree with the status. NULL on an
  * EXPIRED row means "closed before this column existed", not "unknown cause":
  * every current writer sets it.
+ *
+ * ONE exception (2026-09-30): an ACCEPTED row can carry RELEASED_FOR_REOFFER —
+ * the technician answered, and the job was later taken off them by a CRM
+ * reassign. It does not disagree with the status; it records what came after.
  */
 const OFFER_CLOSED_REASON = Object.freeze({
   /* The 30-minute TTL actually elapsed. The ONLY reason that means the
