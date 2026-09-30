@@ -33,19 +33,27 @@
  *      single most damaging field to hand out.
  *   2. `?t=` accepts a signed feedback token bound to this jobId.
  *
- * WHY THE TOKEN IS NOT YET MANDATORY BY DEFAULT. Nothing in this codebase
- * builds the feedback URL — the link lives in an SMS/WhatsApp template outside
- * it. Flipping the requirement on before those templates carry `?t=` would
- * break the rating page for every customer, including everyone holding a link
- * already sent. So the gate ships OFF, the enumeration value is removed
- * immediately by (1), and FEEDBACK_TOKEN_REQUIRED=true is the one-flag cutover
- * once the templates are updated. Mint links with signFeedbackToken().
+ * WHY THE TOKEN IS NOT YET MANDATORY BY DEFAULT. Tokenised links exist but are
+ * not what customers hold yet. services/feedback-link.service.js mints them
+ * (mintFeedbackLink), and the TechVisitComplete SMS in
+ * notification-orchestrator appends one — but only while the property
+ * `job.feedback_link.enabled` is 'true', which waits on ops registering the
+ * URL-bearing body with DLT (unset on QA, 2026-09-30). Until then every link a
+ * customer has is a bare /feedback/<jobId> from the legacy sender, which signs
+ * with a different secret and cannot mint these. Requiring the token first
+ * would break the rating page for all of them, including links already sent.
+ * So the gate ships OFF, the enumeration value is removed immediately by (1),
+ * and FEEDBACK_TOKEN_REQUIRED=true is the cutover once tokenised links are the
+ * ones in circulation. The token also unlocks the technician photo
+ * (technicianPhoto below), so photos appear exactly when that happens.
  */
 
 const router = require('express').Router();
 const { pool } = require('../../db');
 const { modernOk, modernError } = require('../../utils/response');
 const { verifyFeedbackToken } = require('../../utils/jwt');
+const imageDelivery = require('../../services/job-image-delivery');
+const profileLink = require('../../services/easyfixer-profile-update-link.service');
 
 /*
  * Token gate for BOTH endpoints — read and submit. The submit matters as much
@@ -68,6 +76,7 @@ function feedbackGate(req, res, next) {
     if (Number(jobId) !== Number(req.params.jobId)) {
       return modernError(res, 401, 'this feedback link is no longer valid');
     }
+    req.feedbackTokenValid = true;   // unlocks the technician photo — see below
     return next();
   } catch (e) {
     // A PRESENT-but-bad token is always rejected, even when the gate is off.
@@ -76,6 +85,32 @@ function feedbackGate(req, res, next) {
   }
 }
 router.use('/:jobId', feedbackGate);
+
+/*
+ * The technician's photo, for a SIGNED link only (2026-09-30, owner's call).
+ *
+ * This endpoint is reachable by guessing an integer, which is why the customer
+ * mobile and surname were stripped (header note). A face photo per job id on a
+ * bare-id link would be a photo directory of the workforce for anyone counting
+ * — 3110 of 4682 active techs have one (QA, 2026-09-30). A valid ?t= token is
+ * job-bound and only the customer's own link carries it, so the photo rides
+ * with that; bare-id links keep the initials tile.
+ *
+ * Absolute URLs only, or null: an S3 object (presignProfileImage, which also
+ * maps a bare EFRDoc name to easyfixer_documents/), else the HEAD-verified
+ * legacy file host. The page used to prefix `/easydoc/upload_jobs/` on its own
+ * host — wrong directory, and a host that serves no /easydoc. The
+ * `dummy_profile` placeholder is not a photo; initials say more.
+ */
+async function technicianPhoto(stored) {
+  const v = String(stored || '').trim();
+  if (!v || /dummy_profile/i.test(v)) return null;
+  if (/^https?:\/\//i.test(v)) return null;          // never redirect a public page to an unvetted host
+  const s3 = await profileLink.presignProfileImage(v).catch(() => null);
+  if (s3) return s3;
+  if (v.includes('/')) return null;
+  return imageDelivery.resolveLegacyFile('easyfixer_documents', v);
+}
 
 // "Mr. Ravi Kumar" -> "Ravi". Mirrors the trimming the feedback page already
 // applied to the full name it used to receive.
@@ -105,9 +140,9 @@ router.get('/:jobId', async (req, res, next) => {
       return modernError(res, 400, 'invalid jobId');
     }
     // Project only columns verified to exist on prod (see
-    // docs/claude-reference/SCHEMA.md). efr_image / efr_photo were
-    // initially added but neither exists — kept the avatar as an
-    // initials tile on the FE, no photo URL is sent down.
+    // docs/claude-reference/SCHEMA.md). efr_image / efr_photo do not exist;
+    // the photo column is efr_profile_img (S3 key or legacy EFRDoc filename),
+    // sent only to a SIGNED link — see technicianPhoto().
     /*
      * customer_mob_no is GONE and must not come back: the page never read it,
      * and on an endpoint reachable by guessing an integer it was a phone book.
@@ -119,6 +154,7 @@ router.get('/:jobId', async (req, res, next) => {
               j.fk_service_catg_id,
               cu.customer_name,
               ef.efr_name AS easyfixer_name,
+              ef.efr_profile_img,
               sc.service_catg_name,
               cl.client_id, cl.client_name
          FROM tbl_job j
@@ -157,7 +193,7 @@ router.get('/:jobId', async (req, res, next) => {
       customer_name:    firstName(row.customer_name),
       easyfixer_id:     row.fk_easyfixter_id,
       easyfixer_name:   row.easyfixer_name,
-      easyfixer_image:  null, // no photo column on this DB; FE falls back to initials
+      easyfixer_image:  req.feedbackTokenValid ? await technicianPhoto(row.efr_profile_img) : null,
       service_category: row.service_catg_name,
       client_name:      row.client_name,
       already_rated:    alreadyRated,
