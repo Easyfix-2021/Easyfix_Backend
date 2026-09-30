@@ -3286,24 +3286,34 @@ async function list({
    */
   if (sourceType) { clauses.push('j.source_type = ?'); params.push(sourceType); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
-  // Vertical filter — tbl_vertical_mapping is many-to-many across
-  // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
-  // JOIN because it short-circuits on first match per row and avoids
-  // row multiplication when a client maps to multiple verticals.
-  if (verticalId != null) {
-    clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
-    params.push(verticalId);
-  }
-  // Project Manager — the PM is the user mapped to the job's client in
-  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
-  // shape above; the subquery is self-contained (references only vm + the
-  // outer j alias), so it introduces NO new outer alias and the COUNT-join
-  // detection below is unaffected.
+  /*
+   * Vertical + Project Manager — both reach the job through its CLIENT on
+   * tbl_vertical_mapping (many-to-many; the PM is the user_type = 1 row).
+   *
+   * RESOLVED TO A CLIENT IN-LIST FIRST, never a correlated EXISTS (2026-09-30).
+   * MySQL 8 rewrites that EXISTS into a semijoin driven FROM the mapping table,
+   * which under view=manage materialised EVERY matching job (205k for vertical
+   * 1) and ran ~30 correlated projection subqueries per row before the filesort
+   * cut it to 10: 22-45 s on Production, one pooled connection pinned the whole
+   * time. A literal IN-list walks the job PK backwards and stops at the page
+   * (84-309 ms), and keeps COUNT on the FK index. NO_SEMIJOIN fixed the page but
+   * turned COUNT into a 2 s full scan. tests/job-vertical-filter.test.js.
+   *
+   * `j.` only, so the COUNT-join detection below is unaffected. No mapped
+   * client → 1=0: empty, never unfiltered.
+   * ponytail: the smallest vertical (2.4k of 481k jobs) scans the PK ~1.4 s to
+   * fill a page; a deferred join (ids first, like the export) if that matters.
+   */
+  const clientsIn = async (where, bind) => {
+    const [rows] = await pool.query(`SELECT DISTINCT client_id FROM tbl_vertical_mapping WHERE ${where}`, bind);
+    const ids = rows.map((r) => r.client_id).filter((id) => id != null);
+    if (!ids.length) { clauses.push('1=0'); return; }
+    clauses.push(`j.fk_client_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  };
+  if (verticalId != null) await clientsIn('vertical_id = ?', [verticalId]);
   const pmIdList = toIdArray(projectManagerId);
-  if (pmIdList.length) {
-    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
-    params.push(...pmIdList);
-  }
+  if (pmIdList.length) await clientsIn(`user_type = 1 AND user_id IN (${pmIdList.map(() => '?').join(',')})`, pmIdList);
   // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
   // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
   // the needsCi detection below so the COUNT query also joins tbl_address +
