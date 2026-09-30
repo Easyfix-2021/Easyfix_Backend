@@ -556,42 +556,27 @@ function assertFinalActivationEligible(row = {}) {
 }
 
 /*
- * NO ACTIVATION OUT OF TRAINING_PENDING UNTIL MANDATORY TRAINING IS DONE.
+ * VERIFY FIRST, TRAIN BEFORE OFFERS (owner, 2026-09-30).
  *
- * Called from transition() — the only writer of lifecycle_status — whenever the
- * target is work-enabled and the STORED status is TRAINING_PENDING, so every
- * activation path (activateFromVerification, syncFromVerificationFlagsAtomic)
- * meets it; CRM/LEGACY/CRON cannot leave an onboarding state for work at all
- * (assertTransition). Keyed on the STORED column, not the read-time reconciled
- * status, which already reads a legacy-bit-flipped TRAINING_PENDING as ACTIVE.
+ * Replaces "no activation out of TRAINING_PENDING until mandatory training is
+ * done" (2026-09-28), and the same-day widening of it to every applicant. Once
+ * the profile is complete Ops may review and verify at any time; training
+ * stays pending and gates only job OFFERS. So CRM activation of a technician
+ * who still owes mandatory training VERIFIES him (the flags are written) but
+ * keeps him in TRAINING_PENDING — work-blocked, efr_status 0, no offers — and
+ * the app shows the training strip without "Under Review". Finishing training
+ * then moves him straight to work (finalizeTrainingCompletion). Nothing
+ * refuses.
  *
- * "Complete" is the app's own definition — fetchTrainingCompletedTime, what the
- * registration screen shows (every MANDATORY item done). Since 2026-09-28 the
- * same definition also decides entry into TRAINING_PENDING (Gate 1) and the
- * automatic exit (lms.settleTrainingCompletion); lms.isTrainingComplete (all
- * ASSIGNED courses) no longer decides either. It returns null on a failed lookup
- * or an empty mandatory set: fail closed.
- *
- * Scoped to APPLICANTS, never to working technicians: those were never routed
- * through it, and a blanket rule would reach every one of them (about 15% of
- * QA's active technicians have not finished the mandatory video). An applicant
- * is the stored TRAINING_PENDING — kept because a legacy-bit flip reads it back
- * as ACTIVE — OR any onboarding status the row resolves to. The second arm was
- * added 2026-09-30 (owner): an applicant with NO stored status whose saved
- * flags derive UNDER_VERIFICATION (QA efrId 10798) never entered
- * TRAINING_PENDING, so this rule never fired and CRM could activate him with
- * Introduction to Easyfix unwatched.
+ * "Done" is fetchTrainingCompletedTime — every MANDATORY item, the definition
+ * the app, Gate 1 and the automatic exit share. It fails closed (null on an
+ * empty set or a failed lookup), which here means "held", never "refused".
  */
-async function assertMandatoryTrainingComplete(efrId) {
+async function activationTarget(efrId, row) {
   // Lazy: mobile-registration.service requires this module at load time.
   const { fetchTrainingCompletedTime } = require('./mobile-registration.service');
-  if (await fetchTrainingCompletedTime(efrId)) return;
-  const error = httpError(
-    409,
-    'Mandatory training is not complete yet — the technician must finish it before activation.',
-  );
-  error.code = 'MANDATORY_TRAINING_INCOMPLETE';
-  throw error;
+  if (await fetchTrainingCompletedTime(efrId)) return operationalStatusForManager(row);
+  return 'TRAINING_PENDING';
 }
 
 function assertVerificationActivationSourceAllowed(row = {}) {
@@ -1488,12 +1473,6 @@ async function transition(efrId, input = {}, actor = null) {
           && input._willVerify !== true) {
         throw httpError(409, `${target} requires a verified technician`);
       }
-      if (WORK_ENABLED.has(target)
-          && (normalizeStatus(row.lifecycle_status) === 'TRAINING_PENDING'
-            || ONBOARDING_STATES.has(current.status))) {
-        await assertMandatoryTrainingComplete(id);
-      }
-
       if (typeof input._beforeUpdate === 'function') {
         await input._beforeUpdate(conn, row);
       }
@@ -1527,7 +1506,15 @@ async function transition(efrId, input = {}, actor = null) {
       // (including a failed/rejected second-pass outcome) is the exception: it
       // begins a new verification cycle and must remain ineligible for work
       // until a later final SYSTEM activation transaction.
-      const nextLegacyStatus = resetReapplicationVerification
+      /*
+       * VERIFIED BUT TRAINING PENDING (owner, 2026-09-30) is held off work:
+       * efr_status = 0. A verified row with efr_status = 1 is what a legacy
+       * activation looks like, and the read-time reconciliation would read it
+       * back as ACTIVE — offers and all — before training is done.
+       */
+      const heldForTraining = target === 'TRAINING_PENDING'
+        && (input._willVerify === true || asBool(row.is_technician_verified));
+      const nextLegacyStatus = resetReapplicationVerification || heldForTraining
         ? 0
         : legacyStatusForTransition(target, row.efr_status);
       const sets = [
@@ -1858,9 +1845,14 @@ async function finalizeTrainingCompletion(efrId) {
     reasonCode: 'TRAINING_COMPLETED',
     reason: 'All assigned training completed',
     metadata: { trainingCompletion: true },
-    _resolveStatus: (row, current) => (
-      current.status === 'TRAINING_PENDING' ? 'UNDER_VERIFICATION' : current.status
-    ),
+    // Verified while training was pending (see activationTarget) → straight to
+    // work; otherwise on to verification as before.
+    _resolveStatus: (row, current) => {
+      if (current.status !== 'TRAINING_PENDING') return current.status;
+      return asBool(row.is_technician_verified)
+        ? operationalStatusForManager(row)
+        : 'UNDER_VERIFICATION';
+    },
     _protectLifecycle: (current, target) => current.status === target,
   }, null);
   return { schemaInstalled: true, ...result };
@@ -1972,7 +1964,7 @@ async function activateFromVerification(efrId, body, actor = null) {
     source: 'SYSTEM',
     metadata: { verificationSync: true, finalActivation: true },
     _willVerify: true,
-    _resolveStatus: (row) => operationalStatusForManager(row),
+    _resolveStatus: (row) => activationTarget(efrId, row),
     _beforeUpdate: async (conn, row) => {
       assertVerificationActivationSourceAllowed(row);
       assertFinalActivationEligible(row);
