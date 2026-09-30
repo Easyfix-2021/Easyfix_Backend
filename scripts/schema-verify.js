@@ -39,7 +39,12 @@ const EXPECTED = {
     'additional_name', 'additional_number',
     'collected_by', 'eta_status', 'paid_by',
     'original_appointment_date_time', 'original_appointment_time',
-    'job_client_owner', 'helper_req', 'remarks',
+    // job_primary_spoc — the FROZEN revenue attribution, stamped once at
+    // create() and never re-resolved (distinct from job_client_owner beside
+    // it, which moves with an ownership transfer). Read by the QuickSight SPOC
+    // Revenue card, which credits the SPOC a job was BOOKED under rather than
+    // whoever the client maps to today.
+    'job_client_owner', 'job_primary_spoc', 'helper_req', 'remarks',
     'efr_special_notes', 'branch_details', 'last_update_time',
     /*
      * Added 2026-09-07 by verifyExpectedIsComplete(): every one of these is
