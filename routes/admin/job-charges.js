@@ -60,6 +60,16 @@ const incentiveBody = Joi.object({
   isClientApprovalNeeded: Joi.boolean().truthy(1).falsy(0).default(false),
   documentName: Joi.string().max(255).allow('', null).optional(),
 });
+// Material — legacy addAndUpdateMaterial's fields. No txCharge / clientCharge:
+// the service derives both as unit x unit price.
+const materialBody = Joi.object({
+  name: Joi.string().trim().max(100).required(),
+  description: Joi.string().max(255).allow('', null).optional(),
+  unit: Joi.number().integer().min(1).required(),
+  uom: Joi.string().max(45).allow('', null).optional(),
+  txUnit: Joi.number().integer().min(0).required(),
+  clientUnit: Joi.number().integer().min(0).required(),
+});
 // Edit is type-agnostic at the route; the service resolves the row's type and
 // enforces the per-type required-field set. Superset schema, all optional.
 const editBody = Joi.object({
@@ -71,6 +81,11 @@ const editBody = Joi.object({
   totalDistance: Joi.number().integer().min(0).optional(),
   txUnit: Joi.number().integer().min(0).optional(),
   clientUnit: Joi.number().integer().min(0).optional(),
+  // Material rows (the service recomputes both charges from these).
+  name: Joi.string().trim().max(100).optional(),
+  description: Joi.string().max(255).allow('', null).optional(),
+  unit: Joi.number().integer().min(1).optional(),
+  uom: Joi.string().max(45).allow('', null).optional(),
   isClientApprovalNeeded: Joi.boolean().truthy(1).falsy(0).optional(),
   documentName: Joi.string().max(255).allow('', null).optional(),
 }).min(1);
@@ -127,6 +142,14 @@ router.post('/:id/incentive', gate, validate(idParam, 'params'), validate(incent
   } catch (e) { return fail(res, e, next); }
 });
 
+router.post('/:id/material', gate, validate(idParam, 'params'), validate(materialBody), scopedJob, async (req, res, next) => {
+  try {
+    const out = await charges.createMaterial(req.params.id, req.body, req.user.user_id);
+    res.status(201);
+    return modernOk(res, out, 'material added');
+  } catch (e) { return fail(res, e, next); }
+});
+
 // ─── EDIT a charge (same fields as its type) ─────────────────────────
 router.patch('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), validate(editBody), scopedJob, async (req, res, next) => {
   try {
@@ -143,7 +166,7 @@ router.patch('/:id/charges/:chargeId/approval', gate, validate(chargeParams, 'pa
   } catch (e) { return fail(res, e, next); }
 });
 
-// ─── DELETE a charge (guarded to Penalty/Travel/Incentive only) ──────
+// ─── DELETE a charge (guarded to the CHARGE_TYPES rows) ──────
 router.delete('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), scopedJob, async (req, res, next) => {
   try {
     const out = await charges.deleteCharge(req.params.id, req.params.chargeId);
