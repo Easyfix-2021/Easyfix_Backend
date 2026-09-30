@@ -159,7 +159,7 @@ test('each manager name reads the source its own list filter compares against', 
   assert.match(svc, /ci\.state_user IN \(/, 'the list filter still keys on tbl_city.state_user');
 
   // PROJECT: the client's user_type = 1 mapping, picked by the ONE resolver.
-  assert.match(svc, /vm\.user_type = 1 AND vm\.user_id IN \(/, 'the list PM filter still keys on user_type = 1');
+  assert.match(svc, /`user_type = 1 AND user_id IN \(/, 'the list PM filter still keys on user_type = 1');
   assert.match(fn, /resolveClientPrimarySpoc\(/, 'the PM pick must be the shared one');
   assert.doesNotMatch(
     fn, /tbl_vertical_mapping/,

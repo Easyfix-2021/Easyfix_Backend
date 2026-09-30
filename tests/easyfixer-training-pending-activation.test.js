@@ -3,15 +3,14 @@ const { after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 /*
- * NO ACTIVATION OUT OF TRAINING_PENDING UNTIL MANDATORY TRAINING IS DONE.
+ * VERIFY FIRST, TRAIN BEFORE OFFERS (owner, 2026-09-30).
  *
- * The rule lives in transition() — the only writer of lifecycle_status — and is
- * keyed on the STORED status, so it is exercised here through the real
- * transaction with a fake connection. "Complete" is the app's definition,
- * mobile-registration.fetchTrainingCompletedTime, stubbed per test.
- *
- * Legacy technicians (never TRAINING_PENDING) have no mandatory-training rows at
- * all; they must activate exactly as before and never pay for the lookup.
+ * Replaced "no activation out of TRAINING_PENDING until mandatory training is
+ * done". CRM activation never refuses: a technician who still owes mandatory
+ * training is VERIFIED and held in TRAINING_PENDING (efr_status 0, no offers);
+ * finishing training then moves a verified technician straight to work.
+ * Exercised through the real transition() with a fake connection. "Complete"
+ * is mobile-registration.fetchTrainingCompletedTime, stubbed per test.
  */
 
 const { pool } = require('../db');
@@ -99,58 +98,47 @@ const lifecycleWrites = () => calls.filter((c) => (
 ));
 const activate = () => lifecycle.activateFromVerification(77, { final_accept_comment: 'ok' }, { user_id: 9 });
 
-test('TRAINING_PENDING with mandatory training incomplete is refused activation (409)', async () => {
-  trainingDone = null;
-  await assert.rejects(activate, (e) => (
-    e.status === 409
-    && e.code === 'MANDATORY_TRAINING_INCOMPLETE'
-    && /Mandatory training is not complete yet/.test(e.message)
-  ));
-  assert.equal(trainingLookups, 1);
-  assert.equal(lifecycleWrites().length, 0, 'no lifecycle write on refusal');
-  assert.equal(calls.some((c) => typeof c === 'object' && /is_technician_verified = 1/.test(c.sql)), false,
-    'the verification flags are not written either');
-  assert.ok(calls.includes('rollback'));
-  assert.equal(calls.includes('commit'), false);
-});
+/** The efr_status value the lifecycle write stamped, read by column position. */
+function efrStatusWritten() {
+  const [write] = lifecycleWrites();
+  const sql = write.sql;
+  const at = sql.indexOf('efr_status = ?');
+  assert.ok(at > 0, 'the lifecycle write must set efr_status');
+  return write.params[(sql.slice(0, at).match(/\?/g) || []).length];
+}
+const verifiedFlagWritten = () => calls.some((c) => typeof c === 'object' && /is_technician_verified = 1/.test(c.sql));
 
-test('TRAINING_PENDING with mandatory training complete activates', async () => {
-  trainingDone = '2026-09-25 12:00:00';
-  const result = await activate();
-  assert.equal(result.changed, true);
-  assert.equal(result.lifecycle.status, 'ACTIVE');
-  assert.equal(result.transitionedFrom, 'TRAINING_PENDING');
-  assert.equal(trainingLookups, 1);
-  assert.equal(lifecycleWrites().length, 1);
-  assert.ok(calls.includes('commit'));
-});
-
-test('a legacy-bit flip does not hide TRAINING_PENDING: the stored status decides', async () => {
-  // Verified + efr_status 1 reads back as ACTIVE, but the column still says
-  // TRAINING_PENDING and the training is not done.
-  row = baseRow({ is_technician_verified: 1, efr_status: 1 });
-  await assert.rejects(activate, { status: 409, code: 'MANDATORY_TRAINING_INCOMPLETE' });
-  assert.equal(lifecycleWrites().length, 0);
-});
-
-test('an applicant with no stored status or a stored UNDER_VERIFICATION is refused until training is done', async () => {
-  /*
-   * Owner, 2026-09-30 (QA efrId 10798): an applicant whose saved flags derive
-   * UNDER_VERIFICATION with NOTHING stored never entered TRAINING_PENDING, and
-   * the rule — keyed on the stored column alone — let CRM activate him with
-   * the mandatory video unwatched. Any onboarding status is an applicant now.
-   */
-  for (const status of ['UNDER_VERIFICATION', null]) {
-    row = baseRow({ lifecycle_status: status });
+test('activation with training outstanding VERIFIES and holds in TRAINING_PENDING — never refuses', async () => {
+  for (const status of ['TRAINING_PENDING', 'UNDER_VERIFICATION', null]) {
+    row = baseRow({ lifecycle_status: status, efr_status: 1 });
     calls = [];
     trainingDone = null;
-    await assert.rejects(activate, { status: 409, code: 'MANDATORY_TRAINING_INCOMPLETE' }, String(status));
-    assert.equal(lifecycleWrites().length, 0, String(status));
-    trainingDone = '2026-09-25 12:00:00';
+    const result = await activate();
+    assert.equal(result.lifecycle.status, 'TRAINING_PENDING', String(status));
+    assert.ok(verifiedFlagWritten(), `${status}: the verification is recorded`);
+    assert.equal(lifecycleWrites().length, 1, String(status));
+    assert.equal(efrStatusWritten(), 0, `${status}: held off work — efr_status 0, or it reads back ACTIVE`);
+    assert.ok(calls.includes('commit'), String(status));
+  }
+});
+
+test('activation with training done goes to work as before', async () => {
+  for (const status of ['TRAINING_PENDING', 'UNDER_VERIFICATION', null]) {
+    row = baseRow({ lifecycle_status: status });
     calls = [];
+    trainingDone = '2026-09-25 12:00:00';
     const result = await activate();
     assert.equal(result.lifecycle.status, 'ACTIVE', String(status));
+    assert.equal(efrStatusWritten(), 1, String(status));
   }
+});
+
+test('finishing training moves a VERIFIED technician straight to work', async () => {
+  row = baseRow({ lifecycle_status: 'TRAINING_PENDING', is_technician_verified: 1, efr_status: 0 });
+  const result = await lifecycle.finalizeTrainingCompletion(77);
+  assert.equal(result.lifecycle.status, 'ACTIVE');
+  assert.equal(result.transitionedFrom, 'TRAINING_PENDING');
+  assert.equal(efrStatusWritten(), 1);
 });
 
 test('working technicians are never asked for training: an operational move to ACTIVE skips the rule', async () => {

@@ -2783,6 +2783,51 @@ function toIdArray(v) {
 }
 
 /*
+ * Vertical / Project Manager → the CLIENT ids they map to on
+ * tbl_vertical_mapping, resolved by one small query BEFORE the job query is
+ * built. list() (the Manage Jobs grid) and buildDashboardFilters (the dashboard
+ * cards) both emit clientIdsClause() from these, so the card and the grid it
+ * opens are one population AND one SQL text — tests/dashboard-filter-bar.test.js
+ * compares them verbatim.
+ *
+ * Why not the correlated EXISTS they used to be (2026-09-30): MySQL 8 turns it
+ * into a semijoin driven FROM the mapping table, and under the Manage Jobs
+ * projection that materialised every matching job (205k for vertical 1) with
+ * ~30 subqueries each before paginating — 22-45 s on Production. See the note
+ * in list() and tests/job-vertical-filter.test.js. The dashboard's aggregates
+ * cost the same either way (measured); they switch for the shared text.
+ */
+async function mappingClientIds(where, bind) {
+  const [rows] = await pool.query(`SELECT DISTINCT client_id FROM tbl_vertical_mapping WHERE ${where}`, bind);
+  return rows.map((r) => r.client_id).filter((id) => id != null);
+}
+const verticalClientIds = (ids) => mappingClientIds(`vertical_id IN (${ids.map(() => '?').join(',')})`, ids);
+const pmClientIds = (ids) => mappingClientIds(`user_type = 1 AND user_id IN (${ids.map(() => '?').join(',')})`, ids);
+
+// No mapped client → 1=0: empty, never unfiltered.
+function clientIdsClause(ids, jobAlias = 'j') {
+  return ids.length
+    ? { sql: `${jobAlias}.fk_client_id IN (${ids.map(() => '?').join(',')})`, params: ids }
+    : { sql: '1=0', params: [] };
+}
+
+/*
+ * The async half of the dashboard filters: returns a copy of `filters` carrying
+ * the resolved client ids buildDashboardFilters needs. Every caller that hands
+ * buildDashboardFilters a verticalId / projectManagerId must pass it through
+ * here first; buildDashboardFilters throws rather than guess if one did not.
+ */
+async function resolveDashboardFilters(filters) {
+  if (!filters) return filters;
+  const out = { ...filters };
+  const pmIds = toIdArray(filters.projectManagerId);
+  if (pmIds.length) out.pmClientIds = await pmClientIds(pmIds);
+  const verticalIds = toIdArray(filters.verticalId);
+  if (verticalIds.length) out.verticalClientIds = await verticalClientIds(verticalIds);
+  return out;
+}
+
+/*
  * ── THE DASHBOARD FILTER BAR (2026-09-23) ─────────────────────────────────
  *
  * The four filters on /dashboard — Client, City, Project Manager, Zonal
@@ -2835,13 +2880,10 @@ function buildDashboardFilters(filters, { jobAlias = 'j', addressAlias = 'ad', c
    */
   const pmIds = toIdArray(filters.projectManagerId);
   if (pmIds.length) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm`
-      + ` WHERE vm.client_id = ${jobAlias}.fk_client_id`
-      + ` AND vm.user_type = 1`
-      + ` AND vm.user_id IN (${pmIds.map(() => '?').join(',')}))`
-    );
-    params.push(...pmIds);
+    if (!Array.isArray(filters.pmClientIds)) throw new Error('buildDashboardFilters: projectManagerId not resolved — pass filters through resolveDashboardFilters()');
+    const c = clientIdsClause(filters.pmClientIds, jobAlias);
+    clauses.push(c.sql);
+    params.push(...c.params);
   }
 
   /*
@@ -2856,12 +2898,10 @@ function buildDashboardFilters(filters, { jobAlias = 'j', addressAlias = 'ad', c
    */
   const verticalIds = toIdArray(filters.verticalId);
   if (verticalIds.length) {
-    clauses.push(
-      `EXISTS (SELECT 1 FROM tbl_vertical_mapping vm`
-      + ` WHERE vm.client_id = ${jobAlias}.fk_client_id`
-      + ` AND vm.vertical_id IN (${verticalIds.map(() => '?').join(',')}))`
-    );
-    params.push(...verticalIds);
+    if (!Array.isArray(filters.verticalClientIds)) throw new Error('buildDashboardFilters: verticalId not resolved — pass filters through resolveDashboardFilters()');
+    const c = clientIdsClause(filters.verticalClientIds, jobAlias);
+    clauses.push(c.sql);
+    params.push(...c.params);
   }
 
   /*
@@ -3388,30 +3428,34 @@ async function list({
    */
   if (sourceType) { clauses.push('j.source_type = ?'); params.push(sourceType); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
-  // Vertical filter — tbl_vertical_mapping is many-to-many across
-  // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
-  // JOIN because it short-circuits on first match per row and avoids
-  // row multiplication when a client maps to multiple verticals.
+  /*
+   * Vertical + Project Manager — both reach the job through its CLIENT on
+   * tbl_vertical_mapping (many-to-many; the PM is the user_type = 1 row).
+   *
+   * RESOLVED TO A CLIENT IN-LIST FIRST, never a correlated EXISTS (2026-09-30).
+   * MySQL 8 rewrites that EXISTS into a semijoin driven FROM the mapping table,
+   * which under view=manage materialised EVERY matching job (205k for vertical
+   * 1) and ran ~30 correlated projection subqueries per row before the filesort
+   * cut it to 10: 22-45 s on Production, one pooled connection pinned the whole
+   * time. A literal IN-list walks the job PK backwards and stops at the page
+   * (84-309 ms), and keeps COUNT on the FK index. NO_SEMIJOIN fixed the page but
+   * turned COUNT into a 2 s full scan. tests/job-vertical-filter.test.js.
+   *
+   * `j.` only, so the COUNT-join detection below is unaffected. No mapped
+   * client → 1=0: empty, never unfiltered.
+   * ponytail: the smallest vertical (2.4k of 481k jobs) scans the PK ~1.4 s to
+   * fill a page; a deferred join (ids first, like the export) if that matters.
+   */
+  const pushClients = (ids) => { const c = clientIdsClause(ids); clauses.push(c.sql); params.push(...c.params); };
   /*
    * `verticalId` widened to a CSV on 2026-09-23 (was a lone id) so the dashboard
    * bar's Verticals multi-select can send what its three siblings already send.
    * toIdArray keeps a single id valid, so every pre-existing caller is unchanged.
    */
   const verticalIdList = toIdArray(verticalId);
-  if (verticalIdList.length) {
-    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id IN (${verticalIdList.map(() => '?').join(',')}))`);
-    params.push(...verticalIdList);
-  }
-  // Project Manager — the PM is the user mapped to the job's client in
-  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
-  // shape above; the subquery is self-contained (references only vm + the
-  // outer j alias), so it introduces NO new outer alias and the COUNT-join
-  // detection below is unaffected.
+  if (verticalIdList.length) pushClients(await verticalClientIds(verticalIdList));
   const pmIdList = toIdArray(projectManagerId);
-  if (pmIdList.length) {
-    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
-    params.push(...pmIdList);
-  }
+  if (pmIdList.length) pushClients(await pmClientIds(pmIdList));
   // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
   // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
   // the needsCi detection below so the COUNT query also joins tbl_address +
@@ -4570,7 +4614,7 @@ async function getStatusCounts({ ownerId, easyfixerId, scope, allowedStages, fil
    * way it is. Pushed BEFORE the stage clause so clauses and params keep the
    * same sequence; both arrays are concatenated in push order below.
    */
-  const dash = buildDashboardFilters(filters, { jobAlias: 'j', addressAlias: 'ad', cityAlias: 'ct' });
+  const dash = buildDashboardFilters(await resolveDashboardFilters(filters), { jobAlias: 'j', addressAlias: 'ad', cityAlias: 'ct' });
   clauses.push(...dash.clauses);
   params.push(...dash.params);
 
@@ -4765,7 +4809,8 @@ function jobScopeFragment({ scope, allowedStages, hasVerticalCol = false, filter
  * (Admin/Finance) see the full count; scoped users see only their
  * hierarchy-unioned slice.
  */
-async function getAttentionSummary({ scope, allowedStages, filters } = {}) {
+async function getAttentionSummary({ scope, allowedStages, filters: rawFilters } = {}) {
+  const filters = await resolveDashboardFilters(rawFilters);
   const hasVerticalCol = await hasClientVerticalIdColumn();
   // OFFER MODEL: when tbl_job_offer exists, "pending tech accept" keys off an
   // OPEN offer EXISTS rather than the fk (a pool-offered job keeps fk NULL).

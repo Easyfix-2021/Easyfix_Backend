@@ -778,8 +778,39 @@ async function saveWorkArea(efrId, body, database = pool) {
   };
 }
 
+/*
+ * PROFILE 100% ONCE THE THREE CARDS ARE DONE (owner, 2026-09-30).
+ *
+ * tbl_easyfixer.efr_profile_perc had no writer on this stack — it is the
+ * legacy app's column — so a technician who completed Skills, Identity and
+ * Work Area in the new app sat at NULL, and the CRM's final-activation rule
+ * (assertFinalActivationEligible: efr_profile_perc >= 100) and its "Pending
+ * Member Verification" queue both treated him as incomplete. Set here, on the
+ * one path every profile-card save and the explicit finalize share, from the
+ * same predicate the app's checklist reads. Never lowers a stored value.
+ */
+async function markProfileComplete(efrId) {
+  const p = profileCompletion.sqlPredicates({ technicianAlias: 'e', userAlias: 'u' });
+  const [res] = await pool.query(
+    `UPDATE tbl_easyfixer e
+       LEFT JOIN tbl_user u ON u.user_id = e.user_id
+        SET e.efr_profile_perc = 100
+      WHERE e.efr_id = ?
+        AND COALESCE(e.efr_profile_perc, 0) < 100
+        AND ${p.profileComplete}`,
+    [Number(efrId)],
+  );
+  if (res.affectedRows) logger.info('Profile marked 100% · efrId=' + efrId);
+  return res.affectedRows > 0;
+}
+
 async function finalizeGate1(efrId) {
   logger.info('Finalize registration Gate 1 · efrId=' + efrId);
+  // Before the lifecycle step, and best-effort: a failed stamp must never
+  // fail a save that already committed (see finalizeGate1AfterSave).
+  try { await markProfileComplete(efrId); } catch (e) {
+    logger.warn({ efrId, err: e.message }, 'Profile 100% stamp failed');
+  }
   const result = await lifecycleService.finalizeMobileRegistrationGate1(efrId);
   if (!result.schemaInstalled) {
     // Before the additive migration the legacy derived gate remains the source
@@ -903,6 +934,7 @@ module.exports = {
   saveWorkArea,
   finalizeGate1,
   finalizeGate1IfReady,
+  markProfileComplete,
   finalizeGate1AfterSave,
   setLanguage,
   /*
