@@ -184,3 +184,30 @@ test('Gate 1: mandatory training outstanding → TRAINING_PENDING, even with no 
     lms.isTrainingComplete = saved.complete;
   }
 });
+
+/*
+ * The mandatory-course INSERT must run BEFORE transition() takes the
+ * technician's row lock (QA 2026-09-30, efrId 10798). easyfixer_courses has a
+ * foreign key to tbl_easyfixer, and the INSERT runs on the pool, not on the
+ * locking connection — inside the lock it waited on that very row until
+ * innodb_lock_wait_timeout (50 s), and every identity save that finalized
+ * Gate 1 reported failure to the app.
+ */
+test('Gate 1: mandatory courses are assigned before the row lock, never inside it', async () => {
+  const lms = require('../services/lms.service');
+  const saved = lms.assignMandatoryCourses;
+  const order = [];
+  lms.assignMandatoryCourses = async () => {
+    order.push(calls.some((c) => c === 'begin') ? 'assign-inside-lock' : 'assign-before-lock');
+    return { assigned: 1 };
+  };
+  try {
+    row = baseRow({ lifecycle_status: 'REGISTRATION_INCOMPLETE' });
+    calls = [];
+    await lifecycle.finalizeMobileRegistrationGate1(77);
+    assert.deepEqual(order, ['assign-before-lock']);
+    assert.ok(calls.includes('begin'), 'positive control: the transition did open its transaction');
+  } finally {
+    lms.assignMandatoryCourses = saved;
+  }
+});
