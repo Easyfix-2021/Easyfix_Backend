@@ -31,6 +31,14 @@ const LEGACY_HOSTS = () => (process.env.LEGACY_FILE_HOSTS || 'core.easyfix.in')
   .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
 
 /*
+ * What a tbl_job_image row may legitimately hold. video/ added 2026-09-30:
+ * the legacy uploader stores customer .mp4 clips in the same table and the
+ * same upload_jobs dir (job 545900), and an image-only allowlist refused a
+ * file the host was serving with 200. The HTML error page is still refused.
+ */
+const isMediaType = (ctype) => ctype.startsWith('image/') || ctype.startsWith('video/') || ctype.startsWith('application/pdf');
+
+/*
  * Is there really an image at this legacy URL?
  *
  * A redirect that cannot fail is not a resolution. When the file is absent the
@@ -51,7 +59,7 @@ async function legacyUrlHasImage(url) {
       signal: AbortSignal.timeout(Number(process.env.LEGACY_FILE_HEAD_TIMEOUT_MS || 2500)),
     });
     const ctype = String(head.headers.get('content-type') || '').toLowerCase();
-    if (!head.ok || (ctype && !ctype.startsWith('image/') && !ctype.startsWith('application/pdf'))) {
+    if (!head.ok || (ctype && !isMediaType(ctype))) {
       return { usable: false, why: `status ${head.status}, content-type ${ctype || 'none'}` };
     }
     return { usable: true, why: 'ok' };
@@ -79,7 +87,7 @@ async function probeHasFile(url) {
     });
     if (!head.ok) return false;
     const ctype = String(head.headers.get('content-type') || '').toLowerCase();
-    return ctype.startsWith('image/') || ctype.startsWith('application/pdf');
+    return isMediaType(ctype);
   } catch {
     return false;
   }
@@ -210,4 +218,22 @@ async function resolve(storedRaw, { logger } = {}) {
   return { kind: 'none', reason: 'not in S3, no local file, no absolute FILE_BASE_URL' };
 }
 
-module.exports = { resolve, legacyUrlHasImage, probeHasFile, legacyDirsFor,  };
+/*
+ * A job-keyed legacy DOCUMENT at a known directory + name — the Jobsheet
+ * (feedback_jobs/feedback<jobId>.pdf) and the Estimate
+ * (estimateapproval/Estimate_Approval_<jobId>.pdf). No DB row names these;
+ * only the legacy Java system writes them, to the legacy file host. The portal
+ * used to join a RELATIVE /easydoc path onto its own host, which serves none of
+ * it (2026-09-30). Returns an https URL confirmed by probeHasFile, or null.
+ */
+async function resolveLegacyFile(dir, name) {
+  const base = String(process.env.FILE_BASE_URL || '/easydoc').replace(/^https?:\/\/[^/]+/i, '').replace(/^\/+|\/+$/g, '') || 'easydoc';
+  for (const host of LEGACY_HOSTS()) {
+    const url = `https://${host}/${base}/${dir}/${encodeURIComponent(name)}`;
+    // eslint-disable-next-line no-await-in-loop
+    if (await probeHasFile(url)) return url;
+  }
+  return null;
+}
+
+module.exports = { resolve, resolveLegacyFile, legacyUrlHasImage, probeHasFile, legacyDirsFor,  };

@@ -447,15 +447,22 @@ const jwt = require('jsonwebtoken');
 function mintEstimateToken(jobId, clientContactId = null) {
   return jwt.sign({ sub: String(jobId), clientContactId }, process.env.JWT_SECRET);
 }
-async function callPublic(routePath, method, { token, body = {} } = {}) {
+async function callPublic(routePath, method, { token, body = {}, fetchImpl } = {}) {
   const r = mockRes();
-  await handlerFor(publicEstimateRouter, routePath, method)(
+  // GET /:token HEAD-probes the legacy file host for the estimate PDF
+  // (pdf_url, 2026-09-30). Answer 404 locally — a test must not reach
+  // core.easyfix.in, nor wait on its timeout when offline.
+  const realFetch = global.fetch;
+  global.fetch = fetchImpl || (async () => ({ ok: false, status: 404, headers: new Map() }));
+  try {
+    await handlerFor(publicEstimateRouter, routePath, method)(
     {
       params: { token: token || mintEstimateToken(jobFixture.job_id, 42) },
       body: routePath.includes('/approve') ? { ...APPROVE_BODY_DEFAULTS, ...body } : body,
     },
     r, (e) => { throw e; },
-  );
+    );
+  } finally { global.fetch = realFetch; }
   return r;
 }
 
@@ -464,6 +471,18 @@ test('public GET /:token: a 15 job reports status "pending" (client-actionable)'
   const r = await callPublic('/:token', 'get');
   assert.equal(r.statusCode ?? 200, 200);
   assert.equal(r.body?.data?.status ?? r.body?.status, 'pending');
+});
+
+test('public GET /:token: pdf_url is the verified legacy-host estimate PDF', async () => {
+  jobFixture = makeJob({ job_status: 15 });
+  const id = jobFixture.job_id;
+  const r = await callPublic('/:token', 'get', {
+    fetchImpl: async (url) => (String(url).endsWith(`/estimateapproval/Estimate_Approval_${id}.pdf`)
+      ? { ok: true, status: 200, headers: new Map([['content-type', 'application/pdf']]) }
+      : { ok: false, status: 404, headers: new Map() }),
+  });
+  const data = r.body?.data ?? r.body;
+  assert.equal(data.pdf_url, `https://core.easyfix.in/easydoc/estimateapproval/Estimate_Approval_${id}.pdf`);
 });
 
 test('public GET /:token: a 16 job reports a non-actionable status, NOT "pending"', async () => {
