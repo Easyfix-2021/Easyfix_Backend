@@ -359,6 +359,21 @@ router.put('/:id',
 // Feeds the "Transaction List" modal on the Easyfixer detail page.
 // RBAC: easyfixer row must be in caller's city scope (404 otherwise — see
 // /:id rationale above for why we return 404 not 403).
+// Jobs completed by this technician, split by category and by vertical. One
+// call returns both breakdowns AND every row (retired categories included,
+// flagged), so the card's Category/Vertical toggle and its "show retired"
+// reveal never need a second request.
+router.get('/:id/job-category-summary',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      logger.info('Job category summary · id=' + req.params.id);
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await easyfixer.jobCategorySummary(req.params.id);
+      modernOk(res, data);
+    } catch (e) { next(e); }
+  });
+
 router.get('/:id/transactions',
   validate(idParam, 'params'),
   validate(listSubresourceQuery, 'query'),

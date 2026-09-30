@@ -1087,6 +1087,92 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
 // `serviceable_pincodes_csv` comes from tbl_efr_serviceable_pincodes which
 // stores the CSV directly in a `pincodes` TEXT column (one row per efr) —
 // no GROUP_CONCAT needed; a simple LEFT JOIN suffices.
+/*
+ * Jobs completed by ONE technician, split by service category and by vertical.
+ *
+ * WHICH JOBS COUNT. Completed (job_status 3/5) AND carrying a
+ * tbl_job_transaction row. That second condition is what lets the card be read
+ * next to the earnings tile: total_earnings is SUM(efr_charge) over exactly
+ * this join (see the total_earnings sort subquery above), so the bars and the
+ * money describe the same set of jobs rather than two nearly-equal sets.
+ * It costs almost nothing — 233 of 338,926 completed jobs have no transaction
+ * row (0.07%) — and tbl_job_transaction.fk_job_id is UNIQUE, so the EXISTS is
+ * one index probe per job.
+ *
+ * CATEGORY comes off the job itself and is frozen at closure — one category
+ * per job, never changed afterwards. `fk_service_catg_id = 0` is the
+ * pre-2021 sentinel from before categories existed: every job completed from
+ * 2021 onward has a real one, and the 59,309 that do not are all historical.
+ * Those rows come back with category_id 0 and a null name.
+ *
+ * VERTICAL is NOT on the job — it is read live from the job's client
+ * (tbl_client.vertical_id), so it reflects where that client sits TODAY.
+ * Move a client between verticals and its whole job history moves with it.
+ * That is the agreed behaviour (Priyanka, 2026-09-30), not an oversight: a
+ * frozen-at-closure vertical would need its own column on tbl_job.
+ *
+ * EVERY row is returned, active category or not, with is_active alongside.
+ * The caller shows active categories and offers the rest behind a toggle;
+ * filtering here instead would mean a second round-trip to reveal them, and
+ * would silently drop jobs the technician was paid for — 2,212 completed jobs
+ * sit in the 16 retired categories.
+ */
+async function jobCategorySummary(efrId) {
+  const id = Number(efrId);
+  logger.info('Job category summary · efrId=' + id);
+  if (!Number.isInteger(id) || id <= 0) return { total_completed: 0, by_category: [], by_vertical: [] };
+
+  const COUNTED = `j.fk_easyfixter_id = ?
+       AND j.job_status IN (3, 5)
+       AND EXISTS (SELECT 1 FROM tbl_job_transaction t WHERE t.fk_job_id = j.job_id)`;
+
+  const [byCategory, byVertical] = await Promise.all([
+    pool.query(
+      `SELECT j.fk_service_catg_id        AS category_id,
+              sc.service_catg_name        AS category_name,
+              COALESCE(sc.service_catg_status, 0) AS is_active,
+              COUNT(*)                    AS jobs
+         FROM tbl_job j
+         LEFT JOIN tbl_service_catg sc ON sc.service_catg_id = j.fk_service_catg_id
+        WHERE ${COUNTED}
+        GROUP BY j.fk_service_catg_id, sc.service_catg_name, sc.service_catg_status
+        ORDER BY jobs DESC`,
+      [id],
+    ).then(([rows]) => rows),
+    pool.query(
+      `SELECT cl.vertical_id, v.vertical_name, COUNT(*) AS jobs
+         FROM tbl_job j
+         LEFT JOIN tbl_client   cl ON cl.client_id  = j.fk_client_id
+         LEFT JOIN tbl_vertical v  ON v.vertical_id = cl.vertical_id
+        WHERE ${COUNTED}
+        GROUP BY cl.vertical_id, v.vertical_name
+        ORDER BY jobs DESC`,
+      [id],
+    ).then(([rows]) => rows),
+  ]);
+
+  // The total is the SUM of the rows, never a third query: a separately
+  // counted total is a number that can disagree with the bars under it.
+  const total = byCategory.reduce((n, r) => n + Number(r.jobs || 0), 0);
+  logger.info('Job category summary · efrId=' + id + ' · total=' + total
+    + ' categories=' + byCategory.length + ' verticals=' + byVertical.length);
+
+  return {
+    total_completed: total,
+    by_category: byCategory.map((r) => ({
+      category_id: Number(r.category_id) || null,
+      category_name: r.category_name || null,
+      is_active: Number(r.is_active) === 1,
+      jobs: Number(r.jobs) || 0,
+    })),
+    by_vertical: byVertical.map((r) => ({
+      vertical_id: r.vertical_id != null ? Number(r.vertical_id) : null,
+      vertical_name: r.vertical_name || null,
+      jobs: Number(r.jobs) || 0,
+    })),
+  };
+}
+
 async function aggregates(efrIds, { scope } = {}) {
   logger.info('Compute easyfixer aggregates · requested=' + (Array.isArray(efrIds) ? efrIds.length : 0));
   if (!Array.isArray(efrIds) || efrIds.length === 0) return { rows: [] };
@@ -1915,6 +2001,7 @@ module.exports = {
   listTransactions,
   listMappedClients,
   aggregates,
+  jobCategorySummary,
   attendance,
   statusCounts,
   MUTABLE_COLUMNS,
