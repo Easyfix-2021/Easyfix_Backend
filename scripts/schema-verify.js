@@ -119,6 +119,15 @@ const EXPECTED = {
     // The escalation author's NAME, as text (escalation writers leave
     // commented_by NULL) — listComments' legacy "Remark By" falls back to it.
     'job_escalated_by',
+    /*
+     * The technician app's reschedule / cancel ask stores its requested time
+     * here (services/mobile-job-lifecycle.js recordRequestComment INSERTs it
+     * unconditionally), and listComments selects it so those rows are not
+     * rendered dateless. Unlike job_stage — which is column-probed at runtime
+     * and therefore needs no entry here — this one is named by a live query
+     * with no guard, which is exactly what this list is for.
+     */
+    'requested_date_time',
   ],
   /*
    * tbl_job_logs — the job-history archive (1.7M rows, written since 2015).

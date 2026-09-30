@@ -30,7 +30,8 @@ const fake = installFakePool(
   [
     [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
     [/SHOW COLUMNS/i, []],
-    [/SELECT job_id, fk_easyfixter_id, time_slot.* FROM tbl_job/, () => (scenario.existing ? [scenario.existing] : [])],
+    // Tolerant of added columns (job_status joined this SELECT 2026-09-30).
+    [/SELECT job_id,.*fk_easyfixter_id, time_slot.* FROM tbl_job/, () => (scenario.existing ? [scenario.existing] : [])],
   ],
   { stopOn: /UPDATE tbl_job\b/ }, // \b excludes UPDATE tbl_job_offer
 );
