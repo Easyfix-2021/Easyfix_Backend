@@ -29,7 +29,9 @@
  *   - cancelled jobs spread across all four days-open bands;
  *   - a cancelled job with no reason picked and one with no usable comment;
  *   - a city with two different states on its rows, so the modal state wins;
- *   - a client with no internal SPOC, so the pickers have an Unattributed row.
+ *   - a client with no internal SPOC, so the pickers have an Unattributed row;
+ *   - open jobs at tier 10, at tier 2 and with NO tier at all, in three
+ *     different days-open bands, so the tier matrix has an order to get wrong.
  *
  * Runner: TZ=UTC node --test --experimental-test-isolation=none tests/quicksight-mtd-report.test.js
  */
@@ -182,7 +184,15 @@ function rawJob(o) {
     job_status: o.status,
     fk_client_id: o.client === undefined ? 10 : o.client,
     fk_checkout_by: null,
-    ticket_created_date_time: o.ticket ? `${o.ticket} 09:00:00` : null,
+    /*
+     * `ticketTime` defaults to 09:00 — every row that does not name one is the
+     * row it always was. It is overridable because Aging counts whole 24-HOUR
+     * periods from the ticket INSTANT, so a row raised late in the day ages one
+     * day slower than the calendar says: that is the only way to tell the
+     * export's Aging column apart from a day-subtraction, and the tier matrix
+     * has a test that does exactly that.
+     */
+    ticket_created_date_time: o.ticket ? `${o.ticket} ${o.ticketTime === undefined ? '09:00:00' : o.ticketTime}` : null,
     checkout_date_time: o.checkout ? `${o.checkout} 17:30:00` : null,
     cancel_date_time: o.cancel ? `${o.cancel} 11:15:00` : null,
     cancel_comment: o.comment === undefined ? null : o.comment,
@@ -202,9 +212,29 @@ function rawJob(o) {
     total_charge: o.charge ?? null,
     easyfix_charge: null,
     fk_service_catg_id: 15,
-    tier: 2,
-    checkin_date_time: null,
-    original_appointment_date_time: null,
+    /*
+     * The CITY's tier. Defaults to 2 — the value every row carried before this
+     * was overridable — so the Pre-Defined TAT above (category 15 at tier 2 is
+     * 5 days) and every TAT assertion in this file are untouched. `null` is a
+     * city with no tier at all, which the export writes as '' and the tier
+     * matrix must count as "(Tier not given)" rather than drop.
+     */
+    tier: o.tier === undefined ? 2 : o.tier,
+    /*
+     * The three columns the Escalated tile, SDA % and the check-in basis are
+     * made of. All three default to "this job never had one", so every row the
+     * fixture does not mention stays exactly the row it was before they
+     * existed: no check-in (the check-in basis falls back to checkout), no
+     * appointment (SDA Status stays blank), not escalated.
+     *
+     * SDA Status is deliberately NOT seeded. The export derives it from these
+     * two dates — checkin <= original appointment — so the tests below pin the
+     * sheet's own arithmetic rather than a 1 or a 0 this file chose.
+     */
+    checkin_date_time: o.checkin ? `${o.checkin} 10:15:00` : null,
+    original_appointment_date_time: o.appt ? `${o.appt} 00:00:00` : null,
+    original_appointment_time: o.appt ? '09:30:00' : null,
+    is_escalated: o.escalated ? 1 : 0,
   };
 }
 
@@ -229,43 +259,83 @@ const staff = (name, role = 13) => ({ user_name: name, user_type_id: 5, user_rol
 function seedWorld() {
   seedJobs([
     /* ── completed (closed set): checkout inside the window ──────────────── */
+    /*
+     * The four closed rows also carry the whole of SDA % and the whole of the
+     * check-in basis between them, one job per case, so neither figure can be
+     * right by accident:
+     *
+     *   id   checkin   appt    SDA     check-in day vs closure day
+     *   101  3 Sep     4 Sep   1 met   3 Sep, one day BEFORE its 4 Sep closure
+     *   102  7 Sep     5 Sep   0 miss  7 Sep, one day before its 8 Sep closure
+     *   103  31 Aug    28 Aug  0 miss  31 Aug — OUTSIDE the window entirely
+     *   104  (none)    (none)  blank   no check-in at all: falls back to 6 Sep
+     *
+     * One met, two missed and one blank means a numerator counting `=== 0`,
+     * or counting "has a status at all", or counting every closure, each
+     * produces a different number from the right one.
+     */
     // created 2 Sep, closed 4 Sep → 2 days open → band 0-2 / 0-3, in TAT.
-    { id: 101, status: 3, client: 10, ticket: '2026-09-02', checkout: '2026-09-04' },
+    // Escalated, and completed: the Escalated tile is not a closures-only count.
+    { id: 101, status: 3, client: 10, ticket: '2026-09-02', checkout: '2026-09-04', checkin: '2026-09-03', appt: '2026-09-04', escalated: true },
     // created 1 Sep, closed 8 Sep → 7 days → band 6-9 both ways, OUT of TAT
     // (pre-defined TAT is 5). This is the row that keeps TAT % off 100.
-    { id: 102, status: 5, client: 10, ticket: '2026-09-01', checkout: '2026-09-08' },
+    // Reached two days after the promised date, so SDA was missed.
+    { id: 102, status: 5, client: 10, ticket: '2026-09-01', checkout: '2026-09-08', checkin: '2026-09-07', appt: '2026-09-05' },
     // created BEFORE the window, closed inside it → completed but NOT created:
     // the reason ordersCreated and completed are not two views of one set.
-    { id: 103, status: 3, client: 20, ticket: '2026-08-20', checkout: '2026-09-05', city: 'Mumbai', state: 'Maharashtra' },
+    // Its CHECK-IN is in August too, so it is the row that proves the check-in
+    // basis is a different set of days from the closure basis.
+    { id: 103, status: 3, client: 20, ticket: '2026-08-20', checkout: '2026-09-05', checkin: '2026-08-31', appt: '2026-08-28', city: 'Mumbai', state: 'Maharashtra' },
     // a second Pune row carrying a DIFFERENT state, so the city table has to
-    // pick the modal one rather than whichever row it met first.
+    // pick the modal one rather than whichever row it met first. No check-in
+    // and no appointment: SDA Status is blank and the check-in basis falls
+    // back to this row's closure day, as the template's doneAt() does.
     { id: 104, status: 3, client: 20, ticket: '2026-09-03', checkout: '2026-09-06', state: 'Karnataka' },
-    // closed OUTSIDE the window — in no set at all.
-    { id: 105, status: 3, client: 10, ticket: '2026-07-01', checkout: '2026-08-15' },
+    // closed OUTSIDE the window — in no set at all. Escalated, so that a count
+    // that forgot to respect the window would read one too many.
+    { id: 105, status: 3, client: 10, ticket: '2026-07-01', checkout: '2026-08-15', escalated: true },
 
     /* ── cancelled: cancel date inside the window, one per days-open band ── */
     // 0 days → band 0-2 / 0-3.
     { id: 201, status: 6, client: 10, ticket: '2026-09-05', cancel: '2026-09-05', reason: 'Customer not reachable', comment: 'cx not responding since 2 days' },
     // 4 days → band 3-5 / 4-5.
     { id: 202, status: 6, client: 10, ticket: '2026-09-06', cancel: '2026-09-10', reason: 'Duplicate', comment: 'duplicate job, new job id created' },
-    // 8 days → band 6-9 both ways.
-    { id: 203, status: 6, client: 20, ticket: '2026-09-02', cancel: '2026-09-10', reason: 'Customer not reachable', comment: 'na' },
+    // 8 days → band 6-9 both ways. Escalated — a CANCELLED job counts on the
+    // Escalated tile too, which is half of what makes it "of jobs in hand".
+    { id: 203, status: 6, client: 20, ticket: '2026-09-02', cancel: '2026-09-10', reason: 'Customer not reachable', comment: 'na', escalated: true },
     // 12 days → band 9+ / 10-15. No reason picked at all.
     { id: 204, status: 6, client: 30, ticket: '2026-09-01', cancel: '2026-09-13', reason: null, comment: 'customer self installed the product' },
     // cancelled OUTSIDE the window.
     { id: 205, status: 6, client: 10, ticket: '2026-08-01', cancel: '2026-08-20' },
 
     /* ── open: the live backlog, no lower date bound ──────────────────────── */
+    /*
+     * The three open rows also carry the whole of the tier matrix between them.
+     * Their tiers are 10, 2 and NONE, and their ageings land in three different
+     * bands, so the section cannot be right by accident:
+     *
+     *   id   tier   aging   band     what it is there for
+     *   301  10       7     6–9      "Tier - 10" must sort AFTER "Tier - 2"
+     *   302   2     104     30+      the other real tier, in the far band
+     *   401  none     2     0–3      "(Tier not given)" is a ROW, and sorts last
+     *
+     * A lexical sort puts "Tier - 10" first and a dropped blank loses 401, so
+     * either mistake changes this list rather than hiding in it.
+     */
     // raised inside the window and still open.
-    { id: 301, status: 1, client: 10, ticket: '2026-09-15' },
+    { id: 301, status: 1, client: 10, ticket: '2026-09-15', tier: 10 },
     // raised BEFORE the window and still open — part of September's backlog.
-    { id: 302, status: 9, client: 20, ticket: '2026-06-10', city: 'Mumbai', state: 'Maharashtra' },
+    // Escalated, and STILL OPEN: the case the tile exists for, and the one a
+    // closures-only reading of the template would silently lose.
+    { id: 302, status: 9, client: 20, ticket: '2026-06-10', city: 'Mumbai', state: 'Maharashtra', escalated: true, tier: 2 },
     // raised AFTER the window's end: open now, but not open "as at 22 Sep".
-    { id: 303, status: 2, client: 10, ticket: '2026-09-25' },
+    // Escalated, so the tile has to apply the backlog's own date rule too.
+    { id: 303, status: 2, client: 10, ticket: '2026-09-25', escalated: true },
 
     // raised in the window and unconfirmed — open AND created, which is the
     // ordinary case and the one the two tiles are most often confused over.
-    { id: 401, status: 9, client: 30, ticket: '2026-09-20' },
+    // Its city has NO tier: the tier matrix's "(Tier not given)" row.
+    { id: 401, status: 9, client: 30, ticket: '2026-09-20', tier: null },
 
     /* ── created only ─────────────────────────────────────────────────────── */
     // An ENQUIRY (status 7): terminal, so it is in no bucket at all, yet its
@@ -375,6 +445,129 @@ test('KPI · TAT % divides by COMPLETED jobs, not by everything in hand', async 
     'a cancelled or open job has no turnaround to have met');
 });
 
+test('KPI · Escalated counts EVERY set in hand — completed, cancelled and open alike', async () => {
+  seedWorld();
+  const out = await build();
+
+  /*
+   * The template counts this one outside its `s === "C"` branch:
+   *     if (C.esc[i] === 1) esc++;
+   *     if (s === "C"){ ... } else if (s === "X") x++; else o++;
+   * so an escalation on a cancelled or a still-open job counts exactly as
+   * loudly as one on a closure. 101 is completed, 203 cancelled, 302 open.
+   */
+  assert.deepEqual(out.escalatedBySet, { completed: 1, cancelled: 1, open: 1 });
+  assert.equal(out.kpis.escalated, 3);
+  assert.notEqual(out.kpis.escalated, out.escalatedBySet.completed,
+    'counting escalations over closures only is the mistake this test exists to catch');
+
+  // "N% of jobs in hand" — the divisor is completed + cancelled + open, NOT
+  // completed, and not orders created.
+  assert.deepEqual(out.kpis.escalatedPct, { num: 3, den: EXPECT.inHand, pct: 27.3 });
+  assert.equal(out.kpis.escalatedPct.den, out.kpis.inHand);
+
+  // 105 is escalated but closed in August, and 303 is escalated but was raised
+  // after `to`. Neither is in hand for this window, so neither is counted.
+  assert.equal(out.kpis.escalated, 3, '105 and 303 are escalated but outside the window');
+});
+
+test('KPI · SDA % divides by COMPLETED jobs, and a blank status is not a pass', async () => {
+  seedWorld();
+  const out = await build();
+
+  /*
+   * The export derives SDA Status from check-in vs original appointment:
+   *   101 in on 3 Sep for a 4 Sep appointment  → 1, met
+   *   102 in on 7 Sep for a 5 Sep appointment  → 0, missed
+   *   103 in on 31 Aug for a 28 Aug appointment → 0, missed
+   *   104 never checked in, no appointment      → blank
+   */
+  assert.deepEqual(out.kpis.sdaPct, { num: 1, den: EXPECT.completed, pct: 25 });
+
+  // The same shape as TAT — the template computes both inside `s === "C"` and
+  // divides both by the same `c`.
+  assert.equal(out.kpis.sdaPct.den, out.kpis.completed);
+  assert.equal(out.kpis.sdaPct.den, out.kpis.tatPct.den);
+
+  /*
+   * 104 has NO SDA Status. It does not inflate the NUMERATOR — a blank is not
+   * a pass — and it is not quietly dropped from the DENOMINATOR either, which
+   * is the template's rule and the honest one: excluding unmeasured jobs would
+   * push the percentage UP every time the data got worse.
+   */
+  assert.notEqual(out.kpis.sdaPct.num, 2, 'a blank SDA Status must not count as met');
+  assert.equal(out.kpis.sdaPct.den, EXPECT.completed,
+    'the blank-status job stays in the divisor, exactly as it does for TAT');
+  assert.notEqual(out.kpis.sdaPct.num, out.kpis.completed);
+});
+
+test('KPI · Completed on the CHECK-IN basis counts the day the technician arrived', async () => {
+  seedWorld();
+  const out = await build();
+
+  /*
+   * v2 moved completed jobs onto App CheckIn Date (prep.py, 27 Sep). The
+   * closure basis is untouched and still the tile; this is the second figure
+   * beside it.
+   *   101 in 3 Sep  (closed 4 Sep)  → counted, on a DIFFERENT day
+   *   102 in 7 Sep  (closed 8 Sep)  → counted, on a different day
+   *   103 in 31 Aug (closed 5 Sep)  → before the window: not counted
+   *   104 never checked in          → falls back to its 6 Sep closure
+   */
+  assert.equal(out.kpis.completed, EXPECT.completed, 'the live closure-basis tile has NOT moved');
+  assert.equal(out.completedOnCheckin.count, 3);
+  assert.equal(out.completedOnCheckin.beforeWindow, 1, '103 checked in in August');
+  assert.equal(out.completedOnCheckin.afterWindow, 0);
+  assert.equal(out.completedOnCheckin.unknownDate, 0);
+  assert.equal(out.completedOnCheckin.noCheckinDate, 1, '104 falls back to its closure day');
+  assert.notEqual(out.completedOnCheckin.count, out.kpis.completed,
+    'the two bases must actually differ here, or this test proves nothing');
+
+  // Every completed job we hold is on exactly one side of the window.
+  const c = out.completedOnCheckin;
+  assert.equal(c.count + c.beforeWindow + c.afterWindow + c.unknownDate, out.kpis.completed);
+
+  // The day-wise bars carry the same re-bucketing, day by day: 101 moves off
+  // the 4th onto the 3rd, 102 off the 8th onto the 7th, 103 leaves entirely,
+  // 104 stays on the 6th because it has no check-in to move to.
+  const day = (d) => out.daily.buckets.find((b) => b.from === d);
+  assert.equal(day('2026-09-03').completed, 0);
+  assert.equal(day('2026-09-03').completedCheckin, 1);
+  assert.equal(day('2026-09-04').completed, 1);
+  assert.equal(day('2026-09-04').completedCheckin, 0);
+  assert.equal(day('2026-09-05').completed, 1);
+  assert.equal(day('2026-09-05').completedCheckin, 0, '103 checked in before the window');
+  assert.equal(day('2026-09-06').completed, 1);
+  assert.equal(day('2026-09-06').completedCheckin, 1, '104 has no check-in and does not move');
+  assert.equal(day('2026-09-08').completed, 1);
+  assert.equal(day('2026-09-07').completedCheckin, 1);
+
+  assert.equal(out.daily.totals.completed, EXPECT.completed);
+  assert.equal(out.daily.totals.completedCheckin, out.completedOnCheckin.count);
+});
+
+test('KPI · the check-in basis says so when the window ends in the past', async () => {
+  seedWorld();
+
+  /*
+   * A job can only be missing from the check-in basis if it checked in inside
+   * the window and was audited AFTER it — and since check-out never precedes
+   * check-in, and never lands in the future, that is impossible while the
+   * window runs up to today. Month-to-date is therefore exact...
+   */
+  const mtd = await build();
+  assert.equal(mtd.completedOnCheckin.complete, true, 'the window ends today');
+
+  // ...and a closed historical month is not, because a job checked in on
+  // 31 August and audited in September was never read by an August window.
+  const august = await build({ from: '2026-08-01', to: '2026-08-31' });
+  assert.equal(august.completedOnCheckin.complete, false);
+  // 105 closed on 15 Aug with no check-in, so it falls back and is counted.
+  assert.equal(august.kpis.completed, 1);
+  assert.equal(august.completedOnCheckin.count, 1);
+  assert.equal(august.completedOnCheckin.noCheckinDate, 1);
+});
+
 test('KPI · a zero denominator is null, never 0%', async () => {
   // A window before every job in the fixture — including before the oldest
   // still-open one, which is the only way the open backlog is empty too.
@@ -385,6 +578,12 @@ test('KPI · a zero denominator is null, never 0%', async () => {
   assert.equal(out.kpis.completionPct.pct, null);
   assert.equal(out.kpis.tatPct.pct, null);
   assert.equal(out.kpis.cancelledPct.pct, null);
+  // The two new percentages divide by the same empty sets, so they answer the
+  // same way rather than claiming a confident 0%.
+  assert.equal(out.kpis.sdaPct.pct, null);
+  assert.equal(out.kpis.escalatedPct.pct, null);
+  assert.equal(out.kpis.escalated, 0);
+  assert.equal(out.completedOnCheckin.count, 0);
 });
 
 /* ══ section 1 — tickets created vs completed ═══════════════════════════════ */
@@ -671,6 +870,129 @@ test('section 10 · six days-open bands, DIFFERENT from section 3\'s four, each 
   assert.equal(at('open', '0-3'), 1, '401, raised 20 Sep, 2 days ago');
 });
 
+/* ══ section 10b — open orders by tier and days open ════════════════════════ */
+
+/*
+ * Seeded ON TOP of seedWorld() so the shared fixture's counts stay exactly what
+ * every other test asserts, and the tier matrix still gets a table worth
+ * checking. Every row below exists to break one specific wrong implementation:
+ *
+ *   id   set        tier   aging  band    what it catches
+ *   310  open         2      2    0–3     a tier spread over more than one band
+ *   311  open         2      7    6–9     ditto — "Tier - 2" totals 3, not 1
+ *   312  open        10      3    0–3     raised at 15:00, so AGING (3) and a
+ *                                         day-subtraction (4) disagree: the one
+ *                                         row that tells the two apart
+ *   313  open      none    113    30+     the blank row is a real row with a
+ *                                         real spread, not a single stray job
+ *   314  open         3     10    10–15   a third tier, between 2 and 10
+ *                                         numerically but not lexically
+ *   120  completed    7      1    —       tier 7 exists ONLY on jobs that must
+ *   210  cancelled    7      8    —       NOT appear: any leak shows up as a
+ *                                         "Tier - 7" row that should not exist
+ */
+function seedTierExtras() {
+  seedJobs([
+    { id: 310, status: 1, client: 10, ticket: '2026-09-20', tier: 2 },
+    { id: 311, status: 9, client: 10, ticket: '2026-09-15', tier: 2 },
+    { id: 312, status: 1, client: 20, ticket: '2026-09-18', ticketTime: '15:00:00', tier: 10 },
+    { id: 313, status: 9, client: 20, ticket: '2026-06-01', tier: null },
+    { id: 314, status: 1, client: 30, ticket: '2026-09-12', tier: 3 },
+    { id: 120, status: 3, client: 10, ticket: '2026-09-10', checkout: '2026-09-11', tier: 7 },
+    { id: 210, status: 6, client: 10, ticket: '2026-09-02', cancel: '2026-09-10', tier: 7, reason: 'Duplicate', comment: 'duplicate' },
+  ]);
+}
+
+// The whole matrix, written out once: the four tests below all lean on it.
+const TIER_MATRIX = [
+  { tier: 'Tier - 2', blank: false, counts: [1, 0, 1, 0, 0, 1], total: 3 },
+  { tier: 'Tier - 3', blank: false, counts: [0, 0, 0, 1, 0, 0], total: 1 },
+  { tier: 'Tier - 10', blank: false, counts: [1, 0, 1, 0, 0, 0], total: 2 },
+  { tier: '(Tier not given)', blank: true, counts: [1, 0, 0, 0, 0, 1], total: 2 },
+];
+
+test('section 10b · the tier matrix counts OPEN jobs only, and its grand total IS the Open tile', async () => {
+  seedWorld();
+  seedTierExtras();
+  const out = await build();
+
+  // The section's whole claim: "same open jobs as the tiles at the top".
+  assert.equal(out.tierAging.grand, out.kpis.open, 'grand total is the Open tile');
+  assert.equal(out.tierAging.grand, 8, '301, 302, 401 + 310..314 — and nothing else');
+  assert.equal(out.tierAging.columnTotals.reduce((a, n) => a + n, 0), out.kpis.open);
+  assert.equal(out.tierAging.rows.reduce((a, r) => a + r.total, 0), out.kpis.open);
+
+  // 120 and 210 are the only jobs in the fixture at tier 7, and they are
+  // completed and cancelled. A matrix that counted either would grow a row.
+  assert.equal(out.tierAging.rows.find((r) => r.tier === 'Tier - 7'), undefined,
+    'completed and cancelled jobs are NOT in this matrix');
+  assert.ok(out.kpis.completed > 0 && out.kpis.cancelled > 0, 'and there really were some to leak');
+
+  assert.deepEqual(out.tierAging.rows, TIER_MATRIX);
+  assert.deepEqual(out.tierAging.columnTotals, [3, 0, 2, 1, 0, 2]);
+});
+
+test('section 10b · a job with no tier is a ROW, never a dropped job, and that row is always last', async () => {
+  seedWorld();
+  seedTierExtras();
+  const out = await build();
+
+  const blanks = out.tierAging.rows.filter((r) => r.blank);
+  assert.equal(blanks.length, 1, 'exactly one blank-tier row');
+  assert.equal(blanks[0].tier, report.BLANK_TIER);
+  assert.equal(blanks[0].total, 2, '401 and 313 — both kept, both counted');
+  assert.equal(out.tierAging.rows[out.tierAging.rows.length - 1].blank, true, 'and it sorts LAST');
+  assert.ok(out.tierAging.rows.slice(0, -1).every((r) => r.blank === false));
+
+  // Dropping them would take the grand total below the Open tile, which is
+  // exactly the silent breakage the flag and the check exist to prevent.
+  assert.equal(out.tierAging.grand - blanks[0].total, 6);
+  assert.equal(out.tierAging.grand, out.kpis.open);
+});
+
+test('section 10b · tiers sort NATURAL-NUMERIC, so "Tier - 2" comes before "Tier - 10"', async () => {
+  seedWorld();
+  seedTierExtras();
+  const out = await build();
+
+  // Sorted in the SERVICE, in the template's order, so the screen and the
+  // .docx cannot disagree and the UI never has to re-sort.
+  assert.deepEqual(out.tierAging.rows.map((r) => r.tier),
+    ['Tier - 2', 'Tier - 3', 'Tier - 10', '(Tier not given)']);
+  // A plain lexical sort produces this instead — the mistake under test.
+  assert.notDeepEqual(out.tierAging.rows.map((r) => r.tier),
+    ['Tier - 10', 'Tier - 2', 'Tier - 3', '(Tier not given)']);
+});
+
+test('section 10b · the bands are section 10\'s six, split on the export\'s Aging column', async () => {
+  seedWorld();
+  seedTierExtras();
+  const out = await build();
+
+  // The same six bands as the status × aging matrix — one set of boundaries on
+  // the screen, not two that can drift apart.
+  assert.deepEqual(out.tierAging.buckets, out.statusAging.buckets);
+  assert.deepEqual(out.tierAging.buckets.map((b) => b.key), ['0-3', '4-5', '6-9', '10-15', '16-30', '30+']);
+  assert.deepEqual(out.tierAging.buckets.map((b) => b.short), ['0–3', '4–5', '6–9', '10–15', '16–30', '>30']);
+
+  /*
+   * 312 was raised at 15:00 on 18 Sep and `now` is 10:00 on 22 Sep: that is
+   * 3 whole 24-hour periods, so Aging is 3 and the job is in 0–3. Subtracting
+   * the two DAYS instead gives 4, which would move it to 4–5 — and that band
+   * is empty here precisely so the mistake has nowhere to hide.
+   */
+  const at = (tier, key) => out.tierAging.rows.find((r) => r.tier === tier)
+    .counts[out.tierAging.buckets.findIndex((b) => b.key === key)];
+  assert.equal(at('Tier - 10', '0-3'), 1, '312 — Aging 3, not a 4-day subtraction');
+  assert.equal(at('Tier - 10', '4-5'), 0, 'where a day-subtraction would have put it');
+  assert.equal(out.tierAging.columnTotals[1], 0, 'the 4–5 band is empty across every tier');
+
+  // And the same value the section 10 matrix used, for the same jobs.
+  const openRow = out.statusAging.rows.find((r) => r.status === 'open');
+  assert.deepEqual(out.tierAging.columnTotals, openRow.counts,
+    'both matrices split the SAME open jobs on the SAME days-open value');
+});
+
 /* ══ section 11 — the job list ══════════════════════════════════════════════ */
 
 test('section 11 · the list behind a cell is exactly that cell, and the default is every open job', async () => {
@@ -794,13 +1116,41 @@ test('EVERY section that splits a total adds back to it, and the service says so
   assert.equal(out.cities.reduce((a, c) => a + c.created, 0), k.ordersCreated);
   assert.equal(out.cities.reduce((a, c) => a + c.completed, 0), k.completed);
   assert.equal(out.statusAging.grand, k.inHand);
+  // The tier matrix splits the OPEN set and only it, so it reconciles against
+  // kpis.open rather than against jobs in hand.
+  assert.equal(out.tierAging.grand, k.open);
+  assert.equal(out.tierAging.columnTotals.reduce((a, n) => a + n, 0), k.open);
+  assert.equal(out.tierAging.rows.reduce((a, r) => a + r.total, 0), k.open);
+  out.tierAging.columnTotals.forEach((n, b) => {
+    assert.equal(out.tierAging.rows.reduce((a, r) => a + r.counts[b], 0), n);
+  });
   assert.equal(out.jobCount === undefined ? out.jobs.length : out.jobCount, k.inHand);
+
+  // Escalated splits across the three sets it is counted over...
+  const e = out.escalatedBySet;
+  assert.equal(e.completed + e.cancelled + e.open, k.escalated);
+  assert.ok(e.completed <= k.completed && e.cancelled <= k.cancelled && e.open <= k.open);
+  // ...and the check-in basis splits the completed total four ways.
+  const c = out.completedOnCheckin;
+  assert.equal(c.count + c.beforeWindow + c.afterWindow + c.unknownDate, k.completed);
+  assert.equal(out.daily.totals.completedCheckin, c.count);
+  // SDA cannot have met more jobs than there were closures to meet.
+  assert.ok(k.sdaPct.num <= k.completed);
+  assert.equal(k.sdaPct.den, k.completed);
 
   // Positive control: every one of those totals is carrying real work, so the
   // identities above are not passing because both sides happen to be zero.
   assert.ok(k.ordersCreated > 0 && k.completed > 0 && k.cancelled > 0 && k.open > 0);
   assert.ok(out.whyCancelled.reasons.length > 1 && out.whyCancelled.themes.length > 1);
   assert.ok(out.cities.length > 1);
+  // The tier matrix is carrying two real tiers and a blank one, so its
+  // identities above are not passing over a single row.
+  assert.ok(out.tierAging.rows.length > 2 && out.tierAging.rows.some((r) => r.blank));
+  // ...and so are the three new ones: each is carried by more than one set,
+  // and the two completed bases genuinely disagree.
+  assert.ok(e.completed > 0 && e.cancelled > 0 && e.open > 0);
+  assert.ok(k.sdaPct.num > 0 && k.sdaPct.num < k.completed);
+  assert.ok(c.count > 0 && c.count !== k.completed);
 });
 
 /* ══ the route ══════════════════════════════════════════════════════════════ */
@@ -816,7 +1166,7 @@ test('the endpoints answer the report and the job list, gated by the view key, n
   assert.equal(body.success, true);
   // Every block the tab needs is on one response.
   for (const key of ['kpis', 'daily', 'completionVsCancellation', 'byDaysOpen',
-    'whyCancelled', 'cities', 'statusAging', 'filters', 'reconciled']) {
+    'whyCancelled', 'cities', 'statusAging', 'tierAging', 'filters', 'reconciled']) {
     assert.ok(body.data[key] !== undefined, `the report carries ${key}`);
   }
   assert.equal(body.data.jobs, undefined, 'the job list is its own endpoint');

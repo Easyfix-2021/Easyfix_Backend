@@ -45,6 +45,20 @@
  *     date: moving `from` does not change it. That is what makes "jobs in
  *     hand" mean jobs in hand.
  *
+ *  4. ESCALATED IS COUNTED OVER ALL THREE SETS, NOT OVER CLOSURES. Completed,
+ *     cancelled and open alike — the template's `if (C.esc[i] === 1) esc++;`
+ *     sits outside its `s === "C"` branch and the tile reads "% of jobs in
+ *     hand". TAT % and SDA % are the ones that divide by completed. Reading
+ *     escalations over closures only would hide every open job somebody is
+ *     currently shouting about, which is most of them.
+ *
+ *  5. COMPLETED HAS TWO DATE BASES AND ONLY ONE OF THEM IS THE TILE. `completed`
+ *     counts closures on the AUDIT & CHECKOUT day, which is what this report
+ *     has always shipped. `completedOnCheckin` counts the same jobs on the APP
+ *     CHECK-IN day, which is what the owner's v2 moved to. They are offered
+ *     side by side deliberately — see the long note where the second is built,
+ *     including the one window shape where it can read short and says so.
+ *
  * ─── THE FOUR SETS ─────────────────────────────────────────────────────────
  *
  * Read through employee-performance/sources.service.js — the same four
@@ -106,6 +120,10 @@ const UNATTRIBUTED = sources.UNATTRIBUTED;
 // The template's own label for a dimension value the job does not carry.
 const BLANK = '(Blank)';
 const BLANK_CITY = '(City not given)';
+// template.html:1771 — `const BLANK_TIER = "(Tier not given)"`. A job whose city
+// carries no tier is a ROW of the tier matrix, never a dropped job: dropping it
+// would break the one claim that section makes (grand === kpis.open).
+const BLANK_TIER = '(Tier not given)';
 const NO_REASON_PICKED = '(No reason picked)';
 
 /*
@@ -201,6 +219,35 @@ const pct = (num, den) => ({
 });
 
 const sum = (list) => list.reduce((a, b) => a + b, 0);
+
+/*
+ * THE SECOND DATE A COMPLETED JOB CAN BE COUNTED ON.
+ *
+ * v2 of the owner's dashboard moved completed jobs off the closure date and
+ * onto the day the technician checked in. prep.py:
+ *     "checkin": ("App CheckIn Date", "date"),
+ *         # Priyanka, 27 Sep: completed jobs are counted on this date
+ * and template.html turns that into the basis for EVERY closed row, not just
+ * the report's:
+ *     function doneAt(i){
+ *       if (C.checkin && C.checkin[i] != null) return C.checkin[i];
+ *       return C.checkout[i];
+ *     }
+ *     const m = SHEET[i] === "C" ? doneAt(i) : ... ;   // DAY[i], which passes() filters on
+ *
+ * This helper is that `doneAt`, exactly: the check-in day when the row has
+ * one, and the closure day when it does not, per row rather than per column.
+ *
+ * WHY IT IS NOT SIMPLY SWAPPED IN FOR `completed` — see the long note at
+ * `completedOnCheckin` in the build. Short version: that number is already
+ * live on QA on the closure basis, and in the template this date does not
+ * merely re-bucket the closed rows, it changes which of them are in the month
+ * at all. So the second basis ships beside the first, never over it.
+ */
+const checkinDayOf = (row) => {
+  const d = dayIndex(row.checkinDate);
+  return d === null ? dayIndex(row.date) : d;
+};
 
 function getOrSet(map, key, make) {
   let v = map.get(key);
@@ -344,6 +391,10 @@ function buildDaily({ from, to, created, completed, cancelled, open, now }) {
 
   const createdPer = new Array(count).fill(0);
   const completedPer = new Array(count).fill(0);
+  // The same closures placed on their App CheckIn day instead — see
+  // checkinDayOf and `completedOnCheckin`. A separate array, never a
+  // replacement: the two bars are meant to be read against each other.
+  const completedCheckinPer = new Array(count).fill(0);
   const slotOf = (d) => Math.floor((startOf(d) - first) / step);
 
   for (const row of created) {
@@ -353,8 +404,11 @@ function buildDaily({ from, to, created, completed, cancelled, open, now }) {
   }
   for (const row of completed) {
     const d = dayIndex(row.date);
-    if (d === null || d < lo || d > hi) continue;
-    completedPer[slotOf(d)] += 1;
+    if (d !== null && d >= lo && d <= hi) completedPer[slotOf(d)] += 1;
+    // A closure whose check-in fell BEFORE the range has no bucket to go in.
+    // It is not dropped silently: `completedOnCheckin.beforeWindow` counts it.
+    const cd = checkinDayOf(row);
+    if (cd !== null && cd >= lo && cd <= hi) completedCheckinPer[slotOf(cd)] += 1;
   }
 
   /*
@@ -411,6 +465,7 @@ function buildDaily({ from, to, created, completed, cancelled, open, now }) {
       to: ymdOf(b),
       created: createdPer[k],
       completed: completedPer[k],
+      completedCheckin: completedCheckinPer[k],
       open: hasOpen ? backlog[b - lo] : null,
       partial: b === asOfDay && dayStillFilling,
     });
@@ -459,6 +514,7 @@ function buildDaily({ from, to, created, completed, cancelled, open, now }) {
     totals: {
       created: sum(buckets.map((b) => b.created)),
       completed: sum(buckets.map((b) => b.completed)),
+      completedCheckin: sum(buckets.map((b) => b.completedCheckin)),
     },
     openFrom: openFrom === null ? null : ymdOf(openFrom),
     forecast,
@@ -646,6 +702,57 @@ function buildStatusAging({ completed, cancelled, open }) {
   };
 }
 
+/**
+ * Open orders by tier and days open — template.html:1770-1800, tierAgingStats()
+ * and renderTierAging().
+ *
+ * OPEN JOBS ONLY. The template's loop is `if (SHEET[i] !== "O" || !passes(i))
+ * continue;`, and its subtitle says so out loud: "same open jobs as the tiles at
+ * the top". The grand total of this matrix IS kpis.open, which is why the
+ * `tierAging` reconciliation check asserts exactly that — a completed or
+ * cancelled job leaking in turns the banner red rather than quietly inflating a
+ * table nobody cross-foots.
+ *
+ * The bands are SA_BUCKETS — the same six the status × aging matrix uses, split
+ * on the same `daysOpenOf(row)`, which is the export's own Aging column. Both
+ * are reused rather than re-declared: two copies of six boundaries is two
+ * chances for a row to land in a different band in two tables on one screen.
+ *
+ * Rows are sorted HERE, in the template's order — every real tier by natural
+ * numeric collation ("Tier - 2" before "Tier - 10", not after), then the
+ * blank-tier row last — so the screen and the .docx cannot drift apart and the
+ * UI never re-sorts. `blank` is on the row for the UI to pin that row with:
+ * matching the LABEL from the UI would couple it to wording the owner can
+ * change in an afternoon.
+ */
+function buildTierAging({ open }) {
+  const nb = SA_BUCKETS.length;
+  const rows = new Map();
+
+  for (const row of open) {
+    // '' / null / undefined all mean "this job's city has no tier" — one row,
+    // not a dropped job and not three different labels.
+    const tier = row.tier === null || row.tier === undefined || row.tier === '' ? BLANK_TIER : row.tier;
+    const counts = getOrSet(rows, tier, () => new Array(nb).fill(0));
+    counts[bucketIndex(SA_BUCKETS, daysOpenOf(row))] += 1;
+  }
+
+  const list = [...rows.entries()]
+    .map(([tier, counts]) => ({ tier, blank: tier === BLANK_TIER, counts, total: sum(counts) }))
+    // ((a.blank) - (b.blank)) is the template's `(a[0] === BLANK) - (b[0] === BLANK)`:
+    // false sorts before true, so the blank row falls to the end whatever it is called.
+    .sort((a, b) => (a.blank - b.blank)
+      || a.tier.localeCompare(b.tier, 'en', { numeric: true }));
+
+  const columnTotals = SA_BUCKETS.map((_, b) => sum(list.map((r) => r.counts[b])));
+  return {
+    buckets: SA_BUCKETS.map((b) => ({ key: b.key, label: b.label, short: b.short })),
+    rows: list,
+    columnTotals,
+    grand: sum(columnTotals),
+  };
+}
+
 /* ═══ 6. The build ══════════════════════════════════════════════════════════ */
 
 /**
@@ -726,7 +833,7 @@ async function buildMtdReport({
   // buildDaily clips each job to the range itself.
   const openForBacklog = keep(openAll);
 
-  /* ── the six KPI tiles ─────────────────────────────────────────────────── */
+  /* ── the KPI tiles ─────────────────────────────────────────────────────── */
 
   const ordersCreated = created.length;
   const nCompleted = completed.length;
@@ -737,6 +844,64 @@ async function buildMtdReport({
   // denominator is COMPLETED jobs — a cancelled or open job has no turnaround
   // to have met.
   const inTat = completed.reduce((a, row) => a + (Number(row.tat) === 1 ? 1 : 0), 0);
+  /*
+   * SDA % — "Same Day Arrival", the share of closures the technician reached
+   * on or before the day that was promised. The SAME SHAPE as TAT above, and
+   * that is the template's doing rather than a convenience of ours:
+   *
+   *     if (s === "C"){ c++; if (C.tat[i] === 1) t++; if (C.sda[i] === 1) sd++; }
+   *     setPct("sda", sd, c, "completed in SDA");
+   *         // Priyanka, 25 Sep: same rule as TAT, from the SDA Status column
+   *
+   * Both the numerator and the counter it divides by sit INSIDE the
+   * `s === "C"` branch, so the divisor is completed jobs — not jobs in hand.
+   *
+   * A completed job whose SDA Status is BLANK stays in the DENOMINATOR. That
+   * is not an oversight waiting to be tidied away: mapExportRow leaves the
+   * cell null when the job never reached the field, or when either date it
+   * needs is missing (job-export.service.js — `sdaEligible`, then
+   * `if (checkinDay && apptDay)`), and `null === 1` is false in the template
+   * exactly as `Number(null) === 1` is false here. Dropping those rows from
+   * the divisor instead would quietly RAISE the percentage every time the
+   * data got worse, which is the opposite of what the tile is for.
+   */
+  const inSda = completed.reduce((a, row) => a + (Number(row.sda) === 1 ? 1 : 0), 0);
+  /*
+   * ESCALATED — and the one place the brief for this work was wrong, so it is
+   * written down here rather than left to be rediscovered by whoever next
+   * compares this tile against the owner's own dashboard.
+   *
+   * It is NOT counted over the completed set. In BOTH of the template's KPI
+   * passes (renderKpis for the screen, kpiNumbers for the .docx) the line sits
+   * OUTSIDE the `s === "C"` branch, one statement above it, so it sees
+   * completed, cancelled AND open rows alike:
+   *
+   *     if (C.esc[i] === 1) esc++;   // Priyanka, 26 Sep: escalated jobs,
+   *     if (s === "C"){ ... }        //   counted like Cancelled
+   *     else if (s === "X") x++; else o++;
+   *
+   * and the tile divides by all three:
+   *
+   *     es.append(el("b", null, pct1(esc, total)), " of jobs in hand");
+   *     // total = c + x + o
+   *
+   * Which is the only reading that makes sense of the metric. An escalation is
+   * a complaint about a job, and the jobs people complain loudest about are
+   * the ones still OPEN. Counting escalations over closures only would hide
+   * exactly the rows the tile exists to surface, and would make the number
+   * move as jobs closed rather than as customers escalated.
+   *
+   * The flag is never three-valued — mapExportRow puts it through jdbcInt, so
+   * a NULL column arrives as 0 — but it is compared with `=== 1` rather than
+   * for truthiness so that it stays the template's own predicate.
+   */
+  const escalatedIn = (rows) => rows.reduce((a, row) => a + (Number(row.isEscalated) === 1 ? 1 : 0), 0);
+  const escalatedBySet = {
+    completed: escalatedIn(completed),
+    cancelled: escalatedIn(cancelled),
+    open: escalatedIn(open),
+  };
+  const escalated = escalatedBySet.completed + escalatedBySet.cancelled + escalatedBySet.open;
 
   const kpis = {
     ordersCreated,
@@ -746,15 +911,103 @@ async function buildMtdReport({
     inHand,
     completionPct: pct(nCompleted + nOpen, inHand),
     tatPct: pct(inTat, nCompleted),
+    sdaPct: pct(inSda, nCompleted),
     cancelledPct: pct(nCancelled, inHand),
+    escalated,
+    escalatedPct: pct(escalated, inHand),
   };
 
   const daily = buildDaily({
     from: window.from, to: window.to, created, completed, cancelled, open: openForBacklog, now,
   });
+
+  /*
+   * ═══ COMPLETED, ON THE APP CHECK-IN DATE ═══════════════════════════════
+   *
+   * v2 of the owner's dashboard moved completed jobs off the closure date and
+   * onto the day the technician arrived. prep.py:
+   *
+   *     "checkin": ("App CheckIn Date", "date"),
+   *         # Priyanka, 27 Sep: completed jobs are counted on this date
+   *
+   * WHERE IT IS USED, exactly — because this was the question worth getting
+   * right. It is NOT confined to the per-client report's Completed tile and
+   * its day-wise chart. template.html derives ONE basis column for every row
+   * in the file and every number is filtered through it:
+   *
+   *     function doneAt(i){
+   *       if (C.checkin && C.checkin[i] != null) return C.checkin[i];
+   *       return C.checkout[i];
+   *     }
+   *     const DAY = new Int32Array(N);
+   *     for (let i = 0; i < N; i++){
+   *       const m = SHEET[i] === "C" ? doneAt(i)
+   *               : SHEET[i] === "X" ? C.cancelled[i] : C.created[i];
+   *       DAY[i] = m == null ? -99999 : Math.floor(m / MIN_PER_DAY);
+   *     }
+   *
+   * and `passes(i)`, which gates EVERY KPI, every section and the report, is a
+   * range test on DAY[i]. So in v2 the check-in date does not merely re-bucket
+   * the completed jobs — it changes WHICH jobs are completed "in" the month at
+   * all, and with them TAT %, SDA %, the city split and the days-open bands.
+   *
+   * WHICH IS WHY IT IS NOT SWAPPED IN HERE. `completed` is already live on QA
+   * on the closure basis; re-keying it would move a number the owner is
+   * reading today, in the same breath as adding two others, with no way to
+   * tell which change did what. So the closure basis stays exactly as it was
+   * and the check-in basis ships BESIDE it, as its own figure, for comparison.
+   *
+   * HOW FAR WE CAN HONESTLY GO. Our completed set is READ on checkout_date_time
+   * (sources.loadClosedJobs), so it holds every job that CLOSED in the window.
+   * The set v2 would count holds every job that CHECKED IN in the window. The
+   * one job that can be in v2's and not in ours is one that checked in inside
+   * the window but was audited after it — and since a technician cannot check
+   * out before checking in, and cannot check out in the future, that job can
+   * only exist when the window ENDS IN THE PAST. For the month-to-date view
+   * the tab actually opens on, `to` is today and the two sets cannot differ
+   * that way: ours is a superset and this re-bucketing is exact.
+   *
+   * For a historical window it is not, so `complete` says so outright instead
+   * of letting a quietly short number be compared against the owner's file.
+   */
+  const lo = dayIndex(window.from);
+  let onCheckinInWindow = 0;
+  let onCheckinBefore = 0;
+  let onCheckinAfter = 0;
+  let onCheckinUnknown = 0;
+  let noCheckinDate = 0;
+  for (const row of completed) {
+    if (dayIndex(row.checkinDate) === null) noCheckinDate += 1;
+    const d = checkinDayOf(row);
+    if (d === null) onCheckinUnknown += 1;
+    else if (d < lo) onCheckinBefore += 1;
+    else if (d > hi) onCheckinAfter += 1;
+    else onCheckinInWindow += 1;
+  }
+  const completedOnCheckin = {
+    basis: 'checkin',
+    count: onCheckinInWindow,
+    // Every job we HOLD lands in exactly one of these four, which is the
+    // reconciliation below. A job counted here is a job this window's closure
+    // basis also counted — just on a different day.
+    beforeWindow: onCheckinBefore,
+    afterWindow: onCheckinAfter,
+    unknownDate: onCheckinUnknown,
+    // How much of `count` is really the closure date wearing a different hat:
+    // doneAt() falls back to checkout when the check-in cell is blank, and so
+    // do we. A large number here means the two bases are closer than they look.
+    noCheckinDate,
+    /*
+     * False when the window ends before today: jobs that checked in inside it
+     * but were audited after it were never read, so `count` is a floor rather
+     * than the figure v2 would print. True for the month-to-date view.
+     */
+    complete: window.to >= todayIst(now),
+  };
   const { byDaysOpen, whyCancelled } = buildDaysOpen({ completed, cancelled });
   const cities = buildCities({ created, completed });
   const { statusAging, jobs } = buildStatusAging({ completed, cancelled, open });
+  const tierAging = buildTierAging({ open });
 
   const completionVsCancellation = {
     completed: nCompleted,
@@ -804,7 +1057,43 @@ async function buildMtdReport({
       && statusAging.rows[0].total === nCompleted
       && statusAging.rows[1].total === nCancelled
       && statusAging.rows[2].total === nOpen,
+    /*
+     * The tier matrix splits the OPEN set and nothing else, so its grand total
+     * is kpis.open on the nose — that is the section's whole claim ("same open
+     * jobs as the tiles at the top"). Both totals are asserted against nOpen,
+     * not against each other, so a matrix that is internally tidy but counts
+     * the wrong set still fails; and the per-row and per-column identities
+     * below catch the opposite error, a matrix whose margins were computed from
+     * something other than its own cells.
+     */
+    tierAging: tierAging.grand === nOpen
+      && sum(tierAging.columnTotals) === nOpen
+      && tierAging.rows.every((r) => sum(r.counts) === r.total)
+      && tierAging.columnTotals.every((t, b) => sum(tierAging.rows.map((r) => r.counts[b])) === t),
     jobs: jobs.length === inHand,
+    /*
+     * Escalated splits across the three sets it is counted over, and no set
+     * can contribute more escalations than it has jobs. The second half is
+     * what would catch the flag being read off the wrong row — a count that
+     * still adds up but describes more jobs than exist.
+     */
+    escalated: escalatedBySet.completed + escalatedBySet.cancelled + escalatedBySet.open === escalated
+      && escalatedBySet.completed <= nCompleted
+      && escalatedBySet.cancelled <= nCancelled
+      && escalatedBySet.open <= nOpen
+      && escalated <= inHand,
+    // SDA divides the completed set: the jobs that met it cannot outnumber it,
+    // and the divisor must BE it rather than anything else in hand.
+    sda: inSda <= nCompleted && kpis.sdaPct.den === nCompleted && kpis.tatPct.den === nCompleted,
+    /*
+     * Every completed job we hold sits on exactly one side of the check-in
+     * window — in it, before it, after it, or with no usable date at all — so
+     * the four parts are the completed total. The second identity pins the
+     * day-wise bars to the tile: the same rows, bucketed the same way.
+     */
+    completedOnCheckin: completedOnCheckin.count + completedOnCheckin.beforeWindow
+      + completedOnCheckin.afterWindow + completedOnCheckin.unknownDate === nCompleted
+      && daily.totals.completedCheckin === completedOnCheckin.count,
   };
   const reconciled = Object.values(checks).every(Boolean);
   if (!reconciled) {
@@ -838,12 +1127,20 @@ async function buildMtdReport({
       dayStillFilling: istMinutesOfDay(now) < DAY_COMPLETE_AFTER_MIN,
     },
     kpis,
+    // The per-set split behind kpis.escalated, so the tile can say where the
+    // escalations are without a second pass over the job list.
+    escalatedBySet,
+    // Completed counted on App CheckIn Date instead — the owner's v2 basis,
+    // beside the closure basis rather than in place of it. See the long note
+    // where it is built.
+    completedOnCheckin,
     daily,
     completionVsCancellation,
     byDaysOpen,
     whyCancelled,
     cities,
     statusAging,
+    tierAging,
     jobs,
     filters,
     reconciled,
@@ -1013,6 +1310,7 @@ module.exports = {
   JOB_SORT_KEYS,
   BLANK,
   BLANK_CITY,
+  BLANK_TIER,
   NO_REASON_PICKED,
   THEMES: themes.THEMES,
   defaultWindow: sources.defaultWindow,
