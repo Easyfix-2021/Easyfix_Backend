@@ -133,18 +133,34 @@ test('a legacy-bit flip does not hide TRAINING_PENDING: the stored status decide
   assert.equal(lifecycleWrites().length, 0);
 });
 
-test('technicians NOT in TRAINING_PENDING activate exactly as before, with no training lookup', async () => {
-  // No mandatory-training rows at all — what every legacy technician looks like.
-  trainingDone = null;
+test('an applicant with no stored status or a stored UNDER_VERIFICATION is refused until training is done', async () => {
+  /*
+   * Owner, 2026-09-30 (QA efrId 10798): an applicant whose saved flags derive
+   * UNDER_VERIFICATION with NOTHING stored never entered TRAINING_PENDING, and
+   * the rule — keyed on the stored column alone — let CRM activate him with
+   * the mandatory video unwatched. Any onboarding status is an applicant now.
+   */
   for (const status of ['UNDER_VERIFICATION', null]) {
     row = baseRow({ lifecycle_status: status });
     calls = [];
+    trainingDone = null;
+    await assert.rejects(activate, { status: 409, code: 'MANDATORY_TRAINING_INCOMPLETE' }, String(status));
+    assert.equal(lifecycleWrites().length, 0, String(status));
+    trainingDone = '2026-09-25 12:00:00';
+    calls = [];
     const result = await activate();
-    assert.equal(result.changed, true, String(status));
     assert.equal(result.lifecycle.status, 'ACTIVE', String(status));
-    assert.equal(lifecycleWrites().length, 1, String(status));
   }
-  assert.equal(trainingLookups, 0, 'the rule never runs outside TRAINING_PENDING');
+});
+
+test('working technicians are never asked for training: an operational move to ACTIVE skips the rule', async () => {
+  // PAUSED -> ACTIVE is a resume, not an activation; 15% of QA's working
+  // technicians have not watched the video and must not be blocked by it.
+  row = baseRow({ lifecycle_status: 'PAUSED', is_technician_verified: 1, efr_status: 1 });
+  trainingDone = null;
+  const result = await lifecycle.transition(77, { status: 'ACTIVE', source: 'CRM', reasonCode: 'RESUME', reason: 'resume' }, { user_id: 9 });
+  assert.equal(result.lifecycle.status, 'ACTIVE');
+  assert.equal(trainingLookups, 0, 'the rule never runs for a working technician');
 });
 
 test('the automatic post-training exit still advances TRAINING_PENDING -> UNDER_VERIFICATION', async () => {
@@ -210,4 +226,37 @@ test('Gate 1: mandatory courses are assigned before the row lock, never inside i
   } finally {
     lms.assignMandatoryCourses = saved;
   }
+});
+
+test('Gate 1: nothing stored + flags already UNDER_VERIFICATION + training outstanding -> TRAINING_PENDING', async () => {
+  const lms = require('../services/lms.service');
+  const saved = lms.assignMandatoryCourses;
+  lms.assignMandatoryCourses = async () => ({ assigned: 0 });
+  try {
+    row = baseRow({ lifecycle_status: null, is_identity_details_verified_by_crm: null });
+    calls = [];
+    trainingDone = null;
+    const pending = await lifecycle.finalizeMobileRegistrationGate1(77);
+    assert.equal(pending.lifecycle.status, 'TRAINING_PENDING', 'Gate 1 must not no-op an applicant who owes training');
+    assert.equal(lifecycleWrites().length, 1);
+
+    row = baseRow({ lifecycle_status: null, is_identity_details_verified_by_crm: null });
+    calls = [];
+    trainingDone = '2026-09-25 12:00:00';
+    const done = await lifecycle.finalizeMobileRegistrationGate1(77);
+    assert.equal(done.lifecycle.status, 'UNDER_VERIFICATION', 'training done: stays under verification');
+  } finally {
+    lms.assignMandatoryCourses = saved;
+  }
+});
+
+test('the nightly drift heal still adopts a legacy-activated technician without a training lookup', async () => {
+  // Activated by the legacy app (verified bit + efr_status 1) while the stored
+  // status still says UNDER_VERIFICATION: current reads as ACTIVE, so he is not
+  // an applicant and the rule must not refuse the heal.
+  row = baseRow({ lifecycle_status: 'UNDER_VERIFICATION', is_technician_verified: 1, efr_status: 1 });
+  trainingDone = null;
+  const result = await lifecycle.reconcileLegacyStatus(77);
+  assert.equal(result.lifecycle.status, 'ACTIVE');
+  assert.equal(trainingLookups, 0);
 });

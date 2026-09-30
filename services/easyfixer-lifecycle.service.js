@@ -572,9 +572,15 @@ function assertFinalActivationEligible(row = {}) {
  * ASSIGNED courses) no longer decides either. It returns null on a failed lookup
  * or an empty mandatory set: fail closed.
  *
- * Scoped to TRAINING_PENDING on purpose: technicians already working were never
- * routed through it, and a blanket rule would reach every one of them (about
- * 15% of QA's active technicians have not finished the mandatory video).
+ * Scoped to APPLICANTS, never to working technicians: those were never routed
+ * through it, and a blanket rule would reach every one of them (about 15% of
+ * QA's active technicians have not finished the mandatory video). An applicant
+ * is the stored TRAINING_PENDING — kept because a legacy-bit flip reads it back
+ * as ACTIVE — OR any onboarding status the row resolves to. The second arm was
+ * added 2026-09-30 (owner): an applicant with NO stored status whose saved
+ * flags derive UNDER_VERIFICATION (QA efrId 10798) never entered
+ * TRAINING_PENDING, so this rule never fired and CRM could activate him with
+ * Introduction to Easyfix unwatched.
  */
 async function assertMandatoryTrainingComplete(efrId) {
   // Lazy: mobile-registration.service requires this module at load time.
@@ -1483,7 +1489,8 @@ async function transition(efrId, input = {}, actor = null) {
         throw httpError(409, `${target} requires a verified technician`);
       }
       if (WORK_ENABLED.has(target)
-          && normalizeStatus(row.lifecycle_status) === 'TRAINING_PENDING') {
+          && (normalizeStatus(row.lifecycle_status) === 'TRAINING_PENDING'
+            || ONBOARDING_STATES.has(current.status))) {
         await assertMandatoryTrainingComplete(id);
       }
 
@@ -1780,6 +1787,18 @@ async function finalizeMobileRegistrationGate1(efrId) {
       // Lazy: mobile-registration.service requires this module at load time.
       const { fetchTrainingCompletedTime } = require('./mobile-registration.service');
       const trainingDone = !!(await fetchTrainingCompletedTime(efrId));
+      /*
+       * Nothing stored yet, and the saved flags already derive
+       * UNDER_VERIFICATION — "settled" to resolveGate1Finalization, so Gate 1
+       * was a silent no-op and he never entered TRAINING_PENDING (QA efrId
+       * 10798, 2026-09-30). With training outstanding that is where he belongs;
+       * storing it also puts him in the automatic post-training exit.
+       */
+      if (!normalizeStatus(row.lifecycle_status)
+          && current.status === 'UNDER_VERIFICATION'
+          && !trainingDone) {
+        return 'TRAINING_PENDING';
+      }
       const decision = resolveGate1Finalization(current.status, {
         personal_submitted: row.user_is_personal_detail_filled,
         adhaar_card_number: row.adhaar_card_number,
