@@ -117,8 +117,27 @@ router.get('/:id/charges', validate(idParam, 'params'), scopedJob, async (req, r
 // isJobChargesManage is a real menu_action, so Manage Role can.
 const gate = requireAction('isJobChargesManage');
 
+/*
+ * CHARGES LOCK AT CHECKOUT (2026-09-30). Entering 3 / 5 posts the completion
+ * ledger from these job_material rows (services/job-ledger.service.js), once.
+ * A charge added, re-priced or deleted afterwards would never reach that
+ * posting, so the payout and the job's charges would silently disagree. Same
+ * rule as the service lines (jobs.js servicesEditable). Legacy's audit screen
+ * is only reachable before checkout, so this refuses nothing legacy allowed.
+ * After scopedJob, which supplies the status. The service billing-approval
+ * toggle below is not a charge and stays open.
+ */
+const CHECKED_OUT = new Set([3, 5]);
+function chargesOpen(req, res, next) {
+  if (CHECKED_OUT.has(Number(req.scopedJob.job_status))) {
+    logger.warn('Charge write refused, job checked out · jobId=' + req.params.id + ' status=' + req.scopedJob.job_status);
+    return modernError(res, 409, 'Charges are locked once the job is checked out');
+  }
+  return next();
+}
+
 // ─── CREATE charges (job_material typed rows) ────────────────────────
-router.post('/:id/penalty', gate, validate(idParam, 'params'), validate(penaltyBody), scopedJob, async (req, res, next) => {
+router.post('/:id/penalty', gate, validate(idParam, 'params'), validate(penaltyBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.createPenalty(req.params.id, req.body, req.user.user_id);
     res.status(201);
@@ -126,7 +145,7 @@ router.post('/:id/penalty', gate, validate(idParam, 'params'), validate(penaltyB
   } catch (e) { return fail(res, e, next); }
 });
 
-router.post('/:id/travel', gate, validate(idParam, 'params'), validate(travelBody), scopedJob, async (req, res, next) => {
+router.post('/:id/travel', gate, validate(idParam, 'params'), validate(travelBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.createTravel(req.params.id, req.body, req.user.user_id);
     res.status(201);
@@ -134,7 +153,7 @@ router.post('/:id/travel', gate, validate(idParam, 'params'), validate(travelBod
   } catch (e) { return fail(res, e, next); }
 });
 
-router.post('/:id/incentive', gate, validate(idParam, 'params'), validate(incentiveBody), scopedJob, async (req, res, next) => {
+router.post('/:id/incentive', gate, validate(idParam, 'params'), validate(incentiveBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.createIncentive(req.params.id, req.body, req.user.user_id);
     res.status(201);
@@ -142,7 +161,7 @@ router.post('/:id/incentive', gate, validate(idParam, 'params'), validate(incent
   } catch (e) { return fail(res, e, next); }
 });
 
-router.post('/:id/material', gate, validate(idParam, 'params'), validate(materialBody), scopedJob, async (req, res, next) => {
+router.post('/:id/material', gate, validate(idParam, 'params'), validate(materialBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.createMaterial(req.params.id, req.body, req.user.user_id);
     res.status(201);
@@ -151,7 +170,7 @@ router.post('/:id/material', gate, validate(idParam, 'params'), validate(materia
 });
 
 // ─── EDIT a charge (same fields as its type) ─────────────────────────
-router.patch('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), validate(editBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), validate(editBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.editCharge(req.params.id, req.params.chargeId, req.body, req.user.user_id);
     return modernOk(res, out, 'charge updated');
@@ -159,7 +178,7 @@ router.patch('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), v
 });
 
 // ─── EDIT only the client-approval flag ──────────────────────────────
-router.patch('/:id/charges/:chargeId/approval', gate, validate(chargeParams, 'params'), validate(approvalBody), scopedJob, async (req, res, next) => {
+router.patch('/:id/charges/:chargeId/approval', gate, validate(chargeParams, 'params'), validate(approvalBody), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.setChargeApproval(req.params.id, req.params.chargeId, req.body.isClientApprovalNeeded, req.user.user_id);
     return modernOk(res, out, 'approval flag updated');
@@ -167,7 +186,7 @@ router.patch('/:id/charges/:chargeId/approval', gate, validate(chargeParams, 'pa
 });
 
 // ─── DELETE a charge (guarded to the CHARGE_TYPES rows) ──────
-router.delete('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), scopedJob, async (req, res, next) => {
+router.delete('/:id/charges/:chargeId', gate, validate(chargeParams, 'params'), scopedJob, chargesOpen, async (req, res, next) => {
   try {
     const out = await charges.deleteCharge(req.params.id, req.params.chargeId);
     return modernOk(res, out, 'charge deleted');
