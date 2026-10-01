@@ -101,6 +101,47 @@ describe('styled import templates round-trip through their own importer', () => 
     assert.equal(templateExampleRow({ ...ref, brandByKey: new Map() }).brands, '', 'no brands → blank = No Brand');
   });
 
+  // In-cell dropdowns (utils/xlsx-list-validation): a hidden Lists sheet and
+  // list validation on the right DATA columns, from row 5 (header on row 4).
+  async function dropdowns(generate) {
+    const ExcelJS = require('exceljs');
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(await templateBuffer(generate));
+    const lists = wb.getWorksheet('Lists');
+    const data = wb.worksheets.find((w) => w.name !== 'Lists');
+    const model = data.dataValidations.model;
+    const byRange = (range) => {
+      const key = Object.keys(model).find((k) => k === range || k.startsWith(range.split(':')[0]));
+      return key ? model[key] : null;
+    };
+    const listValues = (col) => lists.getColumn(col).values.filter((v) => v != null).slice(1);
+    return { lists, byRange, listValues };
+  }
+
+  it('Manage Materials · Material: Category, Pricing Type and UOM are dropdowns; Brands stays free text', async () => {
+    const d = await dropdowns((r) => mi().generateMaterialTemplate(r));
+    assert.ok(d.lists, 'hidden Lists sheet exists');
+    assert.equal(d.lists.state, 'hidden');
+    for (const [col, listCol] of [['B', 'A'], ['C', 'B'], ['D', 'C']]) {
+      const v = d.byRange(`${col}5:${col}1000`);
+      assert.ok(v, `column ${col} has list validation from row 5`);
+      assert.equal(v.type, 'list');
+      assert.ok(v.formulae[0].startsWith(`Lists!$${listCol}$2:`), `column ${col} points at Lists column ${listCol}: ${v.formulae[0]}`);
+    }
+    assert.equal(d.byRange('F5:F1000'), null, 'Brands (comma-separated) must NOT be a single-value dropdown');
+    assert.deepEqual(d.listValues(1), ['Carpentry Services', 'Electrician Services']);
+    assert.deepEqual(d.listValues(2), ['Fixed', 'Dynamic']);
+    assert.deepEqual(d.listValues(3), ['Nos']);
+  });
+
+  it('Rate Card · Materials: Material, Brand and State dropdowns survive the move to the shared helper', async () => {
+    const d = await dropdowns((r) => rc().generateMaterialRatesTemplate(r));
+    for (const col of ['A', 'B', 'E']) assert.ok(d.byRange(`${col}5:${col}1000`), `column ${col} keeps its dropdown`);
+    assert.equal(d.byRange('D5:D1000'), null, 'Tx Share (D) is a number, never a dropdown');
+    assert.deepEqual(d.listValues(1), ['PVC Pipe']);
+    assert.deepEqual(d.listValues(3), ['Maharashtra']);
+  });
+
   for (const t of TEMPLATES) {
     it(`${t.name}: the template's example row(s) are read as data at Excel row 5+, with no "required" error`, async () => {
       const buf = await templateBuffer(t.generate);

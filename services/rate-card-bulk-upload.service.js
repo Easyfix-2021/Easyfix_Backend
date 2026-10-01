@@ -4,6 +4,7 @@ const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
 const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../utils/xlsx-styled-export');
 const { rowsBelowHeader } = require('../utils/xlsx-header-rows');
+const { addListValidations } = require('../utils/xlsx-list-validation');
 const clientServicesSvc = require('./client-services.service');
 const materialRatesSvc = require('./client-material-rates.service');
 const stateService = require('./state.service');
@@ -356,50 +357,16 @@ function unknownNameError(label, rawName, byKeyMap, nameField) {
  * for a long dropdown list (an inline list is capped at 255 characters).
  * ExcelJS (already a dependency) supports both natively — no new package.
  *
- * `lastDataRow` is a fixed cap (Excel validation needs a bounded range, not
- * "the rest of the sheet") — 1000 rows is generous for a rate-card upload.
+ * The 1000-row validation cap now lives in utils/xlsx-list-validation.js.
  */
-const TEMPLATE_LAST_DATA_ROW = 1000;
 
 function addMaterialListsAndValidation(wb, sheetName, firstDataRow, { materialNames, brandNames, stateNames }) {
-  const listsWs = wb.addWorksheet('Lists', { state: 'hidden' });
-  listsWs.getColumn(1).values = ['Materials', ...materialNames];
-  listsWs.getColumn(2).values = ['Brands', ...brandNames];
-  listsWs.getColumn(3).values = ['States', ...stateNames];
-
-  const ws = wb.getWorksheet(sheetName);
-  const lastRow = TEMPLATE_LAST_DATA_ROW;
-  const rangeFormula = (col, names) => (names.length ? [`Lists!$${col}$2:$${col}$${names.length + 1}`] : null);
-
-  const materialsRange = rangeFormula('A', materialNames);
-  const brandsRange = rangeFormula('B', brandNames);
-  const statesRange = rangeFormula('C', stateNames);
-  // Lists sheet columns are unrelated to the DATA sheet's own layout — these
-  // three letters (A/B/C) name where the Lists sheet keeps its lookup
-  // columns, not where Material/Brand/State live on the Materials sheet.
-
-  if (materialsRange) {
-    ws.dataValidations.add(`A${firstDataRow}:A${lastRow}`, {
-      type: 'list', allowBlank: false, formulae: materialsRange,
-      showErrorMessage: true, errorTitle: 'Unknown material', error: 'Pick a material from the dropdown list.',
-    });
-  }
-  if (brandsRange) {
-    ws.dataValidations.add(`B${firstDataRow}:B${lastRow}`, {
-      type: 'list', allowBlank: true, formulae: brandsRange,
-      showErrorMessage: true, errorTitle: 'Unknown brand',
-      error: 'Pick a brand from the dropdown list, or leave blank for No Brand.',
-    });
-  }
-  if (statesRange) {
-    // Column E — State — now that Tx Share (2026-09-24) occupies D between
-    // Price and State on the Materials sheet.
-    ws.dataValidations.add(`E${firstDataRow}:E${lastRow}`, {
-      type: 'list', allowBlank: true, formulae: statesRange,
-      showErrorMessage: true, errorTitle: 'Unknown state',
-      error: 'Pick a state from the dropdown list, or leave blank for the all-states price.',
-    });
-  }
+  // Material A, Brand B, State E (Tx Share sits in D since 2026-09-24).
+  addListValidations(wb, sheetName, firstDataRow, [
+    { column: 'A', title: 'Materials', names: materialNames, allowBlank: false, error: 'Pick a material from the dropdown list.' },
+    { column: 'B', title: 'Brands', names: brandNames, allowBlank: true, error: 'Pick a brand from the dropdown list, or leave blank for No Brand.' },
+    { column: 'E', title: 'States', names: stateNames, allowBlank: true, error: 'Pick a state from the dropdown list, or leave blank for the all-states price.' },
+  ]);
 }
 
 /*
