@@ -221,7 +221,7 @@ async function getVerificationPage(efrId) {
     leadComments, profComments, persComments,
     bankComments, idComments, actComments,
     deepSkillCountRow, serviceablePincodesRow,
-    kycDocRow, mandatoryTrainingRows, trainingAssignmentRow] = await Promise.all([
+    kycDocRow, mandatoryTrainingRows, trainingAssignmentRow, devicePresenceRow] = await Promise.all([
     getBanking(efrId),
     listEasyfixBanks(),
     listCitiesForLookup(),
@@ -298,6 +298,27 @@ async function getVerificationPage(efrId) {
       [efrId],
     ).then(([rows]) => rows[0] || { assigned: 0, completed: 0 })
       .catch((e) => { logger.warn({ efrId, err: e }, 'verification: training assignment read failed'); return { assigned: 0, completed: 0 }; }),
+    /*
+     * App presence — last seen, app version and language from device_info.
+     *
+     * device_info.user_id holds the EFR_ID for a technician. That is not an
+     * assumption: services/push-delivery.service.js joins `di.user_id =
+     * e.efr_id` to route every push this platform sends, so the convention is
+     * load-bearing and proven. (The column name is shared with CRM users,
+     * whose ids live in the same integer space, which is why this is worth
+     * stating rather than leaving to the reader.)
+     *
+     * A technician can hold several device rows; the most recent login wins.
+     */
+    pool.query(
+      `SELECT app_version_name, language, is_logged_in, last_login_time
+         FROM device_info
+        WHERE user_id = ?
+        ORDER BY last_login_time IS NULL, last_login_time DESC
+        LIMIT 1`,
+      [efrId],
+    ).then(([rows]) => rows[0] || {})
+      .catch((e) => { logger.warn({ efrId, err: e }, 'verification: device presence read failed'); return {}; }),
   ]);
 
   const deepSkillsCount = Number(deepSkillCountRow.cnt || 0);
@@ -655,6 +676,19 @@ async function getVerificationPage(efrId) {
         !completion.personalDetailsComplete && 'Personal details',
         !completion.serviceablePincodesPresent && 'Serviceable pincodes',
       ].filter(Boolean),
+    },
+
+    /*
+     * What the CRM needs to know before picking up the phone: which vertical he
+     * was taken on for, when he last opened the app, in which language, and on
+     * which build. NULLs are expected and meaningful — "never seen" is an
+     * answer, not a gap.
+     */
+    app_presence: {
+      last_seen: devicePresenceRow.last_login_time || null,
+      app_version: devicePresenceRow.app_version_name || null,
+      language: devicePresenceRow.language || null,
+      logged_in: String(devicePresenceRow.is_logged_in ?? '') === '1',
     },
 
     // ─ The vertical this technician was onboarded FOR (a label, not a fence) ─

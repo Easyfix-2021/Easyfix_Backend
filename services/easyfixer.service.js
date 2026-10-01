@@ -1126,6 +1126,127 @@ async function listMappedClients(efrId, { limit = 50, offset = 0 } = {}) {
  * would silently drop jobs the technician was paid for — 2,212 completed jobs
  * sit in the 16 retired categories.
  */
+/*
+ * TQI — Technician Quality Index, over the last 12 months of CLOSED jobs.
+ *
+ * Six criteria, each a percentage, combined on fixed weights. Definitions are
+ * Priyanka's (2026-09-30 / 10-01), and every one is computed from columns that
+ * are already populated — no new writes, no backfill:
+ *
+ *   On-time arrival 20%  check-in within 60 min of the requested time. NOT a
+ *                        new rule: services/mobile-profile-extra.service.js
+ *                        already shows the technician this exact number.
+ *   First-time fix  25%  checked in and out on the SAME DAY — the job was
+ *                        finished on the visit, no second trip.
+ *   Customer rating 25%  average rating over RATED jobs, as a share of 5.
+ *                        An unrated job neither helps nor hurts.
+ *   SLA / TAT met   15%  checked in on the ORIGINAL appointment date.
+ *                        original_appointment_date_time is populated on all
+ *                        47,073 jobs in the window, so no fallback is needed.
+ *   Low escalations 10%  100 minus the share of jobs escalated. LEFT JOIN, so
+ *                        a job with no rating row counts as not escalated.
+ *   Low rework       5%  100 minus the share with a revisit date.
+ *
+ * ⚠ TWO CRITERIA CANNOT CURRENTLY DISCRIMINATE, measured on QA and reported to
+ * the owner: customer rating is 46,422 fives against 272 of everything else
+ * (so nearly every technician scores ~100 on 25% of the index), and only 42 of
+ * 47,099 jobs carry a revisit. 30% of the weight therefore moves almost
+ * nobody, and the real ranking comes from on-time, first-time-fix and SLA,
+ * which spread 13–79%. Shipped on the owner's weights; revisit when the rating
+ * distribution is fixed or rating becomes a low-rating PENALTY.
+ *
+ * Weights live here, in one object, so retuning is a one-line change. They are
+ * returned with the response so the card can label each bar with its weight
+ * and never drift from what was actually applied.
+ */
+const TQI_WEIGHTS = Object.freeze({
+  on_time_arrival: 0.20,
+  first_time_fix: 0.25,
+  customer_rating: 0.25,
+  sla_met: 0.15,
+  low_escalations: 0.10,
+  low_rework: 0.05,
+});
+
+const TQI_LABELS = Object.freeze({
+  on_time_arrival: 'On-time arrival',
+  first_time_fix: 'First-time fix',
+  customer_rating: 'Customer rating',
+  sla_met: 'SLA / TAT met',
+  low_escalations: 'Low escalations',
+  low_rework: 'Low rework',
+});
+
+async function technicianQualityIndex(efrId) {
+  const id = Number(efrId);
+  logger.info('TQI · efrId=' + id);
+  const empty = {
+    window_months: 12, jobs: 0, score: null, criteria: [],
+  };
+  if (!Number.isInteger(id) || id <= 0) return empty;
+
+  const [[row]] = await pool.query(
+    `SELECT COUNT(*) AS jobs,
+            SUM(j.checkin_date_time <= DATE_ADD(j.requested_date_time, INTERVAL 60 MINUTE)) AS on_time,
+            SUM(DATE(j.checkin_date_time) = DATE(j.checkout_date_time))                     AS same_day,
+            SUM(DATE(j.checkin_date_time) = DATE(j.original_appointment_date_time))         AS sla_met,
+            SUM(COALESCE(rc.is_escalated, 0) = 1)                                           AS escalated,
+            SUM(j.revisit_date IS NOT NULL)                                                 AS reworked,
+            AVG(NULLIF(rc.customer_rating, 0))                                              AS avg_rating,
+            COUNT(NULLIF(rc.customer_rating, 0))                                            AS rated_jobs
+       FROM tbl_job j
+       LEFT JOIN tbl_easyfixer_rating_by_customer rc ON rc.job_id = j.job_id
+      WHERE j.fk_easyfixter_id = ?
+        AND j.job_status IN (3, 5)
+        AND j.checkin_date_time IS NOT NULL
+        AND j.checkout_date_time >= DATE_SUB(?, INTERVAL 1 YEAR)`,
+    [id, new Date()],
+  );
+
+  const jobs = Number(row?.jobs || 0);
+  // No jobs in the window means NO SCORE — not a zero. A technician who has
+  // not worked this year has not scored badly, and 0/100 would rank him below
+  // someone genuinely performing poorly.
+  if (jobs === 0) return empty;
+
+  const share = (n) => Math.round((Number(n || 0) / jobs) * 1000) / 10;
+  const ratedJobs = Number(row.rated_jobs || 0);
+  const values = {
+    on_time_arrival: share(row.on_time),
+    first_time_fix: share(row.same_day),
+    customer_rating: ratedJobs > 0
+      ? Math.round((Number(row.avg_rating) / 5) * 1000) / 10
+      : null,
+    sla_met: share(row.sla_met),
+    low_escalations: Math.round((100 - share(row.escalated)) * 10) / 10,
+    low_rework: Math.round((100 - share(row.reworked)) * 10) / 10,
+  };
+
+  /*
+   * A criterion with no sample (nobody rated him) is EXCLUDED and its weight
+   * redistributed across the rest, rather than scored 0 — otherwise an unrated
+   * technician is punished for his customers' silence.
+   */
+  const scored = Object.keys(TQI_WEIGHTS).filter((k) => values[k] != null);
+  const weightSum = scored.reduce((n, k) => n + TQI_WEIGHTS[k], 0);
+  const score = weightSum > 0
+    ? Math.round(scored.reduce((n, k) => n + values[k] * TQI_WEIGHTS[k], 0) / weightSum)
+    : null;
+
+  return {
+    window_months: 12,
+    jobs,
+    rated_jobs: ratedJobs,
+    score,
+    criteria: Object.keys(TQI_WEIGHTS).map((key) => ({
+      key,
+      label: TQI_LABELS[key],
+      weight: Math.round(TQI_WEIGHTS[key] * 100),
+      percent: values[key],
+    })),
+  };
+}
+
 async function jobCategorySummary(efrId) {
   const id = Number(efrId);
   logger.info('Job category summary · efrId=' + id);
@@ -2025,6 +2146,7 @@ module.exports = {
   listMappedClients,
   aggregates,
   jobCategorySummary,
+  technicianQualityIndex,
   attendance,
   statusCounts,
   MUTABLE_COLUMNS,

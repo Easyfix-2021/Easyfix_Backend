@@ -363,6 +363,18 @@ router.put('/:id',
 // call returns both breakdowns AND every row (retired categories included,
 // flagged), so the card's Category/Vertical toggle and its "show retired"
 // reveal never need a second request.
+// TQI — six weighted quality criteria over the last 12 months of closed jobs.
+router.get('/:id/tqi',
+  validate(idParam, 'params'),
+  async (req, res, next) => {
+    try {
+      logger.info('TQI · id=' + req.params.id);
+      if (!(await loadAndAuthorize(req, res))) return;
+      const data = await easyfixer.technicianQualityIndex(req.params.id);
+      modernOk(res, data);
+    } catch (e) { next(e); }
+  });
+
 router.get('/:id/job-category-summary',
   validate(idParam, 'params'),
   async (req, res, next) => {
