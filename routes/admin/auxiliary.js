@@ -476,15 +476,17 @@ router.post('/bulk-reassign', validate(Joi.object({
      * so users on Week Off today are dropped from the rotation before anything is
      * assigned (services/roster.service.js weekOffSet). If every chosen user is
      * off, refuse rather than silently hand jobs to people who are not working.
+     * Same for an approved full-day leave today (Employee Hub).
      */
-    const offToday = await require('../../services/roster.service').weekOffSet(req.body.userIds);
-    const skippedWeekOff = req.body.userIds.filter((id) => offToday.has(Number(id)));
-    const userIds = req.body.userIds.filter((id) => !offToday.has(Number(id)));
+    const { weekOff, onLeave } = await require('../../services/roster.service').offDutySets(req.body.userIds);
+    const skippedWeekOff = req.body.userIds.filter((id) => weekOff.has(Number(id)));
+    const skippedOnLeave = req.body.userIds.filter((id) => onLeave.has(Number(id)));
+    const userIds = req.body.userIds.filter((id) => !weekOff.has(Number(id)) && !onLeave.has(Number(id)));
     if (!userIds.length) {
-      logger.warn('Bulk reassign rejected · every selected user is on week off today');
-      return modernError(res, 400, 'Every selected user is on Week Off today', { skippedWeekOff });
+      logger.warn('Bulk reassign rejected · every selected user is on week off or leave today');
+      return modernError(res, 400, 'Every selected user is on Week Off or leave today', { skippedWeekOff, skippedOnLeave });
     }
-    if (skippedWeekOff.length) logger.info('Bulk reassign · skipping week-off users=' + skippedWeekOff.join(','));
+    if (skippedWeekOff.length || skippedOnLeave.length) logger.info('Bulk reassign · skipping week-off=' + skippedWeekOff.join(',') + ' · on-leave=' + skippedOnLeave.join(','));
     const placeholders = req.body.statuses.map(() => '?').join(',');
     const [jobs] = await pool.query(
       `SELECT job_id FROM tbl_job
@@ -510,7 +512,7 @@ router.post('/bulk-reassign', validate(Joi.object({
       await conn.commit();
     } catch (err) { await conn.rollback(); throw err; } finally { conn.release(); }
     logger.info('Bulk reassign done · reassigned=' + reassigned);
-    modernOk(res, { reassigned, userCount: userIds.length, skippedWeekOff });
+    modernOk(res, { reassigned, userCount: userIds.length, skippedWeekOff, skippedOnLeave });
   } catch (e) { next(e); }
 });
 
