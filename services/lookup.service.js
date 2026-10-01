@@ -536,6 +536,17 @@ function applyMenuFilter(rows, { userEmail } = {}) {
   );
 })();
 
+/** Does this user have at least one ACTIVE direct report? (Employee Hub → Approvals visibility.) */
+async function hasDirectReports(userId) {
+  // Technician / share-guest principals carry non-numeric ids ('efr:123') — never a manager.
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) return false;
+  // user_type_id = 5 (internal employees), the same population findDescendantUserIds
+  // scopes the Approvals list to — so the menu never shows over an empty list.
+  const [rows] = await pool.query('SELECT 1 FROM tbl_user WHERE reporting_manager = ? AND user_status = 1 AND user_type_id = 5 LIMIT 1', [uid]);
+  return rows.length > 0;
+}
+
 async function menus({ userEmail } = {}) {
   logger.info('Lookup menus');
   // `menu_status` is also returned (even though we filter on it) so the
@@ -859,6 +870,7 @@ async function documentTypes({ includeInactive = false } = {}) {
 }
 
 module.exports = {
+  hasDirectReports,
   cities,
   states,
   serviceCategories,

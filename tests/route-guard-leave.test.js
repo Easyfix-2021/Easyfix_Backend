@@ -3,7 +3,9 @@
  * read leave: Team Roster export, bulk-reassign, lookup users.
  *
  *   · Joi on every body / query / param → 400 before the service runs.
- *   · isRosterAdmin is resolved from the role's action keys (like the roster).
+ *   · isRosterAdmin is resolved from the role's action keys (like the roster),
+ *     and only widens scope to RH-less requests — approval is hierarchy-scoped.
+ *   · a reason is mandatory on submit (service 400), not on a dry run.
  *   · export: 'LV' for a full day, 'PR (½LV)' for an approved half day.
  *   · bulk-reassign skips users on full-day leave today, like week-off users.
  *   · lookup users carry on_leave_today next to week_off_today.
@@ -24,6 +26,11 @@ const ADJ = [
 let leaveRows = [];
 const jobUpdates = [];
 
+// id 9 has no Reporting Head (approver NULL); every other id is 2's request with RH 1.
+const reqRow = (id) => (Number(id) === 9
+  ? { id, user_id: 5, kind: 'LV', from_date: '2099-01-05', to_date: '2099-01-05', duration: 'FULL', days: 1, status: 'PENDING', approver_user_id: null }
+  : { id, user_id: 2, kind: 'LV', from_date: '2099-01-05', to_date: '2099-01-05', duration: 'FULL', days: 1, status: 'PENDING', approver_user_id: 1 });
+
 const fake = installFakePool([
   [/SELECT user_role FROM tbl_user/i, (_s, p) => [{ user_role: ROLE_OF[p[0]] }]],
   [/SELECT ma\.action_name/i, (_s, p) => (ACTIONS_OF_ROLE[p[0]] || []).map((a) => ({ action_name: a }))],
@@ -36,10 +43,8 @@ const fake = installFakePool([
     const ids = p.slice(0, -2);
     return leaveRows.filter((r) => ids.includes(r.user_id));
   }],
-  [/FROM tbl_employee_leave_request r WHERE r\.id = \? FOR UPDATE/i, (_s, [id]) =>
-    [{ id, user_id: 2, kind: 'LV', from_date: '2099-01-05', to_date: '2099-01-05', duration: 'FULL', days: 1, status: 'PENDING', approver_user_id: 1 }]],
-  [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.id = \?/i, (_s, [id]) =>
-    [{ id, user_id: 2, kind: 'LV', from_date: '2099-01-05', to_date: '2099-01-05', duration: 'FULL', days: 1, status: 'APPROVED', approver_user_id: 1, user_name: 'U2' }]],
+  [/FROM tbl_employee_leave_request r WHERE r\.id = \? FOR UPDATE/i, (_s, [id]) => [reqRow(id)]],
+  [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.id = \?/i, (_s, [id]) => [{ ...reqRow(id), status: 'APPROVED', user_name: 'U' + reqRow(id).user_id }]],
   [/SELECT user_id, reporting_manager/i, ADJ],
   [/FROM tbl_user u LEFT JOIN tbl_role r/i, (_s, p) => p.map((id) => ({ user_id: id, user_name: 'U' + id, user_code: null, role_name: 'Ops' }))],
   [/FROM tbl_user u\s+LEFT JOIN tbl_role r ON r\.role_id = u\.user_role\s+WHERE/i, () => [2, 3].map((id) => ({ user_id: id, user_name: 'U' + id }))],
@@ -118,11 +123,40 @@ test('params / query / decide body are validated', async () => {
   }
 });
 
-test('isRosterAdmin comes from the role: an admin may decide anyone\'s request, a peer may not', async () => {
+test('a submit without a reason is the service\'s 400 (Joi lets it through); nothing is written', async () => {
+  fake.calls.length = 0;
+  for (const reason of [undefined, '', '   ']) {
+    const r = await post(2, '/leave/requests', { kind: 'LV', fromDate: '2099-01-05', toDate: '2099-01-05', reason });
+    assert.equal(r.status, 400, String(reason));
+    assert.equal(r.body.error, 'Enter a reason for the leave');
+  }
+  assert.equal(fake.calls.filter((c) => /tbl_employee_leave_request/.test(c.sql)).length, 0);
+});
+
+test('decide is hierarchy-scoped: the RH may, a peer may not, a team-less Roster Admin may not', async () => {
   const peer = await post(3, '/leave/requests/7/decide', { decision: 'APPROVE' });
   assert.equal(peer.status, 403);
   const admin = await post(8, '/leave/requests/7/decide', { decision: 'APPROVE' });
+  assert.deepEqual([admin.status, admin.body.error], [403, 'This request is not from your team']);
+  const rh = await post(1, '/leave/requests/7/decide', { decision: 'APPROVE' });
+  assert.equal(rh.status, 200, JSON.stringify(rh.body));
+});
+
+test('isRosterAdmin comes from the role: only the admin decides an RH-less request', async () => {
+  const peer = await post(3, '/leave/requests/9/decide', { decision: 'APPROVE' });
+  assert.equal(peer.status, 403);
+  const rh = await post(1, '/leave/requests/9/decide', { decision: 'APPROVE' });
+  assert.equal(rh.status, 403, 'an RH outside the requester\'s line is a stranger');
+  const admin = await post(8, '/leave/requests/9/decide', { decision: 'APPROVE' });
   assert.equal(admin.status, 200, JSON.stringify(admin.body));
+});
+
+test('approvals: no team and not a Roster Admin → an empty page, no leave query', async () => {
+  fake.calls.length = 0;
+  const r = await call(3, '/leave/approvals');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.data, { total: 0, items: [] });
+  assert.equal(fake.calls.filter((c) => /tbl_employee_leave_request/.test(c.sql)).length, 0);
 });
 
 test('ack: a valid key → { ok: true }', async () => {

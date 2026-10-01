@@ -23,10 +23,35 @@
  *                                          casing differences.
  *   7. Junk values in the env (alpha,  →  silently dropped from the parsed
  *      negatives, decimals)               set; remaining good ids still work.
+ *   8. GET /menus (route handler)      →  Employee Hub → Approvals
+ *                                          (url 'employeeLeaveApprovals') only
+ *                                          for a caller with an ACTIVE direct
+ *                                          report (owner, 2026-10-01).
  */
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
+const { installFakePool } = require('./helpers/fake-pool');
+
+// Fixtures for the route-level case (8). The direct-report fake answers the
+// real SQL: it honours `reporting_manager = ?` and, only while the clause is
+// written, `user_status = 1` — so dropping either is caught.
+const MENU_ROWS = [
+  { menu_id: 90, menu_name: 'Employee Hub', parent_menu: 0, url: 'javascript:;', menu_status: 1 },
+  { menu_id: 91, menu_name: 'Attendance & Leaves', parent_menu: 90, url: 'employeeLeave', menu_status: 1 },
+  { menu_id: 92, menu_name: 'Approvals', parent_menu: 90, url: 'employeeLeaveApprovals', menu_status: 1 },
+];
+const STAFF = [
+  { user_id: 11, reporting_manager: 10, user_status: 1 }, // 10 has an active report
+  { user_id: 13, reporting_manager: 12, user_status: 0 }, // 12's only report is inactive
+];
+const fake = installFakePool([
+  [/FROM tbl_menu/, MENU_ROWS],
+  [/FROM tbl_user WHERE reporting_manager = \?/, (sql, [mgr]) => STAFF.filter((u) => u.reporting_manager === mgr
+    && (!/user_status = 1/.test(sql) || u.user_status === 1)).map(() => ({ 1: 1 }))],
+  [/.*/, []],
+]);
+after(() => fake.restore());
 
 // Snapshot the env keys we mutate so each test can save / restore cleanly.
 const ENV_KEYS = ['NEW_CRM_VISIBLE_MENU_IDS', 'NEW_CRM_MENU_OVERRIDE_EMAILS'];
@@ -45,6 +70,8 @@ function restoreEnv(snap) {
 const origStdoutWrite = process.stdout.write.bind(process.stdout);
 process.stdout.write = () => true;
 const { _test } = require('../services/lookup.service');
+// eslint-disable-next-line global-require
+const lookupRouter = require('../routes/shared/lookup');
 process.stdout.write = origStdoutWrite;
 
 const { applyMenuFilter } = _test;
@@ -154,4 +181,48 @@ test('userEmail omitted → filter still applies (no implicit bypass)', (t) => {
   // list. Filter must still narrow the response.
   const out = applyMenuFilter(FIXTURE, {});
   assert.deepEqual(out.map((r) => r.menu_id).sort((a, b) => a - b), [1, 2]);
+});
+
+// ─── 8. GET /menus — Approvals needs an active direct report ─────────
+/** Run the real GET /menus handler off router.stack (house pattern — keeps requireAuth out). */
+async function getMenus(user) {
+  const layer = lookupRouter.stack.find((l) => l.route && l.route.path === '/menus' && l.route.methods.get);
+  assert.ok(layer, 'GET /menus must be registered');
+  const res = { statusCode: 200, body: null };
+  res.status = (c) => { res.statusCode = c; return res; };
+  res.json = (b) => { res.body = b; return res; };
+  let failure = null;
+  await layer.route.stack.at(-1).handle({ method: 'GET', query: {}, user }, res, (e) => { failure = e; });
+  if (failure) throw failure;
+  return res.body.data.map((m) => m.url);
+}
+
+test('menus: Approvals is kept for a caller with an active direct report', async (t) => {
+  const snap = snapshotEnv();
+  t.after(() => restoreEnv(snap));
+  delete process.env.NEW_CRM_VISIBLE_MENU_IDS;
+  fake.calls.length = 0;
+  assert.deepEqual(await getMenus({ user_id: 10, official_email: 'rh@easyfix.in' }), ['javascript:;', 'employeeLeave', 'employeeLeaveApprovals']);
+  const q = fake.calls.find((c) => /reporting_manager = \?/.test(c.sql));
+  assert.deepEqual(q.params, [10], 'asked about the CALLER');
+});
+
+test('menus: Approvals is dropped — and only it — with no direct report, or only an inactive one', async (t) => {
+  const snap = snapshotEnv();
+  t.after(() => restoreEnv(snap));
+  delete process.env.NEW_CRM_VISIBLE_MENU_IDS;
+  for (const userId of [14, 12, 11]) {
+    assert.deepEqual(await getMenus({ user_id: userId, official_email: 'x@easyfix.in' }), ['javascript:;', 'employeeLeave'], `user ${userId}`);
+  }
+});
+
+test('hasDirectReports: a non-numeric principal id (technician efr:…) is never a manager — no query, no NaN SQL', async () => {
+  const { hasDirectReports } = require('../services/lookup.service');
+  fake.calls.length = 0;
+  assert.equal(await hasDirectReports('efr:123'), false);
+  assert.equal(await hasDirectReports(undefined), false);
+  assert.equal(fake.calls.length, 0);
+  await hasDirectReports(1);
+  const q = fake.calls.find((c) => /reporting_manager = \?/.test(c.sql));
+  assert.match(q.sql, /user_type_id = 5/, 'same population as the Approvals list (findDescendantUserIds)');
 });
