@@ -1,23 +1,35 @@
 /*
- * "Save the reschedule remark the same way Add Remarks does" — VERIFIED, not
- * assumed, and pinned here so it stays true.
+ * "A reschedule is its own event, and it records the stage it happened in" —
+ * VERIFIED, not assumed, and pinned here so it stays true.
  *
- * THE QUESTION. PATCH /admin/jobs/:id/reschedule takes a reason and a remark.
- * Add Remarks (POST /admin/jobs/:id/comments) takes a reason and a remark. If
- * the two wrote tbl_job_comment differently, the job's history would render two
- * kinds of row for one kind of event, and every report keyed on
- * (comment_on, job_stage) would see them as different things.
+ * THIS FILE USED TO PIN THE OPPOSITE. Its original premise was that a
+ * reschedule and an Add Remarks are one kind of event, so their tbl_job_comment
+ * rows should be identical apart from appointment_on — same comment_on = 1,
+ * neither supplying job_stage. That was reversed on 2026-09-30 per ops, and the
+ * reasoning is worth keeping because it is the whole point of the file:
  *
- * THE ANSWER, as of this file: they are already the same. Both go through the
- * ONE writer (job-comment.service.addComment), both send comment_on = 1, both
- * set commented_by to the acting CRM user, both pass the chosen reason as
- * enum_reason_id, and NEITHER sends job_stage — the CRM's AddRemarksDialog does
- * not send one either, so both rows store NULL there. Nothing was changed.
+ *   A reschedule MOVES THE APPOINTMENT. A remark says something about the job.
+ *   Filing both under comment_on = 1 made every reschedule render as a generic
+ *   "Scheduling" row in the CRM's Comments tab, indistinguishable from someone
+ *   typing a note — so an operator scanning a job could not see that it had
+ *   been rescheduled at all.
  *
- * THE ONE DIFFERENCE IS DELIBERATE AND IS NOT A DIVERGENCE: reschedule also
- * sets appointment_on to the new promised time. Add Remarks has no appointment
- * to record, so it leaves that column null. A remark about a job is not a
- * promise about a date; only one of these two events makes one.
+ * Legacy had this right: 70,347 rows under comment_on = 21 ('ReScheduled' in
+ * REMARKS_FOR), every one of them carrying appointment_on, stopping dead on
+ * 2026-04-29 — the day the Node backend took over and started writing 1.
+ * So 21 is a RESTORATION, not an invention.
+ *
+ * WHAT IS PINNED NOW:
+ *   1. reschedule still goes through the ONE writer (job-comment.addComment) —
+ *      never a private INSERT. Unchanged, and the reason this file exists.
+ *   2. It sends comment_on = 21, so the row is identifiable as a reschedule.
+ *   3. It sends job_stage = the job's status AT THE MOMENT OF THE RESCHEDULE,
+ *      which is what answers "it was rescheduled while in Pending to Close".
+ *   4. Everything ELSE still matches Add Remarks exactly (commented_by, the
+ *      reason, the text) — the two paths must not drift on any other axis.
+ *
+ * THE ACCEPTED COST: reports grouping on comment_on = 1 no longer see
+ * reschedules in that bucket. That is the intended behaviour change.
  *
  * Non-destructive: fake pool, no real DB. Runner: `node --test`.
  */
@@ -32,15 +44,23 @@ const { installFakePool } = require('./helpers/fake-pool');
 process.env.WEBHOOK_OUTBOUND_ENABLED = 'false';
 
 const EXISTING = {
-  job_id: 42, fk_easyfixter_id: null, time_slot: null,
+  // job_status 20 = Pending to Close on App — the bucket ops reported this
+  // against, and what the audit row must now record as job_stage.
+  job_id: 42, job_status: 20, fk_easyfixter_id: null, time_slot: null,
   scheduled_date_time: '2026-09-15 09:00:00', fk_scheduled_by: 9,
 };
 
 const fake = installFakePool([
+  // Answers hasJobStageColumn's INFORMATION_SCHEMA probe with one row, i.e.
+  // "this deploy HAS tbl_job_comment.job_stage" — the line every job_stage
+  // assertion below depends on. (The probe is not a SHOW COLUMNS query; a
+  // matcher written for one would never fire.)
   [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
-  [/SHOW COLUMNS FROM tbl_job_comment LIKE 'job_stage'/i, [{ Field: 'job_stage' }]],
   [/SHOW COLUMNS/i, []],
-  [/SELECT job_id, fk_easyfixter_id, time_slot/i, [EXISTING]],
+  // Tolerant of added columns on purpose: this matcher broke when job_status
+  // joined the SELECT, and the failure mode was a silent 'job not found'
+  // rather than anything pointing at the fake.
+  [/SELECT job_id,.*fk_easyfixter_id, time_slot/i, [EXISTING]],
   [/INSERT INTO tbl_job_comment/i, () => ({ insertId: 555, affectedRows: 1 })],
   // addComment reads the row back and shapes it before returning; without this
   // the read comes back empty and the shaper throws on undefined.
@@ -84,13 +104,15 @@ test('reschedule writes its remark through addComment, not a private INSERT', as
   const { jobId, payload } = calls[0];
   assert.equal(jobId, 42);
   assert.equal(payload.comments, 'Customer asked for Saturday');
-  assert.equal(payload.comment_on, 1, 'the same legacy stage code AddRemarksDialog sends');
+  assert.equal(payload.comment_on, 21, "the legacy 'ReScheduled' bucket — NOT the generic 1");
   assert.equal(payload.commented_by, 77, 'the acting CRM user, not the technician');
   assert.equal(payload.enum_reason_id, REASON_ID, 'the reason the operator picked, verbatim');
   // The one deliberate addition: the new promise. Add Remarks has none.
   assert.equal(payload.appointment_on, NEW_TIME_STORED);
-  // And the one thing it must NOT invent — see the parity test below.
-  assert.equal(payload.job_stage, undefined, 'reschedule sends no job_stage, exactly as Add Remarks does not');
+  // The stage the job was rescheduled FROM. reschedule()'s UPDATE never
+  // touches job_status, so reading it off `existing` before the write is
+  // correct, not a race.
+  assert.equal(payload.job_stage, 20, 'the status it was rescheduled FROM (Pending to Close on App)');
 });
 
 /* ── The rows the two paths actually store ───────────────────────────────── */
@@ -105,43 +127,83 @@ async function storedRow(payload) {
   return Object.fromEntries(cols.map((c, i) => [c, ins.params[i]]));
 }
 
-test('the reschedule row and the Add Remarks row differ ONLY in appointment_on', async () => {
+test('the two rows differ in EXACTLY the two ways a reschedule is different', async () => {
   /*
    * The reschedule payload is what the test above captured off the service.
    * The Add Remarks payload is what the route builds: the dialog's body
-   * (comments + comment_on + the reason) plus commented_by from req.user —
-   * routes/admin/jobs.js spreads `...req.body` and stamps the actor. The CRM's
-   * AddRemarksDialog sends NO job_stage, which is why both rows store NULL.
+   * (comments + comment_on + the reason), plus commented_by from req.user and
+   * job_stage from req.scopedJob.job_status — routes/admin/jobs.js spreads
+   * `...req.body` and stamps both (pinned in admin-job-comment-stage.test.js).
+   * So for the same job at the same status, the two stages AGREE.
+   *
+   * The POINT of asserting the difference set exactly, rather than just the
+   * two fields: it still catches the two paths drifting apart on any OTHER
+   * axis (the actor, the reason, the text, the stage), which was the original
+   * reason this file was written and is still worth keeping.
    */
   const rescheduleRow = await storedRow({
     comments: 'Customer asked for Saturday',
-    comment_on: 1,
+    comment_on: 21,
     commented_by: ACTOR.user_id,
     appointment_on: NEW_TIME_STORED,
     enum_reason_id: REASON_ID,
+    job_stage: 20,
   });
   const addRemarksRow = await storedRow({
     comments: 'Customer asked for Saturday',
     comment_on: 1,
     commented_by: ACTOR.user_id,
     enum_reason_id: REASON_ID,
+    job_stage: 20,
   });
 
   const differing = Object.keys(rescheduleRow)
-    .filter((k) => String(rescheduleRow[k]) !== String(addRemarksRow[k]));
-  assert.deepEqual(differing, ['appointment_on'],
-    'the two paths must store identical rows apart from the appointment reschedule promises');
-  assert.equal(addRemarksRow.appointment_on, null, 'a remark makes no promise about a date');
+    .filter((k) => String(rescheduleRow[k]) !== String(addRemarksRow[k]))
+    .sort();
+  assert.deepEqual(differing, ['appointment_on', 'comment_on'],
+    'a reschedule differs by its bucket and its promise — and nothing else');
+
+  assert.equal(rescheduleRow.comment_on, 21, "the 'ReScheduled' bucket");
+  assert.equal(addRemarksRow.comment_on, 1, 'an ordinary remark stays in the generic bucket');
   assert.equal(rescheduleRow.appointment_on, NEW_TIME_STORED);
+  assert.equal(addRemarksRow.appointment_on, null, 'a remark makes no promise about a date');
 });
 
-test('both rows leave job_stage NULL — neither path supplies one', async () => {
-  // Not an oversight to "fix": the CRM's own Add Remarks dialog sends no
-  // job_stage, so stamping one on the reschedule side alone would make the two
-  // rows differ on the very axis reports group by.
-  const row = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, enum_reason_id: REASON_ID });
+test('the writer stores the stage it is given — and stores NULL only when given none', async () => {
+  const rescheduleRow = await storedRow({
+    comments: 'x', comment_on: 21, commented_by: 77,
+    enum_reason_id: REASON_ID, job_stage: 20,
+  });
   assert.match(commentInsert().sql, /job_stage/, 'the column IS written when the deploy has it');
-  assert.equal(row.job_stage, null, 'and the value is NULL, because nobody supplied one');
+  assert.equal(rescheduleRow.job_stage, 20, 'the status the job was rescheduled from');
+
+  const unstamped = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, enum_reason_id: REASON_ID });
+  assert.equal(unstamped.job_stage, null, 'nobody supplied one, so it stays NULL');
+});
+
+test('status 0 is a stage, not "not recorded" — and "" still is', async () => {
+  // job_status 0 = Pending for Scheduling, the commonest status to reschedule
+  // FROM. The writer used `|| null`, which stored every one of those as NULL.
+  const zero = await storedRow({ comments: 'x', comment_on: 21, commented_by: 77, job_stage: 0 });
+  assert.equal(zero.job_stage, 0, 'a reschedule from Pending for Scheduling keeps its stage');
+
+  // The Add Remarks schema admits '' — that one IS "not recorded".
+  const blank = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, job_stage: '' });
+  assert.equal(blank.job_stage, null);
+});
+
+test('addComment ACCEPTS 21 — without it the audit row vanishes silently', async () => {
+  /*
+   * The trap this guards. addComment rejects any comment_on outside STAGES with
+   * a 400, and reschedule() calls it inside a non-fatal try/catch. So if 21 were
+   * ever dropped from STAGES, nothing would throw, nothing would go red — the
+   * reschedule would simply stop writing its comment row, which is the exact
+   * defect this whole change set out to fix.
+   */
+  const { STAGES } = jobComments;
+  assert.ok(STAGES[21], 'STAGES must know 21, or the non-fatal catch swallows every reschedule audit');
+  const row = await storedRow({ comments: 'x', comment_on: 21, commented_by: 77 });
+  assert.equal(row.comment_on, 21);
 });
 
 test('the reason id is stored as given — the action TYPE is only implied by it', async () => {

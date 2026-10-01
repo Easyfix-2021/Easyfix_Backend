@@ -3981,6 +3981,27 @@ async function getByIdCore(jobId) {
             ow.user_name AS owner_name,
             cr.user_name AS created_by_name,
             (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            /*
+             * WHO authorized the job, as a NAME. The CRM's Audit & History card
+             * was rendering the raw j.approved_by_client_contact integer in its
+             * "Approved By" cell, so an authorized job showed a number (1639).
+             *
+             * The approver is the CLIENT CONTACT, not a tbl_user: the client
+             * approval path writes approved_by_client_contact alongside
+             * approved_on_date_time (routes/client/index.js), and the public
+             * estimate route already resolves it through the same table.
+             *
+             * NOT j.approved_by_client, which looks like a person and is not —
+             * it is a status flag holding 0/1/2 (job-export.service.js filters
+             * on = 0 / = 2), and joining it to tbl_user coincidentally
+             * resolves id 2 to a real operator on 94k rows.
+             *
+             * Correlated subquery rather than a JOIN because tbl_client_contacts
+             * is already joined once on a DIFFERENT column (reporting_contact_id)
+             * — same shape as cancelled_by_name above.
+             */
+            (SELECT cc.contact_name FROM tbl_client_contacts cc
+              WHERE cc.id = j.approved_by_client_contact LIMIT 1) AS approved_by_name,
             (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
             /* The two app-REQUEST reason texts (see buildAppRequest below).
                Separate aliases, not one COALESCE like the LIST's
@@ -8459,9 +8480,10 @@ async function listOffers(jobId, { sweep = true } = {}) {
  *   2. scheduling_history (reason_id + reschedule_reason) — same shape as assign
  *   3. any OPEN offers on this job → EXPIRED (they were made for the OLD slot,
  *      so a tech must not be able to accept a now-stale appointment)
- * Then a tbl_job_comment audit row (comment_on=1, enum_reason_id, remarks) is
- * added outside the txn (addComment also mirrors to tbl_job.remarks). Returns
- * the refreshed job detail.
+ * Then a tbl_job_comment audit row (comment_on=21 'ReScheduled', enum_reason_id,
+ * remarks, job_stage = the status it was rescheduled FROM) is added outside the
+ * txn (addComment also mirrors to tbl_job.remarks). Returns the refreshed job
+ * detail.
  */
 async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason, remarks }, actor) {
   logger.info('Reschedule job · id=' + jobId + ' · reasonId=' + reasonId);
@@ -8471,7 +8493,7 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
   // being REPLACED in the 'Re-Scheduling' history row at the end; both are
   // overwritten by the UPDATE below, so they have to be captured up front.
   const [[existing]] = await pool.query(
-    'SELECT job_id, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job WHERE job_id = ? LIMIT 1',
+    'SELECT job_id, job_status, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job WHERE job_id = ? LIMIT 1',
     [jobId],
   );
   if (!existing) { const err = new Error('job not found'); err.status = 404; throw err; }
@@ -8583,16 +8605,38 @@ async function reschedule(jobId, { requestedDateTime, reasonId, rescheduleReason
     logger.warn('Reschedule scheduling_history insert failed (non-fatal) · id=' + jobId + ' · ' + e.message);
   }
 
-  // Comment audit — addComment uses the pool + mirrors the latest remark to
-  // tbl_job.remarks. comment_on=1 (lifecycle/schedule), reason FK in enum_reason_id,
-  // new promised time in appointment_on, actor = CRM user.
+  /*
+   * Comment audit — addComment uses the pool + mirrors the latest remark to
+   * tbl_job.remarks. Reason FK in enum_reason_id, new promised time in
+   * appointment_on, actor = CRM user.
+   *
+   * comment_on = 21 ('ReScheduled'), NOT 1 ('Scheduling') — changed 2026-09-30
+   * per ops. This reverses the parity pinned by
+   * tests/job-reschedule-comment-parity.test.js, deliberately: that test's
+   * premise was that a reschedule and an Add Remarks are "one kind of event"
+   * and should store identical rows. They are not. A reschedule moves the
+   * appointment; a remark says something about the job. Legacy agreed and had
+   * a dedicated bucket for it (70,347 rows under 21, every one carrying
+   * appointment_on, right up to the 2026-04-29 Node cutover) — filing them
+   * under 1 made every reschedule read as a generic "Scheduling" row in the
+   * CRM's Comments tab, indistinguishable from an ordinary remark.
+   *
+   * job_stage = the job's status AT THE MOMENT OF THE RESCHEDULE, which is the
+   * question ops actually asks ("it was rescheduled while in Pending to
+   * Close"). Read off `existing` above rather than re-queried, and correct
+   * either way: the reschedule UPDATE does not touch job_status.
+   *
+   * Consequence to know about: reports grouping on comment_on = 1 no longer
+   * see reschedules in that bucket.
+   */
   try {
     await require('./job-comment.service').addComment(jobId, {
       comments: remarks,
-      comment_on: 1,
+      comment_on: 21,
       commented_by: actor?.user_id || null,
       appointment_on: newRequested,
       enum_reason_id: reasonId || null,
+      job_stage: existing.job_status ?? null,
     });
   } catch (e) {
     logger.warn('Reschedule audit comment failed (non-fatal) · id=' + jobId + ' · ' + e.message);
