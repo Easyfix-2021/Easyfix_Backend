@@ -25,10 +25,11 @@
  * (cancel_by) but writes nothing for the BOOKED transition, so "who confirmed
  * this job" is not directly stored.
  *
- * What IS reliable for THIS population: since 2026-10-01 setStatus() OVERWRITES
- * `fk_created_by` with the CRM user on every transition into BOOKED (before
- * that it only filled a NULL). So for jobs confirmed after that, fk_created_by
- * IS the confirming operator — even when an integration had set it.
+ * What IS reliable for THIS population: setStatus() now OVERWRITES
+ * `fk_created_by` with the CRM user on a first confirmation (Unconfirmed or
+ * Enquiry → Booked; before that it only filled a NULL). So for jobs confirmed
+ * after that, fk_created_by IS the confirming operator — even when an
+ * integration had set it.
  *
  * The gap is honest and bounded: a job confirmed BEFORE 2026-10-01 that already
  * had a creator (Book New Call, or an integration user) keeps that ORIGINAL
