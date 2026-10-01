@@ -32,6 +32,19 @@ const logger = require('../logger');
  *   4  = in_progress (new-app addition; legacy never wrote this)
  *  16  = call_later  (Unreachable outcome — Confirm & Schedule popup)
  *  17  = enquiry     (Enquiry outcome — Confirm & Schedule popup)
+ *  21  = rescheduled (the legacy ReScheduled bucket — see below)
+ *
+ * 21 IS NOT NEW, IT IS A RESTORATION. Legacy filed every reschedule under
+ * comment_on 21 ('ReScheduled' in REMARKS_FOR): 70,347 rows on QA, 100% of
+ * them carrying appointment_on, stopping dead on 2026-04-29 — the day the Node
+ * backend took over and started writing 1 ('Scheduling') instead. That made a
+ * reschedule indistinguishable from an ordinary Add Remarks in the CRM's
+ * Comments tab, which is the defect this restores (ops, 2026-09-30).
+ *
+ * It MUST be listed here: addComment rejects any comment_on outside this map
+ * with a 400, and job.service reschedule() calls it inside a non-fatal
+ * try/catch — so a 21 that this map did not know would not error loudly, it
+ * would silently write no row at all.
  */
 const STAGES = Object.freeze({
   1: 'created',
@@ -40,6 +53,7 @@ const STAGES = Object.freeze({
   4: 'in_progress',
   16: 'call_later',
   17: 'enquiry',
+  21: 'rescheduled',
 });
 
 /*
@@ -73,6 +87,26 @@ function shapeRow(r) {
     comments: r.comments,
     comment_on: r.comment_on,
     stage: STAGES[r.comment_on] ?? 'unknown',
+    /*
+     * `stage` above is the COMMENT's bucket (comment_on). `job_stage` below is
+     * a different column entirely: the JOB's tbl_job.job_status at the moment
+     * the remark was filed — which is what answers "at which stage was this
+     * rescheduled". Same word, two domains; do not collapse them.
+     *
+     * Null means "not recorded" — never status 0, which is a real status. The
+     * legacy CRM stamped it on every reschedule and remark, so legacy history
+     * has it; the Node backend mostly stored NULL from the 2026-04-29 cutover
+     * until reschedule and Add Remarks resumed (2026-10-01). Also null on any
+     * deploy whose tbl_job_comment predates the column — listComments only
+     * selects it when the probe says it is there.
+     */
+    job_stage: r.job_stage ?? null,
+    /*
+     * The technician app's own reschedule ask (comment_on 8) puts its promised
+     * time HERE, not in appointment_on — so a reader that only knows
+     * appointment_on renders those rows dateless. Selected now so they don't.
+     */
+    requested_date_time: r.requested_date_time ?? null,
     created_on: r.created_on,
     appointment_on: r.appointment_on,
     commented_by: r.commented_by,
@@ -123,9 +157,25 @@ async function listComments(jobId) {
   // tbl_job.cancel_*) is deliberately NOT reproduced: this listing's top row
   // must stay the same row Manage Jobs' last_comment picks (see
   // tests/manage-jobs-columns.test.js).
+  /*
+   * job_stage is the OPTIONAL column (legacy deploys may not carry it), so it
+   * goes through the same probe addComment uses rather than being selected
+   * blind — an "Unknown column" here would take out the whole Comments tab,
+   * not just the one cell. NULL AS job_stage keeps the row shape identical
+   * either way, so shapeRow needs no branch.
+   *
+   * requested_date_time is NOT probed: it is a required column in
+   * scripts/schema-verify.js (tbl_job_comment), which is what guarantees it.
+   * recordRequestComment (services/mobile-job-lifecycle.service.js) writing it
+   * is no proof on its own — that INSERT sits in a non-fatal try/catch, so a
+   * missing column there would be swallowed, not reported.
+   */
+  const withJobStage = await hasJobStageColumn();
   const [rows] = await pool.query(
     `SELECT c.comment_id AS id, c.job_id, c.comments, c.comment_on, c.created_on,
-            c.appointment_on, c.commented_by, c.enum_reason_id, c.efr_id,
+            c.appointment_on, c.requested_date_time, c.commented_by,
+            ${withJobStage ? 'c.job_stage' : 'NULL AS job_stage'},
+            c.enum_reason_id, c.efr_id,
             u.user_name, atr.action_desc AS enum_desc,
             c.job_escalated_by, e.efr_name,
             atr.is_new AS reason_is_new, ut.type AS reason_user_type
@@ -223,7 +273,8 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
   }
   const stage = Number(comment_on);
   if (!STAGES[stage]) {
-    const e = new Error('comment_on must be one of: 1 (created/schedule), 2 (check_in), 3 (check_out), 4 (in_progress), 16 (call_later), 17 (enquiry)');
+    const e = new Error('comment_on must be one of: '
+      + Object.entries(STAGES).map(([k, v]) => k + ' (' + v + ')').join(', '));
     e.status = 400;
     throw e;
   }
@@ -258,7 +309,10 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
       commented_by || null,
       enum_reason_id || null,
       efr_id || null,
-      effectiveJobStage || null,
+      // ?? not ||: job_status 0 (Pending for Scheduling) is a real stage — the
+      // commonest one to reschedule from — and `|| null` was storing it as
+      // "not recorded". '' (the Add Remarks schema allows it) still maps to NULL.
+      effectiveJobStage === '' ? null : (effectiveJobStage ?? null),
     ];
   } else {
     insertSql = `INSERT INTO tbl_job_comment

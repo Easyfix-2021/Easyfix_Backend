@@ -2976,6 +2976,15 @@ router.post('/:id/comments',
       const created = await jobComments.addComment(req.params.id, {
         ...req.body,
         commented_by: req.user?.user_id,
+        /*
+         * The job's status when the remark was filed — legacy's saveJobComment
+         * (JobDaoImpl.java:4565) stamped it on every remark, and the CRM's Stage
+         * column renders it. Taken from the row scopedJob already loaded, and
+         * set AFTER the spread so the server, not the body, decides: the column
+         * is an int and the schema above still admits a string label.
+         * addComment still pins 16/17 outcomes to 9.
+         */
+        job_stage: req.scopedJob?.job_status ?? null,
       });
       logger.info('Job comment added · jobId=' + req.params.id);
       res.status(201);

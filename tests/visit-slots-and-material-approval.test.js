@@ -607,7 +607,8 @@ test('reschedule() issues no query against the removed tbl_job_auto_schedule tab
   db.pool.query = async (sql, params) => {
     const text = Array.isArray(sql) ? String(sql[0]) : String(sql);
     seen.push(text);
-    if (/SELECT job_id, fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job/i.test(text)) {
+    // Tolerant of added columns (job_status joined this SELECT 2026-09-30).
+    if (/SELECT job_id,.*fk_easyfixter_id, time_slot, scheduled_date_time, fk_scheduled_by FROM tbl_job/i.test(text)) {
       return [[{ job_id: JOB_ID, fk_easyfixter_id: 4242, time_slot: null, scheduled_date_time: null, fk_scheduled_by: null }], []];
     }
     return [[], []];
