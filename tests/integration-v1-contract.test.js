@@ -19,6 +19,7 @@ const {
   catalogShapeForRole,
   CATALOG_SHAPES,
   resolveCityId,
+  resolveReportingContactId,
   paymentCollectedByCode,
   PAYMENT_COLLECTED_BY,
   jobUiStatus,
@@ -331,4 +332,37 @@ test('an absent paymentCollectedBy is null so the client default applies', () =>
   assert.equal(paymentCollectedByCode(undefined), null);
   assert.equal(paymentCollectedByCode(null), null);
   assert.equal(paymentCollectedByCode('   '), null);
+});
+
+// ─── reporting_contact_id resolution ─────────────────────────────────
+// Contacts of client 213: id 2508 ↔ a@decathlon.com. Anything else misses.
+const contactsPool = () => makeFakePool([[/FROM tbl_client_contacts/i, (sql, params) => {
+  // Like the real table: an id lookup that drops the client_id filter finds the row
+  // whatever client asked — the fake must not supply the scoping the SQL omits.
+  if (/WHERE id = \?/.test(sql)) {
+    if (params[0] !== 2508) return [];
+    return !/client_id = \?/.test(sql) || params[1] === 213 ? [{ id: 2508 }] : [];
+  }
+  return params[0] === 213 && params[1] === 'a@decathlon.com' ? [{ id: 2508 }] : [];
+}]]);
+
+test('an explicit reportingContactId of the SAME client is used as sent', async () => {
+  const fake = contactsPool();
+  assert.equal(await resolveReportingContactId(fake.pool, 213, { reportingContactId: '2508' }), 2508);
+  assert.equal(fake.calls.length, 1, 'no email fallback needed');
+});
+
+test('another client’s contact id is ignored, then the SPOC email decides', async () => {
+  const fake = contactsPool();
+  assert.equal(await resolveReportingContactId(fake.pool, 999, { reportingContactId: 2508 }), null,
+    'a partner cannot attribute a job into another client’s tree');
+  assert.equal(await resolveReportingContactId(contactsPool().pool, 213,
+    { reportingContactId: 7, clientSpocEmail: ' a@decathlon.com ' }), 2508);
+});
+
+test('no id and no matching SPOC email resolves to null', async () => {
+  const fake = contactsPool();
+  assert.equal(await resolveReportingContactId(fake.pool, 213, { clientSpocEmail: 'x@y.com' }), null);
+  assert.equal(await resolveReportingContactId(fake.pool, 213, {}), null);
+  assert.equal(await resolveReportingContactId(fake.pool, 213), null);
 });

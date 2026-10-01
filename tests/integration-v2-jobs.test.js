@@ -80,6 +80,7 @@ test('the field mapping matches v1 exactly — v2 changes the envelope, not the 
     'time_slot', 'client_ref_id', 'client_spoc_name', 'client_spoc_email', 'client_spoc',
     'additional_name', 'additional_number', 'helper_req', 'efr_special_notes',
     'booking_cut_off_time_slot', 'collected_by', 'service_type_ids',
+    'reporting_contact_id', 'fk_created_by',
   ];
   const c = code(SRC);
   for (const f of fields) assert.ok(c.includes(f), `v2 must map ${f} like v1 does`);

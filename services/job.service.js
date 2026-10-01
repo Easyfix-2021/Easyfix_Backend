@@ -5755,7 +5755,9 @@ async function create(input, actor) {
         // identity shape) the implicit coercion silently writes 0 or
         // NULL. Number()-coerce + falsy guard makes the binding
         // explicit and matches the runtime intent.
-        (() => { const n = Number(actor?.user_id); return Number.isFinite(n) && n > 0 ? n : null; })(),
+        // input.fk_created_by is the fallback for actor-less callers (partner API
+        // → 'System-crm'); passing it as the actor instead would also make it job_owner.
+        (() => { const n = Number(actor?.user_id || input.fk_created_by); return Number.isFinite(n) && n > 0 ? n : null; })(),
         // initial_status — legacy footer-button parity. Defaults to
         // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
         // at the booking modal's footer to route the new row to the
