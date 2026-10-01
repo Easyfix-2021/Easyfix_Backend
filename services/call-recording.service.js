@@ -89,4 +89,29 @@ async function resolveRecordingKey(jobCallerInfoId) {
   }
 }
 
-module.exports = { ensureRecordingInS3, resolveRecordingKey };
+/*
+ * ensureStereoRecordingInS3({ jci, callUuid }) — Call Analytics' audio for a
+ * CONFERENCE call (2026-10-01). The file a conference leg stores and plays is
+ * the MPC room recording, which is MONO; Call Analytics needs ch0 agent /
+ * ch1 customer. That stereo file is the <Record> safety net, which Plivo files
+ * under the OPERATOR leg's call_uuid (verified: that lookup returns only it —
+ * the room recording sits under another leg). Cached under its own key and
+ * never written to tbl_job_caller_info.recording, so playback (and the mono
+ * file ensureRecordingInS3 may already have cached) is untouched.
+ * The fallback survives only while Call Analytics is on — see
+ * pruneConferenceFallback — so a conference from a period with it off has
+ * none and returns null.
+ */
+async function ensureStereoRecordingInS3({ jci, callUuid }) {
+  if (!s3.isEnabled() || !callUuid) return null;
+  const key = `${s3.buildCallRecordingKey(jci)}_stereo`;
+  if (await s3.exists(key)) return key;
+  const meta = await plivo.fetchRecordingMeta({ callUuid });
+  if (!meta.ok || !meta.url) return null;
+  const dl = await plivo.downloadRecording(meta.url);
+  if (!dl.ok || !dl.buffer) return null;
+  await s3.putAtKey({ key, buffer: dl.buffer, contentType: dl.contentType || 'audio/mpeg' });
+  return key;
+}
+
+module.exports = { ensureRecordingInS3, ensureStereoRecordingInS3, resolveRecordingKey };
