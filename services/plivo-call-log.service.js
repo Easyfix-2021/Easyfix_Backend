@@ -304,8 +304,8 @@ async function markAnswered(jci, callUuid, recordRequested = null) {
  * for this jci. Without the filter one recording would be filed on all three
  * legs and the Calls list would offer the same audio three times.
  */
-// The primary leg's stored recording + whether it is a conference — the
-// recording-callback reads it BEFORE writing, to find a redundant fallback.
+// The primary leg's stored recording + whether it is a conference — read by
+// the recording-callback when a fill-if-empty write found the row taken.
 async function getPrimaryRecording(jci) {
   if (jci == null) return null;
   try {
@@ -317,17 +317,54 @@ async function getPrimaryRecording(jci) {
 }
 // onlyIfEmpty: never overwrite a stored recording (the <Record> safety net
 // must not clobber the conference room recording — see startRoomRecording).
+// Returns the rows written (0 = not written: onlyIfEmpty found the row taken,
+// or the write failed) — the recording-callback decides on it.
 async function setRecording(jci, { url, id, duration } = {}, { onlyIfEmpty = false } = {}) {
-  if (jci == null || !url) return;
+  if (jci == null || !url) return 0;
   try {
-    await pool.query(
+    const [r] = await pool.query(
       `UPDATE tbl_plivo_call_log
           SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = ?
         WHERE job_caller_info_id = ?${await primaryLegFilter()}${onlyIfEmpty ? ' AND recording_url IS NULL' : ''}`,
       [String(url), id || null, duration != null ? Number(duration) : null, new Date(), jci],
     );
-    logger.info('Plivo call-log recording stored · jci=' + jci + ' · id=' + (id || '?'));
-  } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecording failed (non-fatal — columns may be pre-migration)'); }
+    const n = (r && r.affectedRows) || 0;
+    logger.info('Plivo call-log recording ' + (n ? 'stored' : 'NOT stored (row already has one)') + ' · jci=' + jci + ' · id=' + (id || '?'));
+    return n;
+  } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: setRecording failed (non-fatal — columns may be pre-migration)'); return 0; }
+}
+
+/*
+ * replaceRecording(jci, rec) — overwrite the stored recording and return what
+ * it replaced, ATOMICALLY: SELECT … FOR UPDATE then UPDATE in one transaction.
+ * A conference's two recording callbacks can land in the same second; with a
+ * plain read-then-write both read an empty row and neither sees the other's
+ * file (2026-10-01: jci 1063671 / 1063710 kept both). The row lock makes the
+ * concurrent fill-if-empty setRecording wait, so one of the two always sees
+ * the other. Returns { previousId, conferenceId } or null on failure.
+ */
+async function replaceRecording(jci, { url, id, duration } = {}) {
+  if (jci == null || !url) return null;
+  let conn;
+  try {
+    const filter = await primaryLegFilter();
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const [[prev] = []] = await conn.query(
+      `SELECT recording_id, conference_id FROM tbl_plivo_call_log WHERE job_caller_info_id = ?${filter} LIMIT 1 FOR UPDATE`, [jci]);
+    await conn.query(
+      `UPDATE tbl_plivo_call_log
+          SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = ?
+        WHERE job_caller_info_id = ?${filter}`,
+      [String(url), id || null, duration != null ? Number(duration) : null, new Date(), jci]);
+    await conn.commit();
+    logger.info('Plivo call-log recording replaced · jci=' + jci + ' · id=' + (id || '?') + ' · was=' + ((prev && prev.recording_id) || '-'));
+    return { previousId: (prev && prev.recording_id) || null, conferenceId: (prev && prev.conference_id) || null };
+  } catch (e) {
+    if (conn) await conn.rollback().catch(() => {});
+    logger.warn({ err: e.message, jci }, 'plivo-call-log: replaceRecording failed (non-fatal)');
+    return null;
+  } finally { if (conn) conn.release(); }
 }
 
 // Record whether Plivo was asked to record this call (1/0). Best-effort — the
@@ -757,6 +794,7 @@ module.exports = {
   markAnswered,
   setRecordingRequested,
   setRecording,
+  replaceRecording,
   getPrimaryRecording,
   markTerminalByJci,
   markTerminalByCallUuid,
