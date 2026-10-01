@@ -7453,6 +7453,29 @@ async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, resche
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
       [new Date(), ...crRelease.params, jobId],
     );
+    /*
+     * The OUTGOING technician's own ACCEPTED row stays ACCEPTED — they did
+     * accept, and acceptance stats count that — but is stamped released, so it
+     * no longer reads as "still holds this job" (job 543336: 11599's row read
+     * accepted after the 2026-09-30 reassign to 4204). Latest row only, as in
+     * applyUnassignLocked; responded_at untouched (it is the first-accept
+     * record). No-op on a deploy without the column.
+     */
+    if (releasedTechId != null && crRelease.params.length) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET closed_reason = ?
+          WHERE job_offer_id = (
+            SELECT latest_id FROM (
+              SELECT MAX(job_offer_id) AS latest_id
+                FROM tbl_job_offer
+               WHERE job_id = ? AND fk_easyfixter_id = ?
+            ) latest_offer
+          )
+            AND offer_status = ${OFFER_STATUS.ACCEPTED}`,
+        [...crRelease.params, jobId, releasedTechId],
+      );
+    }
     await conn.commit();
     return releasedTechId;
   } catch (e) {

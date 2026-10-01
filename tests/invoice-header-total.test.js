@@ -37,6 +37,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const FINANCE = fs.readFileSync(path.join(__dirname, '..', 'routes/admin/finance.js'), 'utf8');
+// The printed-line builder (loadInvoiceArtifactData) moved here on 2026-09-30 so
+// the client portal renders the same PDF; the header SQL stayed in finance.js.
+const ARTIFACT = fs.readFileSync(path.join(__dirname, '..', 'services/invoice-artifact.service.js'), 'utf8');
 const code = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
 /*
@@ -127,14 +130,14 @@ test('the printed line and the header now share ONE definition', () => {
    * Keeping the old assertion would have meant reintroducing the second copy to
    * satisfy a test written to stop exactly that.
    */
-  const sql = code(FINANCE);
+  const sql = code(ARTIFACT);
   assert.match(
     sql,
     /line_total: s\.line_total,/,
     'the printed line must take its total from the shared helper, not recompute it',
   );
   assert.ok(
-    !/line_total: charge \* qty \+ mat/.test(sql),
+    !/line_total: charge \* qty \+ mat/.test(sql + code(FINANCE)),
     'a second hand-written copy of the formula must not reappear here',
   );
   assert.match(

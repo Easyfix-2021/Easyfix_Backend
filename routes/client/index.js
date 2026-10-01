@@ -1030,9 +1030,51 @@ router.get('/jobs/:id', async (req, res, next) => {
      */
     const job = await loadJobInScope(req, res, 'Fetch');
     if (!job) return;
-    modernOk(res, job);
+    modernOk(res, { ...job, images: await withBrowserImageUrls(job.images) });
   } catch (e) { next(e); }
 });
+
+/*
+ * GET /api/client/jobs/:id/documents — token-free, HEAD-verified URLs for the
+ * two job-keyed legacy PDFs, or null when absent (2026-09-30). The portal built
+ * these as `${FILE_BASE}/feedback_jobs/…` with FILE_BASE the relative
+ * `/easydoc`, i.e. on client.easyfix.in, which serves no /easydoc: every
+ * Jobsheet-fallback and Estimate link was a 404. A separate endpoint, not a
+ * field on GET /jobs/:id, so the drawer and Completed page don't pay two
+ * legacy-host probes for links they never show.
+ */
+router.get('/jobs/:id/documents', async (req, res, next) => {
+  try {
+    const job = await loadJobInScope(req, res, 'Documents');
+    if (!job) return;
+    const [jobsheet_url, estimate_url] = await Promise.all([
+      imageDelivery.resolveLegacyFile('feedback_jobs', `feedback${job.job_id}.pdf`),
+      imageDelivery.resolveLegacyFile('estimateapproval', `Estimate_Approval_${job.job_id}.pdf`),
+    ]);
+    modernOk(res, { jobsheet_url, estimate_url });
+  } catch (e) { next(e); }
+});
+
+/*
+ * Make every images[].image_url something a browser can load with NO auth
+ * (2026-09-30). getById fills it via s3Storage.resolveImageUrl, which returns
+ * a presigned URL for S3 rows but a RELATIVE `/easydoc/upload_jobs/<name>` for
+ * legacy ones — and the portal host serves no /easydoc, so those tiles 404'd,
+ * while the fallback route the portal used instead 401s from an <img>.
+ *
+ * Only non-absolute URLs are re-resolved (S3 rows were just presigned; a second
+ * exists() round trip buys nothing), through the shared delivery chain, which
+ * HEAD-verifies the legacy host. `null` = nothing loadable → the empty state.
+ * Scoped to THIS response rather than getById: getById is also every route's
+ * scope check, and legacy probes there would run once per tile per image.
+ */
+async function withBrowserImageUrls(images) {
+  return Promise.all((images || []).map(async (im) => {
+    if (/^https?:\/\//i.test(String(im.image_url || ''))) return im;
+    const d = await imageDelivery.resolve(im.image);
+    return { ...im, image_url: d.url || null };
+  }));
+}
 
 // Approve / reject / escalate
 router.patch('/jobs/:id/approve', async (req, res, next) => {
@@ -1256,6 +1298,8 @@ router.post('/jobs/:id/cancel', validate(Joi.object({
 // a client can only attach to its own jobs.
 const multerClientImg = require('multer');
 const jobImageService = require('../../services/job-image.service');
+const imageDelivery = require('../../services/job-image-delivery');
+const invoiceArtifact = require('../../services/invoice-artifact.service');
 const clientImageUpload = multerClientImg({
   storage: multerClientImg.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
@@ -3278,6 +3322,35 @@ router.get('/dashboard-summary', async (req, res, next) => {
 });
 
 /*
+ * GET /api/client/invoices/:id/pdf — the invoice PDF, rendered by the SAME
+ * service the admin CRM uses (services/invoice-artifact.service.js).
+ *
+ * The portal linked `${FILE_BASE}/<file_path_pdf>` instead: the wrong host
+ * (the portal serves no /easydoc), the wrong directory (the legacy files sit
+ * under /easydoc/client_invoice/), and files that no longer exist — the
+ * legacy generator stopped in Feb 2018, and only a minority of rows ever had
+ * a path. This renders every raised invoice (2026-09-30).
+ *
+ * Bearer-authed: the portal downloads it with the header (Blob → save), so no
+ * token ever sits in a URL. Another client's id, or an unraised draft, is a
+ * 404 identical to an unknown one.
+ */
+router.get('/invoices/:id/pdf', async (req, res, next) => {
+  try {
+    const invoiceId = Number(req.params.id);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) return modernError(res, 400, 'invalid id');
+    logger.info('Client invoice PDF · id=' + invoiceId + ' · clientId=' + req.spoc.client_id);
+    const [[own]] = await pool.query(
+      'SELECT id FROM tbl_client_invoice WHERE id = ? AND fk_client_id = ? AND is_raised = 1 LIMIT 1',
+      [invoiceId, req.spoc.client_id]);
+    if (!own) return modernError(res, 404, 'invoice not found');
+    const data = await invoiceArtifact.loadInvoiceArtifactData(invoiceId);
+    if (!data) return modernError(res, 404, 'invoice not found');
+    invoiceArtifact.sendInvoicePdf(res, data);
+  } catch (e) { next(e); }
+});
+
+/*
  * GET /api/client/invoices — the client's raised invoices + aging.
  *
  * Client-level (NOT team-scoped) — invoices live in tbl_client_invoice
@@ -4149,13 +4222,13 @@ router.get('/team/members', async (req, res, next) => {
  * browser. Scoped to SPOC's client_id (other clients' images 404 even
  * when the imageId is known).
  *
- * Resolution mirrors the admin route (routes/admin/jobs.js:1831):
- *   1. S3 (if enabled) — 302 to a presigned URL
- *   2. Local file under UPLOAD_JOB_FILES — res.sendFile
- *   3. FILE_BASE_URL absolute — 302 to Nginx-served path
- *   4. 404
+ * Resolution is services/job-image-delivery.js via serveResolvedImage — the
+ * same chain as the admin route (2026-09-30; this was a third private copy
+ * with no legacy-file-host branch, so every bare-filename row 404'd).
  *
- * Powers the Jobsheet button + the gallery thumbnails on the detail page.
+ * Bearer-authed, so an <img> or a new tab gets 401: the portal renders the
+ * token-free `images[].image_url` from GET /jobs/:id instead. This stays for
+ * API callers that send the header.
  */
 router.get('/jobs/:id/images/:imageId', async (req, res, next) => {
   try {
@@ -4176,59 +4249,7 @@ router.get('/jobs/:id/images/:imageId', async (req, res, next) => {
     );
     if (!row || !row.image) return modernError(res, 404, 'image not found');
 
-    const stored = String(row.image).trim();
-    const path = require('path');
-    const fs = require('fs');
-
-    // (1) S3 — presigned URL redirect
-    try {
-      const s3Storage = require('../../utils/s3-storage');
-      if (s3Storage.isEnabled && s3Storage.isEnabled()) {
-        const candidates = [stored];
-        if (!stored.startsWith('Job_Images/') && !stored.startsWith('JobSupportings/')) {
-          candidates.push(`JobSupportings/${path.basename(stored)}`);
-          candidates.push(`Job_Images/${path.basename(stored)}`);
-        }
-        for (const key of candidates) {
-          try {
-            if (await s3Storage.exists(key)) {
-              const url = await s3Storage.getPresignedUrl(key);
-              return res.redirect(url);
-            }
-          } catch { /* fall through to local */ }
-        }
-      }
-    } catch { /* s3 module not available — fall through */ }
-
-    // (2) Local file
-    const rootCandidates = [
-      process.env.UPLOAD_JOB_FILES,
-      process.env.UPLOAD_ROOT_PATH,
-      './uploads/upload_jobs',
-      './uploads',
-    ].filter(Boolean);
-    const relForms = [stored, path.basename(stored)];
-    for (const root of rootCandidates) {
-      const absRoot = path.resolve(root);
-      for (const rel of relForms) {
-        const candidate = path.resolve(absRoot, rel.replace(/^\/+/, ''));
-        if (!candidate.startsWith(absRoot + path.sep) && candidate !== absRoot) continue;
-        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-          return res.sendFile(candidate);
-        }
-      }
-    }
-
-    // (3) Absolute FILE_BASE_URL — Nginx fallback
-    const fileBase = process.env.FILE_BASE_URL || '';
-    if (/^https?:\/\//i.test(fileBase)) {
-      const url = stored.includes('/')
-        ? `${fileBase.replace(/\/+$/, '')}/${stored.replace(/^\/+/, '')}`
-        : `${fileBase.replace(/\/+$/, '')}/upload_jobs/${stored}`;
-      return res.redirect(url);
-    }
-
-    return modernError(res, 404, 'image file not found on disk');
+    await jobImageService.serveResolvedImage(res, row.image);
   } catch (e) { next(e); }
 });
 
