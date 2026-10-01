@@ -189,13 +189,26 @@ test('9 → 0 overwrites fk_created_by with the booking CRM user', async () => {
   assert.ok(upd.params.includes(17), 'the booking operator is bound');
 });
 
-test('0 → 0 re-submit and a technician actor leave fk_created_by alone', async () => {
-  scenario.jobMeta = { ...META, job_status: 0, fk_easyfixter_id: null };
-  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
-  assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, 'same-status is not a booking');
+test('a re-submit (0 → 0), a re-book (1 → 0) and a technician actor keep the existing booker', async () => {
+  for (const job_status of [0, 1]) {
+    fake.calls.length = 0;
+    scenario.jobMeta = { ...META, job_status, fk_easyfixter_id: null, fk_created_by: 555 };
+    try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
+    assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, `${job_status} → 0 is not a first confirmation`);
+    // The fake returns scenario.jobMeta whatever is projected, so pin the projection:
+    // without fk_created_by, `existing.fk_created_by == null` holds for EVERY job.
+    const meta = fake.calls.find((c) => /FROM\s+tbl_job\s+WHERE\s+job_id/i.test(c.sql));
+    assert.match(meta.sql, /fk_created_by/, 'getJobMeta must select fk_created_by');
+  }
 
   fake.calls.length = 0;
-  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null };
+  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null, fk_created_by: 555 };
   try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 'efr:88' }); } catch (e) { if (!e.__stop) throw e; }
   assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, 'a tech has no tbl_user row');
+});
+
+test('a booking with NO creator yet is stamped even outside 9/7 → 0', async () => {
+  scenario.jobMeta = { ...META, job_status: 1, fk_easyfixter_id: null, fk_created_by: null };
+  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
+  assert.match(lastUpdate().sql, /fk_created_by = \?/);
 });
