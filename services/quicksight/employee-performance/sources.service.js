@@ -280,7 +280,7 @@ function withoutCancelPrefix(v) {
  * null (compose shows an em dash), and the export's legacy literal 'null'
  * Zonal Manager becomes null (compose shows 'Unassigned').
  *
- * The block below `txid` is what the MTD Client Report's eleven sections read
+ * The block below `txid` is what the MTD Client Report's twelve sections read
  * (services/quicksight/mtd-report.service.js) and nothing else does yet. It is
  * HERE rather than in that service because every one of these values is a
  * column of the SAME export row the loaders already mapped — re-reading the
@@ -334,6 +334,48 @@ function jobFields(m, raw) {
     cancelReason: withoutCancelPrefix(m.cancelReason),
     cancelComment: withoutCancelPrefix(m.cancelComment),
     cancelBy: trimmed(m.cancelBy),
+    /*
+     * "Is Escalated" — the export's own flag, 1 when the job was escalated.
+     * mapExportRow runs it through jdbcInt, so a NULL / blank / unparsable
+     * column arrives as 0 rather than null and the flag is never three-valued.
+     *
+     * It is on EVERY set, unlike SDA below, because the template counts
+     * escalations across the whole of jobs in hand — completed, cancelled AND
+     * open — not over closures (template.html renderKpis / kpiNumbers:
+     * `if (C.esc[i] === 1) esc++;` sits OUTSIDE the `s === "C"` branch, and
+     * the tile reads "N% of jobs in hand"). An open job that has been
+     * escalated is the most interesting one there is, so putting this on the
+     * closed rows only would drop exactly the rows the tile exists for.
+     */
+    isEscalated: m.isEscalated,
+    /*
+     * "Tier" — the city's tier, which the export already writes as the DISPLAY
+     * label ("Tier - 2") and as '' when the city has none (job-export.service
+     * mapExportRow; the column is `city.tier` off the job's city). Kept as the
+     * export wrote it, with only a blank normalised to null the way `state` and
+     * `city` above are, so the one place that decides what a missing tier is
+     * CALLED is the report service, not four loaders.
+     *
+     * It is on EVERY set, like the flag above. Tier is a property of the JOB's
+     * city and therefore of the job at every stage of its life — it is not,
+     * like SDA below, a fact that only a closure has. The template agrees:
+     * tierAgingStats reads it on OPEN jobs (template.html:1770-1786), and
+     * cityStats' `tvote` reads it again on the ticket-created AND completed
+     * rows to label a city in the bottom-5 list (1810-1834). Putting it on the
+     * open set alone would mean adding it a second time the day that city list
+     * lands, which is exactly the drift this projection exists to prevent.
+     */
+    tier: trimmed(m.tier),
+    /*
+     * "SDA Status" is DELIBERATELY NOT HERE, and the asymmetry with the flag
+     * above is the point. The template reads it only inside its `s === "C"`
+     * branch, so it is a property of a CLOSURE and of nothing else, and
+     * loadClosedJobs already carries it as `sda` (m.sdaStatus) — the one place
+     * it is read. mapExportRow only computes it for jobs that reached the
+     * field, so on an open or cancelled row it would usually be null and,
+     * where it was not, it would be an invitation to divide by a denominator
+     * the owner never asked for ("SDA % of cancelled jobs" means nothing).
+     */
   };
 }
 
@@ -420,8 +462,8 @@ async function readFrozenSpocs(jobIds, db = pool) {
  *
  * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
  *        jobStatus, ticketDate, aging, cancelReason, cancelComment, cancelBy,
- *        dueTo, reason, spoc: null, spocUserId, spocName, spocInternal,
- *        spocSource: 'mapping' }  — resolvePeople() fills `spoc`.
+ *        isEscalated, tier, dueTo, reason, spoc: null, spocUserId, spocName,
+ *        spocInternal, spocSource: 'mapping' }  — resolvePeople() fills `spoc`.
  */
 async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {}) {
   const started = Date.now();
@@ -470,13 +512,23 @@ async function loadOpenJobs({ now = new Date(), verticalId, zonalManagerId } = {
  * Row: { jobId, clientId, date, spoc: null, spocUserId, spocName, spocInternal,
  *        spocSource: 'frozen'|'mapping', charge, margin, client, tat, sda, zm,
  *        vertical, tx, txid, aco: null, acoUserId, acoName, acoInternal,
- *        city, state, jobStatus, ticketDate, aging }
+ *        city, state, jobStatus, ticketDate, aging, isEscalated, tier,
+ *        checkinDate }
+ *
+ * `date` is the AUDIT & CHECKOUT day — the day this loader's window is read
+ * on — and `checkinDate` is the App CheckIn day, which is the same day or an
+ * earlier one. Both are carried because the MTD report counts a completed job
+ * on the first and offers the second beside it; see that service's
+ * `completedOnCheckin`.
  *
  * This is the one loader that PICKS its columns out of jobFields instead of
  * spreading it, because its row is also compose()'s first-seen table row. The
- * last five are the MTD Client Report's: completed jobs are split by city and
- * by days open there, and the open-backlog line needs the day each one was
- * raised. They are listed explicitly for the same reason the rest are.
+ * last eight are the MTD Client Report's: completed jobs are split by city and
+ * by days open there, the open-backlog line needs the day each one was raised,
+ * the Escalated tile counts closures alongside the other two sets, and `tier`
+ * is carried so the four sets agree about a column the export writes on every
+ * row (see jobFields). They are listed explicitly for the same reason the rest
+ * are.
  */
 async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalManagerId } = {}) {
   const started = Date.now();
@@ -528,6 +580,20 @@ async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalMan
           jobStatus: f.jobStatus,
           ticketDate: f.ticketDate,
           aging: f.aging,
+          isEscalated: f.isEscalated,
+          tier: f.tier,
+          /*
+           * "App CheckIn Date" as a plain IST day — the day the technician
+           * reached the job, which is EARLIER than `date` (Audit & Checkout)
+           * on any job audited later than it was worked.
+           *
+           * Carried only here, on the closed rows, because it is only ever
+           * read of a closure: the MTD report offers it as a SECOND basis for
+           * counting a completed job onto a day (mtd-report.service.js,
+           * `completedOnCheckin`). Null when the column is blank, and the
+           * caller falls back to `date` for that row, as the template does.
+           */
+          checkinDate: jobExport.datePart(raw.checkin_date_time),
         },
       });
     }
@@ -592,8 +658,8 @@ async function loadClosedJobs({ from, to, now = new Date(), verticalId, zonalMan
  *
  * Row: { jobId, clientId, status, vertical, state, city, client, zm, tx, txid,
  *        jobStatus, ticketDate, aging, cancelReason, cancelComment, cancelBy,
- *        date, charge, spoc: null, spocUserId, spocName, spocInternal,
- *        spocSource: 'mapping' }
+ *        isEscalated, tier, date, charge, spoc: null, spocUserId, spocName,
+ *        spocInternal, spocSource: 'mapping' }
  */
 async function loadWindowedJobs({
   label, statuses, dateType, dateOf, from, to, now = new Date(), verticalId, zonalManagerId,
