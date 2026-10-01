@@ -732,12 +732,22 @@ function operatorAnswerXml(friendlyName, opts = {}) {
  * Only for calls the answer route flagged recording_requested=1 on the
  * operator leg (plivo.recording.enabled). Fail-soft: never disturbs the call.
  */
+// The room's own row, re-read: did the END webhook land while we were asking?
+async function roomHasEnded(confId, pool) {
+  try {
+    const [[row] = []] = await pool.query('SELECT status FROM tbl_job_conference WHERE id = ? LIMIT 1', [confId]);
+    return !!row && row.status === 'ended';
+  } catch (_e) { return false; }
+}
 // ponytail: per-process once-guard; another instance's duplicate start only
 // earns a logged Plivo 4xx. Released on failure so a later join can retry.
 const roomRecordingStarted = new Set();
 async function startRoomRecording(conference, pool) {
   if (!conference || !conference.id || !conference.friendly_name || !pool) return { ok: false, started: false };
   if (roomRecordingStarted.has(conference.id)) return { ok: true, started: false };
+  // A receiver's join can land after the room ended (operator hung up as they
+  // answered — conf 8902, 2026-10-01): nothing to record, the fallback has it.
+  if (conference.status === 'ended') return { ok: true, started: false };
   roomRecordingStarted.add(conference.id);
   const [[op] = []] = await pool.query(
     `SELECT job_caller_info_id FROM tbl_plivo_call_log
@@ -751,6 +761,10 @@ async function startRoomRecording(conference, pool) {
     recording_callback_url: cbUrl,
     recording_callback_method: 'POST',
   });
+  if (!r.ok && r.httpStatus === 404 && (await roomHasEnded(conference.id, pool))) {
+    logger.info(`🎙 Conference room recording not started · conf=${conference.id} · room already ended (404) — the fallback covers it`);
+    return { ok: true, started: false };
+  }
   if (!r.ok) {
     roomRecordingStarted.delete(conference.id);
     const msg = `Conference room recording NOT started · conf=${conference.id} · jci=${op.job_caller_info_id}`
