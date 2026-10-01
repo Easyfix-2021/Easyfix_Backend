@@ -12,6 +12,10 @@ const { todayIst, shiftYmd, shiftMonth, currentIstMonth, monthBounds } = require
  *   1. a tbl_employee_roster row wins                → source 'ROSTER'
  *   2. else the weekday column of the preference     → source 'WEEKLY'
  *   3. no preference row at all = 7 working days     → never an invented WO
+ *   4. on top, Employee Hub leave (tbl_employee_leave_request):
+ *        APPROVED full day → a PR day becomes LV / SL (source 'LEAVE'); every
+ *                            date in the range is `locked` (no writer touches it)
+ *        APPROVED half day / PENDING → the planned day is kept, plus `leave`
  * There is no "on roster" flag: a user is on the roster for a date exactly when
  * a row exists for it. Holidays are display-only (ops works holidays).
  *
@@ -79,13 +83,52 @@ async function loadRosterRows(userIds, from, to, runner = pool) {
 }
 
 /*
- * THE resolution. Returns { byUser: Map<userId, { [date]: cell }>, prefs } where
- * cell = { type, shift, source, rowSource }. rowSource (GRID/PATTERN/COPY) is
- * internal — it powers "keep cells already edited by hand".
+ * PENDING / APPROVED leave requests intersecting [from, to] (idx_elr_user_dates).
+ * FAIL-SOFT on a missing table, like loadRosterRows: Prod must keep resolving
+ * rosters before migrations/2026-09-30-employee-leave-01-tables.sql runs.
  */
-async function resolveDays(userIds, from, to) {
+async function loadLeaveRows(userIds, from, to, runner = pool) {
+  if (!userIds.length) return [];
+  try {
+    const [rows] = await runner.query(
+      `SELECT id, user_id, kind, DATE_FORMAT(from_date, '%Y-%m-%d') AS from_date,
+              DATE_FORMAT(to_date, '%Y-%m-%d') AS to_date, duration, status
+         FROM tbl_employee_leave_request
+        WHERE user_id IN (${userIds.map(() => '?').join(',')}) AND status IN ('PENDING', 'APPROVED')
+          AND from_date <= ? AND to_date >= ?`,
+      [...userIds, to, from]
+    );
+    return rows;
+  } catch (e) {
+    if (!isMissingTable(e)) throw e;
+    logger.warn('Leave read skipped · table missing — apply migrations/2026-09-30-employee-leave-01-tables.sql');
+    return [];
+  }
+}
+
+const isLockingLeave = (l) => l.status === 'APPROVED' && l.duration === 'FULL';
+
+/** 'userId|date' keys inside an APPROVED full-day leave — the dates no roster writer may touch. */
+function lockedKeys(leaveRows, from, to) {
+  const out = new Set();
+  for (const l of leaveRows) {
+    if (!isLockingLeave(l)) continue;
+    for (const d of listDates(l.from_date > from ? l.from_date : from, l.to_date < to ? l.to_date : to)) out.add(`${Number(l.user_id)}|${d}`);
+  }
+  return out;
+}
+
+/*
+ * THE resolution. Returns { byUser: Map<userId, { [date]: cell }>, prefs } where
+ * cell = { type, shift, source, rowSource, locked?, leaveId?, leave? }. rowSource
+ * (GRID/PATTERN/COPY) is internal — it powers "keep cells already edited by hand".
+ * { leaves: false } = the plan alone (leave.service counts working days on it).
+ */
+async function resolveDays(userIds, from, to, { leaves = true } = {}) {
   const ids = [...new Set(userIds.map(Number).filter(Boolean))];
-  const [prefs, rows] = await Promise.all([attendancePref.loadPreferences(ids), loadRosterRows(ids, from, to)]);
+  const [prefs, rows, leaveRows] = await Promise.all([
+    attendancePref.loadPreferences(ids), loadRosterRows(ids, from, to), leaves ? loadLeaveRows(ids, from, to) : [],
+  ]);
   const planned = new Map();
   for (const r of rows) planned.set(`${r.user_id}|${r.roster_date}`, r);
   const dates = listDates(from, to);
@@ -101,15 +144,47 @@ async function resolveDays(userIds, from, to) {
     }
     byUser.set(uid, days);
   }
+  // APPROVED before PENDING, so an approved half day wins the single `leave` slot.
+  // ponytail: two approved halves on one date show as one half day (the cell stays PR); fold into a full day if that ever matters.
+  for (const l of [...leaveRows].sort((a, b) => (a.status === 'APPROVED' ? 0 : 1) - (b.status === 'APPROVED' ? 0 : 1))) {
+    const days = byUser.get(Number(l.user_id));
+    if (!days) continue;
+    for (const d of listDates(l.from_date > from ? l.from_date : from, l.to_date < to ? l.to_date : to)) {
+      const c = days[d];
+      if (isLockingLeave(l)) {
+        // A week off inside the range stays WO — leave counts working days only — but is locked all the same.
+        days[d] = c.type === 'PR' ? { ...c, type: l.kind, source: 'LEAVE', leaveId: Number(l.id), locked: true, leave: undefined } : { ...c, locked: true };
+      } else if (c.type === 'PR' && !c.locked && !c.leave) {
+        c.leave = { id: Number(l.id), kind: l.kind, duration: l.duration, status: l.status };
+      }
+    }
+  }
   return { byUser, prefs };
+}
+
+/** The grid / dashboard / export view of a resolved cell (internal fields dropped). */
+function publicCell(c) {
+  const out = { type: c.type, shift: c.shift, source: c.source };
+  if (c.locked) out.locked = true;
+  if (c.leave) out.leave = c.leave;
+  return out;
+}
+
+/** Of the given users on `date` (default today IST): who is on Week Off, who is on full-day leave. */
+async function offDutySets(userIds, date = todayIst()) {
+  const { byUser } = await resolveDays(userIds, date, date);
+  const weekOff = new Set();
+  const onLeave = new Set();
+  for (const [uid, days] of byUser) {
+    if (days[date].type === 'WO') weekOff.add(uid);
+    else if (days[date].source === 'LEAVE') onLeave.add(uid);
+  }
+  return { weekOff, onLeave };
 }
 
 /** Set of the given user ids who are on Week Off on `date` (default: today IST). */
 async function weekOffSet(userIds, date = todayIst()) {
-  const { byUser } = await resolveDays(userIds, date, date);
-  const out = new Set();
-  for (const [uid, days] of byUser) if (days[date].type === 'WO') out.add(uid);
-  return out;
+  return (await offDutySets(userIds, date)).weekOff;
 }
 
 // ─── Scope ────────────────────────────────────────────────────────────
@@ -192,7 +267,7 @@ async function getGrid({ actorId, isAdmin, from, to, teamOf, maxDays = MAX_RANGE
   const members = users.map((u) => {
     const uid = Number(u.user_id);
     const days = {};
-    for (const d of dates) { const c = byUser.get(uid)[d]; days[d] = { type: c.type, shift: c.shift, source: c.source }; }
+    for (const d of dates) days[d] = publicCell(byUser.get(uid)[d]);
     return {
       userId: uid, name: u.user_name, empCode: u.user_code || null, roleName: u.role_name || null,
       editable: canEditUser(reach, uid),
@@ -234,7 +309,7 @@ async function getMine(userId, { days = 14 } = {}) {
   const mine = byUser.get(uid);
   const hol = new Map(holidays.getRange({ from: today, to: shiftYmd(today, span - 1) }).map((h) => [h.date, h.name]));
   const list = listDates(today, shiftYmd(today, span - 1)).map((d) => ({
-    date: d, type: mine[d].type, shift: mine[d].shift, source: mine[d].source,
+    date: d, ...publicCell(mine[d]),
     holiday: hol.has(d) ? { name: hol.get(d) } : null,
   }));
   const nextWeekOff = listDates(shiftYmd(today, 1), lookahead).find((d) => mine[d].type === 'WO') || null;
@@ -244,9 +319,10 @@ async function getMine(userId, { days = 14 } = {}) {
   let team = null;
   if (descendants.length) {
     const users = await loadActiveUsers(descendants);
-    const off = await weekOffSet(users.map((u) => Number(u.user_id)), today);
-    const offToday = users.filter((u) => off.has(Number(u.user_id))).map((u) => ({ userId: Number(u.user_id), name: u.user_name }));
-    team = { date: today, total: users.length, weekOff: offToday.length, onDuty: users.length - offToday.length, offToday };
+    const { weekOff, onLeave } = await offDutySets(users.map((u) => Number(u.user_id)), today);
+    const offToday = users.filter((u) => weekOff.has(Number(u.user_id)) || onLeave.has(Number(u.user_id)))
+      .map((u) => ({ userId: Number(u.user_id), name: u.user_name, reason: weekOff.has(Number(u.user_id)) ? 'WO' : 'LEAVE' }));
+    team = { date: today, total: users.length, weekOff: weekOff.size, onLeave: onLeave.size, onDuty: users.length - offToday.length, offToday };
   }
   return { days: list, nextWeekOff, team };
 }
@@ -385,6 +461,10 @@ async function saveCells({ actorId, isAdmin, cells }) {
   const reach = await actorReach(actorId, isAdmin);
   const empCodes = await assertEditable(reach, list.map((c) => c.userId));
   const users = new Set(list.map((c) => c.userId)).size;
+  const span = list.reduce((m, c) => [c.date < m[0] ? c.date : m[0], c.date > m[1] ? c.date : m[1]], [list[0].date, list[0].date]);
+  const locked = lockedKeys(await loadLeaveRows([...empCodes.keys()], span[0], span[1]), span[0], span[1]);
+  const hit = list.find((c) => locked.has(`${c.userId}|${c.date}`));
+  if (hit) throw mkErr(409, `${empCodes.get(hit.userId) || 'User ' + hit.userId} is on approved leave on ${dayLabel(hit.date)} — cancel the leave first`);
 
   const changed = await inTransaction(async (conn) => {
     const actionId = await insertAction(conn, {
@@ -416,19 +496,22 @@ async function fillPattern({ actorId, isAdmin, userIds, from, to, weekOffDays, s
   const empCodes = await assertEditable(reach, userIds || []);
   const ids = [...empCodes.keys()];
 
-  const existing = await loadRosterRows(ids, from, to);
+  const [existing, leaveRows] = await Promise.all([loadRosterRows(ids, from, to), loadLeaveRows(ids, from, to)]);
+  const locked = lockedKeys(leaveRows, from, to);
   // Hand-made = the grid or a bulk upload; both survive "Keep cells already edited by hand".
   const manual = new Set(existing.filter((r) => r.source === 'GRID' || r.source === 'UPLOAD').map((r) => `${r.user_id}|${r.roster_date}`));
   const cells = [];
   let kept = 0;
+  let keptLeave = 0;
   for (const uid of ids) {
     for (const d of dates) {
+      if (locked.has(`${uid}|${d}`)) { keptLeave++; continue; }
       if (keepManual && manual.has(`${uid}|${d}`)) { kept++; continue; }
       cells.push({ userId: uid, date: d, dayType: offs.has(weekdayIndex(d)) ? 'WO' : 'PR', shift });
     }
   }
   const counts = {
-    users: ids.length, cells: cells.length, keptManual: kept,
+    users: ids.length, cells: cells.length, keptManual: kept, keptLeave,
     wo: cells.filter((c) => c.dayType === 'WO').length, pr: cells.filter((c) => c.dayType === 'PR').length,
   };
   if (dryRun) return counts;
@@ -455,13 +538,16 @@ async function resetRange({ actorId, isAdmin, userIds, from, to }) {
   const ids = [...empCodes.keys()];
 
   const removed = await inTransaction(async (conn) => {
-    const [rows] = await conn.query(
+    const [all] = await conn.query(
       `SELECT user_id, DATE_FORMAT(roster_date, '%Y-%m-%d') AS roster_date, day_type
          FROM tbl_employee_roster
         WHERE user_id IN (${ids.map(() => '?').join(',')}) AND roster_date BETWEEN ? AND ?
         FOR UPDATE`,
       [...ids, from, to]
     );
+    // Dates inside an approved full-day leave keep their plan.
+    const locked = lockedKeys(await loadLeaveRows(ids, from, to, conn), from, to);
+    const rows = all.filter((r) => !locked.has(`${Number(r.user_id)}|${r.roster_date}`));
     const actionId = await insertAction(conn, {
       action: 'RESET', actorId, scope: rangeLabel(from, to),
       params: { userIds: ids, from, to }, users: ids.length, cells: rows.length,
@@ -469,8 +555,8 @@ async function resetRange({ actorId, isAdmin, userIds, from, to }) {
     if (!rows.length) return 0;
     await conn.query(
       `DELETE FROM tbl_employee_roster
-        WHERE user_id IN (${ids.map(() => '?').join(',')}) AND roster_date BETWEEN ? AND ?`,
-      [...ids, from, to]
+        WHERE (user_id, roster_date) IN (${rows.map(() => '(?, ?)').join(', ')})`,
+      rows.flatMap((r) => [r.user_id, r.roster_date])
     );
     const now = new Date();
     await insertChangeLogs(conn, rows.map((r) => [actionId, r.user_id, r.roster_date, 'day_type', r.day_type, null, actorId, now]));
@@ -671,7 +757,10 @@ module.exports = {
   weekdayIndex,
   editWindow,
   resolveDays,
+  loadLeaveRows,
+  lockedKeys,
   weekOffSet,
+  offDutySets,
   canEditUser,
   getGrid,
   getMine,

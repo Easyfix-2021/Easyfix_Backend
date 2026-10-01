@@ -272,14 +272,19 @@ async function users({ q, roleGroup, limit = 100, offset = 0, includeInactive = 
    * roster read error must never empty the picker, and "not on week off" is the
    * safe default (it never hides anyone).
    */
+  // on_leave_today — an APPROVED full-day leave today (Employee Hub); same fail-soft.
   let off = new Set();
+  let leave = new Set();
   try {
-    off = await require('./roster.service').weekOffSet(rows.map((r) => Number(r.user_id)));
+    ({ weekOff: off, onLeave: leave } = await require('./roster.service').offDutySets(rows.map((r) => Number(r.user_id))));
   } catch (e) {
-    logger.warn('Lookup users · week-off flag skipped · ' + e.message);
+    logger.warn('Lookup users · week-off / leave flags skipped · ' + e.message);
   }
-  for (const r of rows) r.week_off_today = off.has(Number(r.user_id));
-  logger.info(`Found ${rows.length} users · ${off.size} on week off today`);
+  for (const r of rows) {
+    r.week_off_today = off.has(Number(r.user_id));
+    r.on_leave_today = leave.has(Number(r.user_id));
+  }
+  logger.info(`Found ${rows.length} users · ${off.size} on week off · ${leave.size} on leave today`);
   return rows;
 }
 
@@ -530,6 +535,17 @@ function applyMenuFilter(rows, { userEmail } = {}) {
     `menu filter active — ${sortedIds.length} id(s) allowed${overrides.size ? `, ${overrides.size} override email(s) bypass` : ''}`,
   );
 })();
+
+/** Does this user have at least one ACTIVE direct report? (Employee Hub → Approvals visibility.) */
+async function hasDirectReports(userId) {
+  // Technician / share-guest principals carry non-numeric ids ('efr:123') — never a manager.
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) return false;
+  // user_type_id = 5 (internal employees), the same population findDescendantUserIds
+  // scopes the Approvals list to — so the menu never shows over an empty list.
+  const [rows] = await pool.query('SELECT 1 FROM tbl_user WHERE reporting_manager = ? AND user_status = 1 AND user_type_id = 5 LIMIT 1', [uid]);
+  return rows.length > 0;
+}
 
 async function menus({ userEmail } = {}) {
   logger.info('Lookup menus');
@@ -854,6 +870,7 @@ async function documentTypes({ includeInactive = false } = {}) {
 }
 
 module.exports = {
+  hasDirectReports,
   cities,
   states,
   serviceCategories,

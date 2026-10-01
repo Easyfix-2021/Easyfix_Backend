@@ -226,6 +226,10 @@ manage.post('/bulk/errors', async (req, res, next) => {
 // ~6 months: the whole plan window (tomorrow → end of month+3, up to ~123 days)
 // plus a look back. The grid itself stays capped at 62 (MAX_RANGE_DAYS).
 const EXPORT_MAX_DAYS = 186;
+// LV / SL for a full-day leave (the cell's type); 'PR (½LV)' for an approved half day; pending leave is not shown.
+function exportCell(c) {
+  return c.leave && c.leave.status === 'APPROVED' ? `${c.type} (½${c.leave.kind})` : c.type;
+}
 manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.required(), teamOf: Joi.number().integer().positive() }), 'query'),
   async (req, res, next) => {
     try {
@@ -241,7 +245,7 @@ manage.get('/export', validate(Joi.object({ from: ymd.required(), to: ymd.requir
       const hol = new Set(grid.holidays.map((h) => h.date));
       for (const m of grid.members) {
         ws.addRow([m.name, m.empCode || '', m.roleName || '', m.defaultShift || '',
-          ...grid.dates.map((d) => m.days[d].type)]);
+          ...grid.dates.map((d) => exportCell(m.days[d]))]);
       }
       ws.addRow(['On Duty', '', '', '', ...grid.dates.map((d) => `${grid.headcount[d].onDuty}/${grid.headcount[d].total}`)]).font = { bold: true };
       grid.dates.forEach((d, i) => { if (hol.has(d)) ws.getColumn(5 + i).eachCell((c) => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDECEA' } }; }); });

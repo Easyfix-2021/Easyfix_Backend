@@ -162,6 +162,7 @@ async function buildTemplate({ actorId, isAdmin, months, userIds }) {
     'Leave anything you are not changing as it is — only cells that differ from the current plan are saved.',
     'Shift applies to every PR day in this file, but only if you change it from the employee\'s default.',
     'Do not edit the User ID column or the date headers. A blank cell means "no change".',
+    'LV / SL = approved leave: those days are locked — leave them as they are.',
   ].forEach((t) => help.addRow([t]));
   help.getColumn(1).width = 110;
 
@@ -246,9 +247,11 @@ async function validateSheet(ws, { actorId, isAdmin }) {
       const v = cellText(row.getCell(col).value);
       const t = typeof v === 'string' ? v.toUpperCase() : '';
       if (t === '') continue; // blank = no change
+      const cur = days ? days[date] : null;
+      // Approved full-day leave: the template pre-fills LV / SL (or the WO) — left alone it is skipped.
+      if (cur && cur.locked) { if (t !== cur.type) addErr(x.r, col, 'Locked: approved leave'); continue; }
       if (!roster.DAY_TYPES.includes(t)) { addErr(x.r, col, 'Use PR or WO'); continue; }
       if (!days) continue;
-      const cur = days[date];
       const typeChanged = cur.type !== t;
       const shiftChanged = newShift !== undefined && t === 'PR' && cur.shift !== newShift;
       if (!typeChanged && !shiftChanged) continue;
