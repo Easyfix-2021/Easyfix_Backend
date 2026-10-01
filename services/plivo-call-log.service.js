@@ -304,6 +304,17 @@ async function markAnswered(jci, callUuid, recordRequested = null) {
  * for this jci. Without the filter one recording would be filed on all three
  * legs and the Calls list would offer the same audio three times.
  */
+// The primary leg's stored recording + whether it is a conference — the
+// recording-callback reads it BEFORE writing, to find a redundant fallback.
+async function getPrimaryRecording(jci) {
+  if (jci == null) return null;
+  try {
+    const [[row] = []] = await pool.query(
+      `SELECT recording_id, conference_id FROM tbl_plivo_call_log WHERE job_caller_info_id = ?${await primaryLegFilter()} LIMIT 1`,
+      [jci]);
+    return row || null;
+  } catch (e) { logger.warn({ err: e.message, jci }, 'plivo-call-log: getPrimaryRecording failed (non-fatal)'); return null; }
+}
 // onlyIfEmpty: never overwrite a stored recording (the <Record> safety net
 // must not clobber the conference room recording — see startRoomRecording).
 async function setRecording(jci, { url, id, duration } = {}, { onlyIfEmpty = false } = {}) {
@@ -746,6 +757,7 @@ module.exports = {
   markAnswered,
   setRecordingRequested,
   setRecording,
+  getPrimaryRecording,
   markTerminalByJci,
   markTerminalByCallUuid,
   // conference legs

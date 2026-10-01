@@ -316,8 +316,22 @@ async function recordingCallback(req, res) {
     const duration = src.RecordingDuration || src.recording_duration || null;
     logger[event === 'MPCRecordingFailed' ? 'warn' : 'info']('Plivo recording-callback · jci=' + claims.jci + ' · event=' + (event || '-')
       + ' · id=' + (id || 'none') + ' · hasUrl=' + !!url + (url ? '' : ' · keys=' + Object.keys(src).filter((k) => k !== 't').join(',')));
-    if (url && !event) await plivoLog.setRecording(claims.jci, { url, id, duration }, { onlyIfEmpty: true });
-    else if (url && event === 'MPCRecordingCompleted') await plivoLog.setRecording(claims.jci, { url, id, duration });
+    if (event === 'MPCRecordingFailed') {
+      conference.alertRecordingProblem(`Plivo MPCRecordingFailed · jci=${claims.jci} · recording=${id || '-'}`)
+        .catch((e) => logger.warn('recording alert failed · ' + e.message));
+    }
+    if (url && (!event || event === 'MPCRecordingCompleted')) {
+      // Read BEFORE writing: whichever of the two files lands SECOND names the
+      // redundant <Record> fallback, which pruneConferenceFallback may delete.
+      const prev = await plivoLog.getPrimaryRecording(claims.jci);
+      if (!event) await plivoLog.setRecording(claims.jci, { url, id, duration }, { onlyIfEmpty: true });
+      else await plivoLog.setRecording(claims.jci, { url, id, duration });
+      if (prev && prev.conference_id && prev.recording_id && id && String(prev.recording_id) !== String(id)) {
+        const ids = event ? { roomId: id, fallbackId: prev.recording_id } : { roomId: prev.recording_id, fallbackId: id };
+        conference.pruneConferenceFallback({ ...ids, jci: claims.jci })
+          .catch((e) => logger.warn('conference fallback prune threw · jci=' + claims.jci + ' · ' + e.message));
+      }
+    }
     return res.status(200).type('text/plain').send('ok');
   } catch (e) {
     // Header above: ALWAYS 200 so Plivo doesn't retry-storm. A failed store is
