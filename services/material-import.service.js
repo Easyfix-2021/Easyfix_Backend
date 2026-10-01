@@ -2,7 +2,8 @@ const XLSX = require('xlsx');
 const { pool } = require('../db');
 const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
-const { streamStyledXlsx } = require('../utils/xlsx-styled-export');
+const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../utils/xlsx-styled-export');
+const { addListValidations } = require('../utils/xlsx-list-validation');
 const { rowsBelowHeader } = require('../utils/xlsx-header-rows');
 const brandSvc = require('./brand.service');
 const materialSvc = require('./material.service');
@@ -159,8 +160,10 @@ function templateExampleRow(ref) {
 }
 
 async function generateMaterialTemplate(res) {
-  const example = templateExampleRow(await loadImportReferenceData());
-  await streamStyledXlsx(res, 'easyfix-material-import-template.xlsx', {
+  const ref = await loadImportReferenceData();
+  const example = templateExampleRow(ref);
+  const sorted = (m, key) => [...m.values()].map((x) => x[key]).sort((x, y) => String(x).localeCompare(String(y)));
+  const wb = buildStyledWorkbook({
     title: 'EasyFix · Material Import Template',
     meta: 'One row = one brand group. Rows sharing Material Name + Category are the same material.',
     sheetName: 'Materials',
@@ -175,6 +178,15 @@ async function generateMaterialTemplate(res) {
     ],
     rows: [example],
   });
+  // Header on row 4 (title / note / spacer), data from row 5. Brands stays free
+  // text: it takes a comma-separated list, which one-value-per-cell Excel list
+  // validation cannot express.
+  addListValidations(wb, 'Materials', 5, [
+    { column: 'B', title: 'Categories', names: sorted(ref.categoryByKey, 'service_catg_name'), allowBlank: false, error: 'Pick a category from the dropdown list.' },
+    { column: 'C', title: 'Pricing Types', names: ['Fixed', 'Dynamic'], allowBlank: false, error: 'Pricing Type must be Fixed or Dynamic.' },
+    { column: 'D', title: 'UOMs', names: sorted(ref.uomByKey, 'uom_name'), allowBlank: true, error: 'Pick a unit from the dropdown list, or leave blank.' },
+  ]);
+  await streamWorkbook(res, 'easyfix-material-import-template.xlsx', wb);
 }
 
 // A "Brands" cell blank or normalising to one of these aliases means the row
