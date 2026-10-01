@@ -172,3 +172,43 @@ test('3 → 5 stamps feedback_date_time and fk_feedback_by, write-once', async (
   assert.match(upd.sql, /feedback_date_time = COALESCE\(feedback_date_time, \?\)/);
   assert.match(upd.sql, /fk_feedback_by = COALESCE\(fk_feedback_by, \?\)/);
 });
+
+/*
+ * Booking (→ 0) stamps fk_created_by with the booking operator, OVERWRITING any
+ * value an integration (e.g. the Decathlon webhook) set on the Unconfirmed row.
+ */
+test('9 → 0 overwrites fk_created_by with the booking CRM user', async () => {
+  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null, fk_created_by: 555 };
+  try {
+    await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 });
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd, 'an UPDATE tbl_job should have been issued');
+  assert.match(upd.sql, /fk_created_by = \?/);
+  assert.doesNotMatch(upd.sql, /COALESCE\(fk_created_by/, 'must overwrite, not keep the webhook user');
+  assert.ok(upd.params.includes(17), 'the booking operator is bound');
+});
+
+test('a re-submit (0 → 0), a re-book (1 → 0) and a technician actor keep the existing booker', async () => {
+  for (const job_status of [0, 1]) {
+    fake.calls.length = 0;
+    scenario.jobMeta = { ...META, job_status, fk_easyfixter_id: null, fk_created_by: 555 };
+    try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
+    assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, `${job_status} → 0 is not a first confirmation`);
+    // The fake returns scenario.jobMeta whatever is projected, so pin the projection:
+    // without fk_created_by, `existing.fk_created_by == null` holds for EVERY job.
+    const meta = fake.calls.find((c) => /FROM\s+tbl_job\s+WHERE\s+job_id/i.test(c.sql));
+    assert.match(meta.sql, /fk_created_by/, 'getJobMeta must select fk_created_by');
+  }
+
+  fake.calls.length = 0;
+  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null, fk_created_by: 555 };
+  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 'efr:88' }); } catch (e) { if (!e.__stop) throw e; }
+  assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, 'a tech has no tbl_user row');
+});
+
+test('a booking with NO creator yet is stamped even outside 9/7 → 0', async () => {
+  scenario.jobMeta = { ...META, job_status: 1, fk_easyfixter_id: null, fk_created_by: null };
+  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
+  assert.match(lastUpdate().sql, /fk_created_by = \?/);
+});

@@ -25,15 +25,16 @@
  * (cancel_by) but writes nothing for the BOOKED transition, so "who confirmed
  * this job" is not directly stored.
  *
- * What IS reliable for THIS population: setStatus() stamps `fk_created_by` on
- * the BOOKED transition *when the row has none yet*, and Unconfirmed jobs come
- * from bulk upload / client integrations, which create rows with no user. So for
- * the jobs this report is about, fk_created_by IS the confirming operator.
+ * What IS reliable for THIS population: setStatus() now OVERWRITES
+ * `fk_created_by` with the CRM user on a first confirmation (Unconfirmed or
+ * Enquiry → Booked; before that it only filled a NULL). So for jobs confirmed
+ * after that, fk_created_by IS the confirming operator — even when an
+ * integration had set it.
  *
- * The gap is honest and bounded: a job that already had a creator (booked by an
- * operator via Book New Call, then later confirmed by someone else) keeps the
- * ORIGINAL creator's name. Those are rare in the Unconfirmed bucket, and the row
- * still reports the suspicious pattern — only the name may be the wrong person.
+ * The gap is honest and bounded: a job confirmed BEFORE 2026-10-01 that already
+ * had a creator (Book New Call, or an integration user) keeps that ORIGINAL
+ * name. The row still reports the suspicious pattern — only the name may be the
+ * wrong person.
  * `moved_by_confidence` flags which is which so the report never quietly
  * misattributes: 'confirmed' when the job began with no creator, 'creator' when
  * the name is the original creator and may not be who confirmed it.
