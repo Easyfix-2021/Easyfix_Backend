@@ -68,6 +68,18 @@ function approvalsFilter(sql, params) {
     && (self === undefined || r.user_id !== self);
 }
 
+function pastFilter(sql, [uid, floor]) {
+  const byDate = /r\.to_date < \?/.test(sql);
+  const byStatus = /r\.status IN/.test(sql);
+  const both = /r\.to_date < \? AND r\.status IN/.test(sql);
+  return (r) => {
+    if (/r\.user_id = \?/.test(sql) && r.user_id !== uid) return false;
+    const d = r.to_date < floor; const s = statusFilter(sql)(r);
+    if (byDate && byStatus) return both ? d && s : d || s;
+    return byDate ? d : byStatus ? s : true;
+  };
+}
+
 const fake = installFakePool([
   [/FROM tbl_employee_attendance_preference/i, []],
   [/FROM tbl_employee_roster\s+WHERE \(user_id, roster_date\) IN/i, () => []],
@@ -96,6 +108,15 @@ const fake = installFakePool([
     && (r.approver_user_id === uid || (/OR r\.approver_user_id IS NULL/.test(sql) && r.approver_user_id === null))
     && (!/a\.user_id IS NULL/.test(sql) || !acks.some((a) => a.user_id === uid && a.alert_key === `leave:${r.id}`))).map(withNames)],
   [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.id = \?/i, (sql, [id]) => requests.filter((r) => r.id === id).map(withNames)],
+  // pastRequests — each clause applies only while it is in the SQL (user, to_date floor, status IN list,
+  // the OR/AND joining the last two), then ORDER BY and LIMIT ?, ? as written.
+  [/COUNT\(\*\) AS total FROM tbl_employee_leave_request r WHERE r\.user_id = \?/i, (sql, params) => [{ total: requests.filter(pastFilter(sql, params)).length }]],
+  [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.user_id = \?[\s\S]*LIMIT \?, \?/i, (sql, params) => {
+    const [offset, size] = params.slice(-2);
+    return requests.filter(pastFilter(sql, params))
+      .sort((a, b) => (/ORDER BY r\.from_date DESC, r\.id DESC/.test(sql) ? b.from_date.localeCompare(a.from_date) || b.id - a.id : a.id - b.id))
+      .slice(offset, offset + size).map(withNames);
+  }],
   // me() My Requests — the status IN list, the `to_date >= ?` floor and the ORDER BY as written.
   [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.user_id = \?/i, (sql, [uid, floor]) => requests
     .filter((r) => r.user_id === uid && statusFilter(sql)(r) && (!/r\.to_date >= \?/.test(sql) || r.to_date >= floor))
@@ -582,4 +603,58 @@ test('me: My Requests = PENDING + APPROVED ending this IST month or later, by fr
   assert.deepEqual((await leave.me({ userId: 2, month: prevMonth })).requests.map((x) => x.id), want, 'independent of the viewed month');
   const q = fake.calls.findLast((c) => /WHERE r\.user_id = \?/.test(c.sql));
   assert.deepEqual(q.params, [2, first]);
+});
+
+test('pastRequests: exactly the complement of me().requests for the caller — older months, plus REJECTED / WITHDRAWN / CANCELLED, newest first', async () => {
+  reset();
+  const first = monthBounds(currentIstMonth()).start;
+  const old = (n) => shiftYmd(first, -n);
+  // Seeded so id order ≠ from_date order (either direction) — the ORDER BY is observable.
+  const oldApproved = seed({ user_id: 2, from_date: old(5), to_date: old(1), status: 'APPROVED' }); // ended last month
+  const oldPending = seed({ user_id: 2, from_date: old(40), to_date: old(38), status: 'PENDING' });
+  const rejected = seed({ user_id: 2, from_date: D(12), to_date: D(12), status: 'REJECTED' });
+  const withdrawn = seed({ user_id: 2, from_date: D(30), to_date: D(30), status: 'WITHDRAWN' });
+  const cancelled = seed({ user_id: 2, from_date: D(20), to_date: D(20), status: 'CANCELLED' });
+  const oldRejected = seed({ user_id: 2, from_date: old(100), to_date: old(100), status: 'REJECTED' }); // both arms
+  const same = seed({ user_id: 2, from_date: D(12), to_date: D(12), status: 'CANCELLED' });            // from_date tie → id DESC
+  const mine = [
+    seed({ user_id: 2, from_date: D(10), to_date: D(10), status: 'PENDING' }),
+    seed({ user_id: 2, from_date: shiftYmd(first, -3), to_date: first, status: 'APPROVED' }),          // ends ON the 1st → still in me()
+    seed({ user_id: 2, from_date: D(40), to_date: D(41), status: 'APPROVED' }),
+  ];
+  seed({ user_id: 3, from_date: old(5), to_date: old(1), status: 'APPROVED' });                         // someone else's, never
+  seed({ user_id: 3, from_date: D(12), to_date: D(12), status: 'REJECTED' });
+
+  const past = await leave.pastRequests({ userId: 2 });
+  const inMe = (await leave.me({ userId: 2 })).requests.map((x) => x.id);
+  assert.deepEqual(inMe.sort((a, b) => a - b), mine.map((x) => x.id).sort((a, b) => a - b), 'CONTROL — me() shows the current / future Pending + Approved');
+  assert.deepEqual(past.items.map((x) => x.id), [withdrawn, cancelled, same, rejected, oldApproved, oldPending, oldRejected].map((x) => x.id),
+    'from_date DESC, id DESC; the other user\'s rows and me()\'s rows are absent');
+  assert.equal(past.total, 7);
+  assert.equal(past.items.every((x) => x.userId === 2), true);
+  const all = requests.filter((r) => r.user_id === 2).map((r) => r.id).sort((a, b) => a - b);
+  assert.deepEqual([...inMe, ...past.items.map((x) => x.id)].sort((a, b) => a - b), all, 'me ∪ past = every request of the user, no overlap');
+  assert.deepEqual(Object.keys(past.items[0]), Object.keys((await leave.me({ userId: 2 })).requests[0]), 'the same row shape as me()');
+  assert.deepEqual(past.items.at(-2).status, 'PENDING', 'an old Pending (ended before this month) is a past request too');
+  assert.deepEqual((await leave.pastRequests({ userId: 5 })), { total: 0, items: [] }, 'a user with none');
+});
+
+test('pastRequests: page / limit → LIMIT ?, ? (offset, size); limit is clamped to 1–100 and defaults to 20', async () => {
+  reset();
+  const first = monthBounds(currentIstMonth()).start;
+  const rows = [1, 2, 3, 4, 5].map((n) => seed({ user_id: 2, from_date: shiftYmd(first, -n), to_date: shiftYmd(first, -n), status: 'APPROVED' }));
+  const ids = (out) => out.items.map((x) => x.id);
+  const newestFirst = rows.map((r) => r.id); // a smaller n = a later from_date
+  assert.deepEqual(ids(await leave.pastRequests({ userId: 2, page: 1, limit: 2 })), newestFirst.slice(0, 2));
+  const p2 = await leave.pastRequests({ userId: 2, page: 2, limit: 2 });
+  assert.deepEqual([ids(p2), p2.total], [newestFirst.slice(2, 4), 5], 'total is the whole set, not the page');
+  assert.deepEqual(ids(await leave.pastRequests({ userId: 2, page: 3, limit: 2 })), newestFirst.slice(4));
+  assert.deepEqual(await leave.pastRequests({ userId: 2, page: 9, limit: 2 }).then((o) => [o.items.length, o.total]), [0, 5]);
+  const lim = async (args) => { fake.calls.length = 0; await leave.pastRequests({ userId: 2, ...args }); return fake.calls.findLast((c) => /LIMIT \?, \?/.test(c.sql)).params.slice(-2); };
+  assert.deepEqual(await lim({}), [0, 20]);
+  assert.deepEqual(await lim({ limit: 1000 }), [0, 100]);
+  assert.deepEqual(await lim({ page: 0, limit: 0 }), [0, 20]);
+  const q = fake.calls.findLast((c) => /LIMIT \?, \?/.test(c.sql));
+  assert.deepEqual(q.params, [2, first, 0, 20]);
+  assert.match(q.sql, /\(r\.to_date < \? OR r\.status IN \('REJECTED', 'WITHDRAWN', 'CANCELLED'\)\)/);
 });

@@ -40,6 +40,13 @@ function handle(fn) {
 router.get('/me', validate(Joi.object({ month: Joi.string().pattern(/^\d{4}-(0[1-9]|1[0-2])$/) }), 'query'),
   handle((req) => leave.me({ userId: req.user.user_id, month: req.query.month })));
 
+router.get('/requests/past',
+  validate(Joi.object({
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+  }), 'query'),
+  handle((req) => leave.pastRequests({ userId: req.user.user_id, ...req.query })));
+
 router.post('/requests',
   validate(Joi.object({ dryRun: Joi.boolean().truthy('1').falsy('0').default(false) }), 'query'),
   validate(Joi.object({
