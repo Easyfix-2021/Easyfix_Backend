@@ -113,3 +113,31 @@ test('create never writes any of the retired backend band labels', async () => {
     assert.ok(params.some((p) => BANDS.includes(p)), `${hour} wrote no canonical band`);
   }
 });
+
+/*
+ * fk_created_by: an acting CRM user wins; input.fk_created_by is the fallback for
+ * actor-less callers (the partner API stamps 53 'System-crm', as legacy did) —
+ * and that fallback must NOT leak into job_owner the way an actor would.
+ */
+async function insertCol(input, actor, col) {
+  fake.reset();
+  await assert.rejects(() => jobSvc.create({ ...VALID_INPUT(), ...input }, actor));
+  const ins = fake.calls.find((c) => /INSERT INTO tbl_job\b/.test(c.sql));
+  assert.ok(ins, 'the job row must be inserted');
+  const cols = ins.sql.slice(ins.sql.indexOf('(') + 1, ins.sql.indexOf(')')).split(',').map((s) => s.trim());
+  assert.ok(cols.includes(col), `${col} is in the INSERT column list`);
+  return ins.params[cols.indexOf(col)];
+}
+
+test('an actor-less create stamps input.fk_created_by, and job_owner stays the client owner', async () => {
+  assert.equal(await insertCol({ fk_created_by: 53 }, { user_id: null }, 'fk_created_by'), 53);
+  assert.equal(await insertCol({ fk_created_by: 53 }, { user_id: null }, 'job_owner'), 9);
+});
+
+test('the acting CRM user beats input.fk_created_by', async () => {
+  assert.equal(await insertCol({ fk_created_by: 53 }, { user_id: '17' }, 'fk_created_by'), 17);
+});
+
+test('reporting_contact_id from input reaches the INSERT', async () => {
+  assert.equal(await insertCol({ reporting_contact_id: 2508 }, { user_id: null }, 'reporting_contact_id'), 2508);
+});
