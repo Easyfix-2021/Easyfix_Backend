@@ -86,8 +86,11 @@ const real = {
   markRinging: plivoLog.markRinging,
   setRecordingRequested: plivoLog.setRecordingRequested,
   setRecording: plivoLog.setRecording,
+  getPrimaryRecording: plivoLog.getPrimaryRecording,
   recordingEnabled: plivo.recordingEnabled,
   addParticipant: conference.addParticipant,
+  pruneConferenceFallback: conference.pruneConferenceFallback,
+  alertRecordingProblem: conference.alertRecordingProblem,
 };
 
 before(async () => { await properties.flushCache(); });
@@ -100,9 +103,14 @@ beforeEach(async () => {
     markRinging: real.markRinging,
     setRecordingRequested: real.setRecordingRequested,
     setRecording: real.setRecording,
+    getPrimaryRecording: real.getPrimaryRecording,
   });
   plivo.recordingEnabled = real.recordingEnabled;
-  conference.addParticipant = real.addParticipant;
+  Object.assign(conference, {
+    addParticipant: real.addParticipant,
+    pruneConferenceFallback: real.pruneConferenceFallback,
+    alertRecordingProblem: real.alertRecordingProblem,
+  });
   await setRecording(false);
 });
 
@@ -472,6 +480,48 @@ test('/recording-callback: <Record> is the safety net (fill-if-empty); the ROOM 
   assertPlainOk(await mpc('MPCRecordingCompleted'));
   assert.deepEqual(stored, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' }, opts: undefined }],
     'stored with overwrite — it replaces the ringback-laden <Record> file');
+});
+
+test('/recording-callback names the redundant FALLBACK to prune — whichever file lands second', async () => {
+  const pruned = [];
+  plivoLog.setRecording = async () => {};
+  conference.pruneConferenceFallback = async (a) => { pruned.push(a); return { deleted: true }; };
+  const post = (body) => call('/recording-callback', 'post', { query: { t: recToken() }, body });
+  const settle = () => new Promise((r) => setImmediate(r));
+
+  // Fallback first (row empty) → nothing to prune yet.
+  plivoLog.getPrimaryRecording = async () => ({ recording_id: null, conference_id: 77 });
+  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb.mp3', RecordingID: 'fb-1' }));
+  // …then the room recording lands over it → the fallback is the one to go.
+  plivoLog.getPrimaryRecording = async () => ({ recording_id: 'fb-1', conference_id: 77 });
+  assertPlainOk(await post({ EventName: 'MPCRecordingCompleted', RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'room-1' }));
+  // Room first, fallback second → still the fallback.
+  plivoLog.getPrimaryRecording = async () => ({ recording_id: 'room-2', conference_id: 78 });
+  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb2.mp3', RecordingID: 'fb-2' }));
+  // A 1:1 bridge call (no conference) and a repeat of the same file → never.
+  plivoLog.getPrimaryRecording = async () => ({ recording_id: 'x-1', conference_id: null });
+  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/x.mp3', RecordingID: 'x-2' }));
+  plivoLog.getPrimaryRecording = async () => ({ recording_id: 'fb-3', conference_id: 79 });
+  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb3.mp3', RecordingID: 'fb-3' }));
+  await settle();
+
+  assert.deepEqual(pruned, [
+    { roomId: 'room-1', fallbackId: 'fb-1', jci: JCI },
+    { roomId: 'room-2', fallbackId: 'fb-2', jci: JCI },
+  ]);
+});
+
+test('/recording-callback raises the recording alert on MPCRecordingFailed — and stores nothing', async () => {
+  const alerted = [];
+  let stored = 0;
+  plivoLog.setRecording = async () => { stored += 1; };
+  conference.alertRecordingProblem = async (m) => { alerted.push(m); return { sent: true }; };
+  assertPlainOk(await call('/recording-callback', 'post', {
+    query: { t: recToken() }, body: { EventName: 'MPCRecordingFailed', RecordingUUID: 'room-9' },
+  }));
+  assert.equal(alerted.length, 1);
+  assert.match(alerted[0], /MPCRecordingFailed · jci=944793 · recording=room-9/);
+  assert.equal(stored, 0);
 });
 
 test('⚠ an invalid token acks 200 and stores NOTHING', async () => {

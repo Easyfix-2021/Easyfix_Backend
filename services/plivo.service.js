@@ -589,6 +589,35 @@ async function downloadRecording(recordingUrl) {
 }
 
 /*
+ * One Recording object (GET /Recording/{id}/), or null on any failure — the
+ * caller treats "unknown" as "do nothing". Used by the conference-fallback
+ * pruner to check both files before it deletes one.
+ */
+async function getRecording(recordingId) {
+  const auth = authHeader();
+  if (!recordingId || !auth || !process.env.PLIVO_AUTH_ID) return null;
+  try {
+    const res = await fetch(`${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Recording/${encodeURIComponent(recordingId)}/`,
+      { headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
+    return res.ok ? await res.json() : null;
+  } catch (_e) { return null; }
+}
+
+/*
+ * DELETE /Recording/{id}/ — PERMANENT. Only pruneConferenceFallback calls it,
+ * after proving the conference room recording covers the same call.
+ */
+async function deleteRecording(recordingId) {
+  const auth = authHeader();
+  if (!recordingId || !auth || !process.env.PLIVO_AUTH_ID) return { ok: false, error: 'not configured' };
+  try {
+    const res = await fetch(`${BASE}/Account/${encodeURIComponent(process.env.PLIVO_AUTH_ID)}/Recording/${encodeURIComponent(recordingId)}/`,
+      { method: 'DELETE', headers: { Authorization: auth }, signal: AbortSignal.timeout(PLIVO_HTTP_TIMEOUT_MS) });
+    return { ok: res.ok, httpStatus: res.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+/*
  * Fetch a recording's transcription from the Plivo Transcription API
  * (GET /Account/{id}/Transcription/{recording_id}/). Returns { ok, text } —
  * `text` is null when Plivo has no transcription for that recording yet (404 —
@@ -773,6 +802,8 @@ module.exports = {
   recordingEnabled,
   fetchRecordingMeta,
   downloadRecording,
+  getRecording,
+  deleteRecording,
   fetchTranscription,
   createTranscription,
   transcriptionEnabled,
