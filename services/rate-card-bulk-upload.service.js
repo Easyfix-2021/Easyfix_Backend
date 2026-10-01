@@ -3,6 +3,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
 const { streamStyledXlsx, buildStyledWorkbook, streamWorkbook } = require('../utils/xlsx-styled-export');
+const { rowsBelowHeader } = require('../utils/xlsx-header-rows');
 const clientServicesSvc = require('./client-services.service');
 const materialRatesSvc = require('./client-material-rates.service');
 const stateService = require('./state.service');
@@ -60,13 +61,11 @@ function mkErr(status, message, extra) {
  * Rates") or the upload template — has no sheet by that name, so both fall
  * back to "whatever the one sheet is", unchanged from before this existed.
  */
-function namedOrFirstSheet(buffer, preferredName) {
+function namedOrFirstSheet(buffer, preferredName, requiredHeader) {
   const wb = XLSX.read(buffer, { type: 'buffer' });
   const wantedKey = preferredName.trim().toLowerCase();
   const matchName = wb.SheetNames.find((n) => n.trim().toLowerCase() === wantedKey);
-  const sheet = wb.Sheets[matchName || wb.SheetNames[0]];
-  if (!sheet) return [];
-  return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  return rowsBelowHeader(wb.Sheets[matchName || wb.SheetNames[0]], requiredHeader);
 }
 
 // Header lookup tolerant of case/whitespace (mirrors material-import.service.js).
@@ -147,7 +146,7 @@ async function loadExistingClientServiceByType(clientId) {
 }
 
 async function parseServiceRows(buffer, clientId) {
-  const raw = namedOrFirstSheet(buffer, 'Services');
+  const raw = namedOrFirstSheet(buffer, 'Services', 'Service Type ID');
   const [typeById, existingByTypeId] = await Promise.all([
     loadServiceTypeRef(), loadExistingClientServiceByType(clientId),
   ]);
@@ -155,8 +154,8 @@ async function parseServiceRows(buffer, clientId) {
   const seenTypeIds = new Map(); // service_type_id -> first rowNumber
   const rows = [];
 
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2;
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const errors = [];
     const warnings = [];
 
@@ -506,7 +505,7 @@ function blockAllRows(rows, message) {
  *               the material compiled cleanly.
  */
 async function parseMaterialRateRows(buffer, clientId) {
-  const raw = namedOrFirstSheet(buffer, 'Materials');
+  const raw = namedOrFirstSheet(buffer, 'Materials', 'Material');
   const ref = await loadMaterialRatesRef();
   const stateNameById = new Map([...ref.stateByKey.values()].map((s) => [s.state_id, s.state_name]));
   const existingItems = await materialRatesSvc.list(clientId);
@@ -522,8 +521,8 @@ async function parseMaterialRateRows(buffer, clientId) {
   const rows = [];
   const materials = new Map(); // bucket key -> accumulator (see doc-comment above)
 
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2;
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const errors = [];
     const warnings = [];
 
