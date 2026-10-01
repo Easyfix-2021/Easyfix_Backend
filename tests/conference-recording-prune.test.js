@@ -15,7 +15,14 @@ const assert = require('node:assert/strict');
 const { installFakePool } = require('./helpers/fake-pool');
 
 let props = [];
-installFakePool([[/FROM easyfix_properties/i, () => props]]);
+let fillAffected = 1;
+const fake = installFakePool([
+  [/FROM easyfix_properties/i, () => props],
+  [/information_schema\.columns/i, () => [{ 1: 1 }]],
+  [/SELECT recording_id, conference_id FROM tbl_plivo_call_log[^]*FOR UPDATE/i, () => [{ recording_id: 'fb-1', conference_id: 77 }]],
+  [/recording_url IS NULL/i, () => ({ affectedRows: fillAffected })],
+  [/^\s*UPDATE tbl_plivo_call_log/i, () => ({ affectedRows: 1 })],
+]);
 
 const properties = require('../services/properties.service');
 const plivo = require('../services/plivo.service');
@@ -23,6 +30,7 @@ const transcribe = require('../services/transcribe-call-analytics.service');
 const email = require('../services/email.service');
 const alerts = require('../services/plivo-balance-alert-cron');
 const conf = require('../services/plivo-conference.service');
+const plivoLog = require('../services/plivo-call-log.service');
 
 // Recording objects as Plivo returns them (fields verified on the live account
 // 2026-10-01: room c631022f… / fallback 03eab857…, conf 8759).
@@ -105,4 +113,21 @@ test('a recording problem emails the Plivo ops list — once per hour, Productio
   assert.match(mails[0].text, /fallback still records/, 'says calls are NOT being lost — so nobody panics');
   assert.equal((await conf.alertRecordingProblem('again')).why, 'throttled');
   assert.equal(mails.length, 1);
+});
+
+test('replaceRecording reads the row it replaces UNDER A ROW LOCK, then writes — the same-second race (jci 1063671/1063710)', async () => {
+  fake.reset();
+  const r = await plivoLog.replaceRecording(5001, { url: 'https://media.plivo.com/r.mp3', id: 'room-1', duration: 95 });
+  assert.deepEqual(r, { previousId: 'fb-1', conferenceId: 77 });
+  const sqls = fake.calls.map((c) => c.sql).filter((q) => /tbl_plivo_call_log/.test(q));
+  const lock = sqls.findIndex((q) => /FOR UPDATE/.test(q));
+  const write = sqls.findIndex((q) => /^\s*UPDATE tbl_plivo_call_log/i.test(q));
+  assert.ok(lock >= 0 && write > lock, 'SELECT … FOR UPDATE, then the UPDATE');
+});
+
+test('setRecording(onlyIfEmpty) reports 0 when the row is already taken — that is how the late fallback knows', async () => {
+  fillAffected = 0;
+  assert.equal(await plivoLog.setRecording(5001, { url: 'https://media.plivo.com/fb.mp3', id: 'fb-2' }, { onlyIfEmpty: true }), 0);
+  fillAffected = 1;
+  assert.equal(await plivoLog.setRecording(5001, { url: 'https://media.plivo.com/fb.mp3', id: 'fb-2' }, { onlyIfEmpty: true }), 1);
 });
