@@ -16,7 +16,7 @@ const logger = require('../logger');
 const transcribe = require('./transcribe-call-analytics.service');
 // Recording→S3 resolution was promoted here into a shared service when the
 // Gemini recording-mode analysis became a second audio consumer.
-const { ensureRecordingInS3 } = require('./call-recording.service');
+const { ensureRecordingInS3, ensureStereoRecordingInS3 } = require('./call-recording.service');
 
 async function runCallMetrics({ startLimit = 10, pollLimit = 25 } = {}) {
   if (!transcribe.enabled()) {
@@ -71,10 +71,12 @@ async function runCallMetrics({ startLimit = 10, pollLimit = 25 } = {}) {
   try {
     [pending] = await pool.query(
       // eslint-disable-next-line no-restricted-syntax -- tbl_job_caller_info.inserted_time is only ever written by its DEFAULT CURRENT_TIMESTAMP (DB clock)
-      `SELECT jci.job_caller_info AS jci, jci.unique_id AS callUuid, jci.recording AS recording
+      `SELECT jci.job_caller_info AS jci, jci.unique_id AS callUuid, jci.recording AS recording,
+              pcl.conference_id AS conferenceId, pcl.recording_url AS recordingUrl
          FROM tbl_plivo_call_log pcl
          JOIN tbl_job_caller_info jci ON jci.job_caller_info = pcl.job_caller_info_id
         WHERE pcl.call_metrics_status IS NULL
+          AND (pcl.conference_id IS NULL OR pcl.participant_role = 'operator')
           AND jci.provider = 'plivo'
           AND jci.unique_id IS NOT NULL
           AND jci.caller_status IN ('completed', 'hungup')
@@ -88,7 +90,19 @@ async function runCallMetrics({ startLimit = 10, pollLimit = 25 } = {}) {
   }
   for (const r of pending) {
     try {
-      const key = await ensureRecordingInS3({ jci: r.jci, recording: r.recording, callUuid: r.callUuid });
+      // A conference leg's stored file is the MONO room recording; analytics
+      // needs the STEREO <Record> fallback (ensureStereoRecordingInS3).
+      const key = r.conferenceId
+        ? await ensureStereoRecordingInS3({ jci: r.jci, callUuid: r.callUuid })
+        : await ensureRecordingInS3({ jci: r.jci, recording: r.recording, callUuid: r.callUuid });
+      if (!key && r.conferenceId && r.recordingUrl) {
+        // The room recording is in but no stereo file exists (pruned while Call
+        // Analytics was off) — it never will. Fail it so it stops taking a slot.
+        await pool.query("UPDATE tbl_plivo_call_log SET call_metrics_status = 'failed' WHERE job_caller_info_id = ?", [r.jci]);
+        logger.warn('call-metrics · conference jci=' + r.jci + ' has no stereo fallback recording — skipped');
+        result.failed += 1;
+        continue;
+      }
       if (!key) {
         // Recording not ready yet — leave NULL so a later run retries.
         result.noRecording += 1;

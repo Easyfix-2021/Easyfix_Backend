@@ -87,7 +87,10 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('../logger');
 const { getProperty } = require('./properties.service');
-const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC, recordingCallbackUrl } = require('./plivo.service');
+const plivo = require('./plivo.service');
+const { normaliseIndianPhone, maskForDisplay, callingEnabled, RECORD_MAX_SEC, recordingCallbackUrl } = plivo;
+const transcribe = require('./transcribe-call-analytics.service');
+const email = require('./email.service');
 const legs = require('./plivo-call-log.service');
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -750,13 +753,80 @@ async function startRoomRecording(conference, pool) {
   });
   if (!r.ok) {
     roomRecordingStarted.delete(conference.id);
-    logger.warn(`⚠ Conference room recording NOT started · conf=${conference.id} · jci=${op.job_caller_info_id}`
-      + ` · http=${r.httpStatus} · ${String(r.text || r.error || '').slice(0, 300)}`);
+    const msg = `Conference room recording NOT started · conf=${conference.id} · jci=${op.job_caller_info_id}`
+      + ` · http=${r.httpStatus} · ${String(r.text || r.error || '').slice(0, 300)}`;
+    logger.warn('⚠ ' + msg);
+    alertRecordingProblem(msg).catch(() => {});
     return { ok: false, started: false };
   }
   logger.info(`🎙 Conference room recording started on answer · conf=${conference.id} · jci=${op.job_caller_info_id}`
     + ` · http=${r.httpStatus} · ${String(r.text || '').slice(0, 300)}`);
   return { ok: true, started: true };
+}
+
+/*
+ * pruneConferenceFallback({ roomId, fallbackId, jci }) — delete the <Record>
+ * SAFETY-NET file once the conference room recording has replaced it
+ * (2026-10-01). Called by /recording-callback from whichever of the two
+ * callbacks arrives SECOND, so both ids are known. Fire-and-forget; every
+ * doubt resolves to KEEPING the file — a deletion cannot be undone.
+ *
+ * Kept (logged, not deleted) when:
+ *  - plivo.recording.prune_fallback = false (the kill switch);
+ *  - Call Analytics is enabled — it needs this STEREO file (ch0 agent /
+ *    ch1 customer); the room recording is MONO. See call-metrics-cron;
+ *  - either Recording cannot be read, or the types are not exactly
+ *    multipartycall (room) / call (fallback);
+ *  - the room recording ended > 5 s before the fallback — it did not run to
+ *    the end of the call, so the fallback holds audio it lacks.
+ * The room recording starts at answer and the fallback at operator join, so a
+ * room file that runs to the end holds everything but the pre-answer ringback.
+ */
+async function pruneConferenceFallback({ roomId, fallbackId, jci }) {
+  const keep = (why) => { logger.info(`🎙 Conference fallback KEPT · jci=${jci} · fallback=${fallbackId} · ${why}`); return { deleted: false, why }; };
+  if (!roomId || !fallbackId || roomId === fallbackId) return keep('ids');
+  if (String(getProperty('plivo.recording.prune_fallback') ?? '').trim().toLowerCase() === 'false') return keep('plivo.recording.prune_fallback=false');
+  if (transcribe.enabled()) return keep('Call Analytics is on — it needs the stereo fallback');
+  const [room, fb] = await Promise.all([plivo.getRecording(roomId), plivo.getRecording(fallbackId)]);
+  if (!room || !fb) return keep('recording lookup failed');
+  if (room.recording_type !== 'multipartycall' || fb.recording_type !== 'call') {
+    return keep(`types room=${room.recording_type} fallback=${fb.recording_type}`);
+  }
+  if (!(Number(room.recording_end_ms) >= Number(fb.recording_end_ms) - 5000)) return keep('room recording ended early');
+  const r = await plivo.deleteRecording(fallbackId);
+  if (!r.ok) return keep(`delete failed · http=${r.httpStatus || '-'} ${r.error || ''}`);
+  logger.info(`🎙 Conference fallback DELETED · jci=${jci} · fallback=${fallbackId} · room=${roomId}`);
+  return { deleted: true };
+}
+
+/*
+ * alertRecordingProblem(msg) — email the Plivo ops list (the low-balance
+ * alert's plivo.balance.alert.recipients; blank = off) when the conference
+ * room recording fails to start or Plivo reports MPCRecordingFailed. The
+ * <Record> fallback still captures the call; this is so a silent regression —
+ * the kind that cost recordings on 2026-09-24 and 09-30 — is SEEN. Production
+ * only, like the balance alert.
+ */
+// ponytail: per-process hourly throttle — each replica may send its own copy;
+// stamp in easyfix_properties (as plivo-balance-alert-cron does) if that is noisy.
+const RECORDING_ALERT_EVERY_MS = 60 * 60 * 1000;
+let lastRecordingAlertAt = 0;
+async function alertRecordingProblem(msg) {
+  const alerts = require('./plivo-balance-alert-cron');
+  if (!alerts.enabledForEnvironment()) return { sent: false, why: 'environment' };
+  const to = alerts.recipients();
+  if (!to.length) return { sent: false, why: 'no-recipients' };
+  if (Date.now() - lastRecordingAlertAt < RECORDING_ALERT_EVERY_MS) return { sent: false, why: 'throttled' };
+  lastRecordingAlertAt = Date.now();
+  await email.send({
+    to,
+    subject: 'EasyFix · Plivo conference recording problem',
+    text: `${msg}\n\nThe safety-net fallback still records conference calls from operator join (ringback included), `
+      + 'so calls are not being lost — but the answer-time room recording is failing. Check the backend log for '
+      + '"room recording" / "MPCRecordingFailed". At most one of these emails per hour per server.',
+    category: 'plivo-recording-alert',
+  });
+  return { sent: true };
 }
 
 // ─────────────────────────── DB: create ────────────────────────────────────
@@ -1597,6 +1667,8 @@ module.exports = {
   // call control
   operatorAnswerXml,
   startRoomRecording,
+  pruneConferenceFallback,
+  alertRecordingProblem,
   // provider read-backs (reconciliation)
   fetchConference,
   listParticipants,
