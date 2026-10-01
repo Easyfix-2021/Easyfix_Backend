@@ -504,6 +504,12 @@ router.post('/status', async (req, res) => {
       }, pool);
       logger.info(`📡 Conference participant JOINED · conf=${conference.id} · participant=${p.id}`
         + ` · kind=${p.target_kind} · ${p.masked_number || '-'} · member=${memberId || p.member_id || '-'}`);
+      // The first REMOTE party answering starts the room recording (see
+      // startRoomRecording). Off the response path; can never fail this webhook.
+      if (p.target_kind !== 'operator') {
+        conf.startRoomRecording(conference, pool)
+          .catch((e) => logger.warn(`⚠ Conference room recording start threw · conf=${conference.id} · ${e && e.message}`));
+      }
       return res.json({ ok: true, handled: true, event: kind });
     }
 

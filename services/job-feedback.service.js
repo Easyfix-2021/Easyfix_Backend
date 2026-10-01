@@ -32,8 +32,9 @@ async function getFeedback(jobId) {
   return row || null;
 }
 
-async function upsertFeedback(jobId, { easyfixerRating, easyfixRating, happyWithService }) {
+async function upsertFeedback(jobId, { easyfixerRating, easyfixRating, happyWithService }, userId = null) {
   logger.info('Upsert job feedback · job_id=' + jobId);
+  // feedback_by (tbl_user FK) — who recorded it, as legacy's feedback SP writes.
   // Try update first; if no row, insert. One row per job_id by convention.
   const [existing] = await pool.query(
     'SELECT feedback_id FROM tbl_customer_feedback WHERE job_id = ? LIMIT 1',
@@ -44,19 +45,42 @@ async function upsertFeedback(jobId, { easyfixerRating, easyfixRating, happyWith
       `UPDATE tbl_customer_feedback
           SET easyfixer_rating   = COALESCE(?, easyfixer_rating),
               easyfix_rating     = COALESCE(?, easyfix_rating),
-              happy_with_service = COALESCE(?, happy_with_service)
+              happy_with_service = COALESCE(?, happy_with_service),
+              feedback_by        = COALESCE(?, feedback_by)
         WHERE job_id = ?`,
-      [easyfixerRating ?? null, easyfixRating ?? null, happyWithService ?? null, jobId]
+      [easyfixerRating ?? null, easyfixRating ?? null, happyWithService ?? null, userId, jobId]
     );
   } else {
     await pool.query(
-      `INSERT INTO tbl_customer_feedback (job_id, easyfixer_rating, easyfix_rating, happy_with_service)
-       VALUES (?, ?, ?, ?)`,
-      [jobId, easyfixerRating ?? null, easyfixRating ?? null, happyWithService ?? null]
+      `INSERT INTO tbl_customer_feedback (job_id, easyfixer_rating, easyfix_rating, happy_with_service, feedback_by)
+       VALUES (?, ?, ?, ?, ?)`,
+      [jobId, easyfixerRating ?? null, easyfixRating ?? null, happyWithService ?? null, userId]
     );
   }
   logger.info('Feedback ' + (existing.length > 0 ? 'updated' : 'created') + ' · job_id=' + jobId);
   return getFeedback(jobId);
 }
 
-module.exports = { getFeedback, upsertFeedback };
+/*
+ * The technician half of legacy's sp_ef_job_save_feedback_job: one
+ * tbl_easyfixer_rating_by_customer row carrying the easyfixer rating, which is
+ * what computeRating / grade / candidate-ranking average. Called once, when a
+ * CRM user moves the job into 5 (setStatus) — a later feedback edit updates
+ * tbl_customer_feedback only, so the average never counts a job twice.
+ * insert_date_time on the app clock: the 90-day window reads it (see
+ * mobile-performance.service.js computeRating).
+ */
+async function recordTechnicianRating(jobId) {
+  const [res] = await pool.query(
+    `INSERT INTO tbl_easyfixer_rating_by_customer (easyfixer_id, job_id, customer_rating, insert_date_time)
+     SELECT j.fk_easyfixter_id, j.job_id, f.easyfixer_rating, ?
+       FROM tbl_job j
+       JOIN tbl_customer_feedback f ON f.job_id = j.job_id
+      WHERE j.job_id = ? AND j.fk_easyfixter_id IS NOT NULL AND f.easyfixer_rating IS NOT NULL
+      LIMIT 1`,
+    [new Date(), jobId]
+  );
+  logger.info('Technician rating recorded · job_id=' + jobId + ' · rows=' + (res?.affectedRows ?? 0));
+}
+
+module.exports = { getFeedback, upsertFeedback, recordTechnicianRating };

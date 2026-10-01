@@ -304,13 +304,15 @@ async function markAnswered(jci, callUuid, recordRequested = null) {
  * for this jci. Without the filter one recording would be filed on all three
  * legs and the Calls list would offer the same audio three times.
  */
-async function setRecording(jci, { url, id, duration } = {}) {
+// onlyIfEmpty: never overwrite a stored recording (the <Record> safety net
+// must not clobber the conference room recording — see startRoomRecording).
+async function setRecording(jci, { url, id, duration } = {}, { onlyIfEmpty = false } = {}) {
   if (jci == null || !url) return;
   try {
     await pool.query(
       `UPDATE tbl_plivo_call_log
           SET recording_url = ?, recording_id = ?, recording_duration = ?, updated_on = ?
-        WHERE job_caller_info_id = ?${await primaryLegFilter()}`,
+        WHERE job_caller_info_id = ?${await primaryLegFilter()}${onlyIfEmpty ? ' AND recording_url IS NULL' : ''}`,
       [String(url), id || null, duration != null ? Number(duration) : null, new Date(), jci],
     );
     logger.info('Plivo call-log recording stored · jci=' + jci + ' · id=' + (id || '?'));

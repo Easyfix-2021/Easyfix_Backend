@@ -4130,7 +4130,7 @@ router.put('/:id/feedback',
   async (req, res, next) => {
     try {
       logger.info('Save job feedback · jobId=' + req.params.id);
-      const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body);
+      const row = await jobFeedback.upsertFeedback(Number(req.params.id), req.body, req.user?.user_id || null);
       logger.info('Job feedback saved · jobId=' + req.params.id);
       modernOk(res, row, 'Feedback saved');
     } catch (e) { next(e); }
@@ -4454,6 +4454,37 @@ router.get('/images/:imageId/url', async (req, res, next) => {
  * tag receives the bytes. 404 when the row is missing, out-of-scope, or the
  * S3 object is gone.
  */
+/*
+ * Shared by /videos/:mediaId/file and /videos/:mediaId/url so both resolve
+ * identically. Returns { status, error } or { url }.
+ */
+async function resolveJobVideo(req, mediaId) {
+  const [[row]] = await imagePool.query(
+    'SELECT media_id, job_id, s3_key FROM tbl_job_media WHERE media_id = ? LIMIT 1',
+    [mediaId],
+  );
+  if (!row || !row.s3_key) return { status: 404, error: 'video not found' };
+
+  const j = await job.getById(row.job_id);
+  if (!j) return { status: 404, error: 'video not found' };
+  const guard = assertEntityInScope(req, {
+    client_id:   j.fk_client_id,
+    city_id:     j.city_id,
+    vertical_id: j.vertical_id,
+  });
+  if (!guard.ok) return { status: 404, error: 'video not found' };
+
+  if (!s3Storage.isEnabled()) return { status: 503, error: 'video storage not configured' };
+  try {
+    if (await s3Storage.exists(row.s3_key)) {
+      return { url: await s3Storage.getPresignedUrl(row.s3_key) };
+    }
+  } catch (e) {
+    uploadLogger.warn({ mediaId, jobId: row.job_id, key: row.s3_key, err: e?.message }, 'video s3 lookup failed');
+  }
+  return { status: 404, error: 'video file not found in S3' };
+}
+
 router.get('/videos/:mediaId/file', async (req, res, next) => {
   try {
     const mediaId = Number(req.params.mediaId);
@@ -4461,33 +4492,27 @@ router.get('/videos/:mediaId/file', async (req, res, next) => {
       return modernError(res, 400, 'invalid mediaId');
     }
     logger.info('Serve job video file · mediaId=' + mediaId);
-    const [[row]] = await imagePool.query(
-      'SELECT media_id, job_id, s3_key FROM tbl_job_media WHERE media_id = ? LIMIT 1',
-      [mediaId],
-    );
-    if (!row || !row.s3_key) return modernError(res, 404, 'video not found');
+    const r = await resolveJobVideo(req, mediaId);
+    return r.url ? res.redirect(r.url) : modernError(res, r.status, r.error);
+  } catch (e) { next(e); }
+});
 
-    const j = await job.getById(row.job_id);
-    if (!j) return modernError(res, 404, 'video not found');
-    const guard = assertEntityInScope(req, {
-      client_id:   j.fk_client_id,
-      city_id:     j.city_id,
-      vertical_id: j.vertical_id,
-    });
-    if (!guard.ok) return modernError(res, 404, 'video not found');
-
-    if (!s3Storage.isEnabled()) {
-      return modernError(res, 503, 'video storage not configured');
+/*
+ * GET /api/admin/jobs/videos/:mediaId/url — the JSON twin of /file, for the
+ * same reason /images/:imageId/url exists: a <video src> sends no
+ * Authorization header, and the CRM's customer-video strip was pointing one
+ * straight at /file with no token at all, so every tile 401'd (2026-09-30).
+ * Called WITH the header; the CRM plays the presigned URL it returns.
+ * `url: null` for anything unresolvable or out of scope — same no-oracle rule.
+ */
+router.get('/videos/:mediaId/url', async (req, res, next) => {
+  try {
+    const mediaId = Number(req.params.mediaId);
+    if (!Number.isInteger(mediaId) || mediaId <= 0) {
+      return modernError(res, 400, 'invalid mediaId');
     }
-    try {
-      if (await s3Storage.exists(row.s3_key)) {
-        const url = await s3Storage.getPresignedUrl(row.s3_key);
-        return res.redirect(url);
-      }
-    } catch (e) {
-      uploadLogger.warn({ mediaId, jobId: row.job_id, key: row.s3_key, err: e?.message }, 'video s3 lookup failed');
-    }
-    return modernError(res, 404, 'video file not found in S3');
+    const r = await resolveJobVideo(req, mediaId);
+    return modernOk(res, { mediaId, url: r.url || null });
   } catch (e) { next(e); }
 });
 

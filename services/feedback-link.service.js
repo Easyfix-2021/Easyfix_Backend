@@ -6,13 +6,14 @@
  * mandatory. Nothing could produce such a link: no code in this repo built a
  * /feedback/ URL at all. This is that missing half.
  *
- * WHO ACTUALLY SENDS THE LINK TODAY — worth knowing before using this.
- * This backend does NOT send a feedback link. Its own completion SMS
- * (notification-orchestrator, TechVisitComplete) says "Please rate your
- * experience" with no URL in it, and no template key it reads mentions
- * feedback. The link a customer receives is produced OUTSIDE this codebase, by
- * the legacy system — which signs with a different secret and therefore cannot
- * mint one of these tokens.
+ * WHO ACTUALLY SENDS THE LINK — worth knowing before using this.
+ * This backend's completion SMS (notification-orchestrator, TechVisitComplete)
+ * appends mintFeedbackLink()'s URL, but ONLY while the property
+ * `job.feedback_link.enabled` is 'true' — appending a URL changes a
+ * DLT-registered body, so ops registers the new template first. With it off
+ * (the default; unset on QA, 2026-09-30) that SMS carries no link, and the
+ * link a customer holds comes from the legacy system OUTSIDE this codebase,
+ * which signs with a different secret and cannot mint one of these tokens.
  *
  * So a tokenised link has to originate here. mintFeedbackLink() is what any
  * sender in this repo calls, and feedbackUrl() is the shape to give whoever

@@ -636,6 +636,10 @@ const statusBody = Joi.object({
   comment: Joi.string().max(500).optional(),
   extras: Joi.object({
     revisit_reason_id: intId.optional(),
+    // Audit & Checkout confirms Collected By with the completion (legacy's
+    // checkout screen allows only 1 Easyfixer / 2 Easyfix). Completions only.
+    collected_by: Joi.number().integer().valid(1, 2)
+      .when('/status', { is: Joi.valid(3, 5), otherwise: Joi.forbidden() }),
   }).optional(),
 });
 

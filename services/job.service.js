@@ -3286,24 +3286,34 @@ async function list({
    */
   if (sourceType) { clauses.push('j.source_type = ?'); params.push(sourceType); }
   if (stateId != null)     { clauses.push('ci.state_id = ?');        params.push(stateId); }
-  // Vertical filter — tbl_vertical_mapping is many-to-many across
-  // (client_id, vertical_id, [user_id]). EXISTS is cheaper than a
-  // JOIN because it short-circuits on first match per row and avoids
-  // row multiplication when a client maps to multiple verticals.
-  if (verticalId != null) {
-    clauses.push('EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.vertical_id = ?)');
-    params.push(verticalId);
-  }
-  // Project Manager — the PM is the user mapped to the job's client in
-  // tbl_vertical_mapping with user_type = 1. EXISTS mirrors the verticalId
-  // shape above; the subquery is self-contained (references only vm + the
-  // outer j alias), so it introduces NO new outer alias and the COUNT-join
-  // detection below is unaffected.
+  /*
+   * Vertical + Project Manager — both reach the job through its CLIENT on
+   * tbl_vertical_mapping (many-to-many; the PM is the user_type = 1 row).
+   *
+   * RESOLVED TO A CLIENT IN-LIST FIRST, never a correlated EXISTS (2026-09-30).
+   * MySQL 8 rewrites that EXISTS into a semijoin driven FROM the mapping table,
+   * which under view=manage materialised EVERY matching job (205k for vertical
+   * 1) and ran ~30 correlated projection subqueries per row before the filesort
+   * cut it to 10: 22-45 s on Production, one pooled connection pinned the whole
+   * time. A literal IN-list walks the job PK backwards and stops at the page
+   * (84-309 ms), and keeps COUNT on the FK index. NO_SEMIJOIN fixed the page but
+   * turned COUNT into a 2 s full scan. tests/job-vertical-filter.test.js.
+   *
+   * `j.` only, so the COUNT-join detection below is unaffected. No mapped
+   * client → 1=0: empty, never unfiltered.
+   * ponytail: the smallest vertical (2.4k of 481k jobs) scans the PK ~1.4 s to
+   * fill a page; a deferred join (ids first, like the export) if that matters.
+   */
+  const clientsIn = async (where, bind) => {
+    const [rows] = await pool.query(`SELECT DISTINCT client_id FROM tbl_vertical_mapping WHERE ${where}`, bind);
+    const ids = rows.map((r) => r.client_id).filter((id) => id != null);
+    if (!ids.length) { clauses.push('1=0'); return; }
+    clauses.push(`j.fk_client_id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  };
+  if (verticalId != null) await clientsIn('vertical_id = ?', [verticalId]);
   const pmIdList = toIdArray(projectManagerId);
-  if (pmIdList.length) {
-    clauses.push(`EXISTS (SELECT 1 FROM tbl_vertical_mapping vm WHERE vm.client_id = j.fk_client_id AND vm.user_type = 1 AND vm.user_id IN (${pmIdList.map(() => '?').join(',')}))`);
-    params.push(...pmIdList);
-  }
+  if (pmIdList.length) await clientsIn(`user_type = 1 AND user_id IN (${pmIdList.map(() => '?').join(',')})`, pmIdList);
   // Zonal Manager — a city's zonal owner is tbl_city.state_user. `ci` is the
   // tbl_city alias already joined in LIST_JOIN; the `ci.` literal here trips
   // the needsCi detection below so the COUNT query also joins tbl_address +
@@ -3971,6 +3981,27 @@ async function getByIdCore(jobId) {
             ow.user_name AS owner_name,
             cr.user_name AS created_by_name,
             (SELECT u2.user_name FROM tbl_user u2 WHERE u2.user_id = j.cancel_by LIMIT 1) AS cancelled_by_name,
+            /*
+             * WHO authorized the job, as a NAME. The CRM's Audit & History card
+             * was rendering the raw j.approved_by_client_contact integer in its
+             * "Approved By" cell, so an authorized job showed a number (1639).
+             *
+             * The approver is the CLIENT CONTACT, not a tbl_user: the client
+             * approval path writes approved_by_client_contact alongside
+             * approved_on_date_time (routes/client/index.js), and the public
+             * estimate route already resolves it through the same table.
+             *
+             * NOT j.approved_by_client, which looks like a person and is not —
+             * it is a status flag holding 0/1/2 (job-export.service.js filters
+             * on = 0 / = 2), and joining it to tbl_user coincidentally
+             * resolves id 2 to a real operator on 94k rows.
+             *
+             * Correlated subquery rather than a JOIN because tbl_client_contacts
+             * is already joined once on a DIFFERENT column (reporting_contact_id)
+             * — same shape as cancelled_by_name above.
+             */
+            (SELECT cc.contact_name FROM tbl_client_contacts cc
+              WHERE cc.id = j.approved_by_client_contact LIMIT 1) AS approved_by_name,
             (SELECT atr.action_desc FROM action_taken_reason atr WHERE atr.id = j.cancel_reason_id LIMIT 1) AS cancel_reason_name,
             /* The two app-REQUEST reason texts (see buildAppRequest below).
                Separate aliases, not one COALESCE like the LIST's
@@ -6279,7 +6310,10 @@ function statusToEventName(prevStatus, newStatus) {
   // rely on NO event firing (see routes/mobile/index.js).
   if (Number(prevStatus) === Number(newStatus)) return null;
   if (newStatus === STATUS.IN_PROGRESS)   return 'TechStart';
-  if (COMPLETED_STATES.has(newStatus))    return 'TechVisitComplete';
+  // 3 → 5 (Feedback & Complete) closes nothing new: the visit was reported
+  // complete when the job ENTERED 3, so a second TechVisitComplete would be a
+  // duplicate at every webhook client.
+  if (COMPLETED_STATES.has(newStatus))    return COMPLETED_STATES.has(Number(prevStatus)) ? null : 'TechVisitComplete';
   if (newStatus === STATUS.CANCELLED)     return 'CancelJob';
   if (newStatus === STATUS.REVISIT)       return 'TechVisitInComplete';
   // Unreachable outcome → CustomerNotReachable. Legacy CRM didn't
@@ -6361,6 +6395,11 @@ const STATUS_EXTRAS_ALLOWLIST = new Set([
   // name, and readers still see it on the job row, so the contract the
   // technician app depends on is unchanged.
   'material_sub_status', 'permission_required',
+  // Audit & Checkout (10 → 3, 2026-09-30) — ops confirm Collected By in the
+  // same call, as legacy's sp_ef_checkout_job_and_update_transaction writes it
+  // with the checkout. Inside the ledger transaction, so the posting reads the
+  // value just written. validators/job.validator.js statusBody admits it only on 3 / 5.
+  'collected_by',
 ]);
 
 /*
@@ -6700,6 +6739,12 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
   } else if (COMPLETED_STATES.has(Number(status))) {
     sets.push('checkout_date_time = COALESCE(checkout_date_time, ?)', 'fk_checkout_by = COALESCE(fk_checkout_by, ?)');
     values.push(new Date(), crmUserId);
+    // Feedback & Complete (3 → 5): legacy sp_ef_job_update_job('Feedback')
+    // stamps who closed the feedback and when. COALESCE, like the checkout pair.
+    if (Number(status) === STATUS.COMPLETED_ALT) {
+      sets.push('feedback_date_time = COALESCE(feedback_date_time, ?)', 'fk_feedback_by = COALESCE(fk_feedback_by, ?)');
+      values.push(new Date(), crmUserId);
+    }
     // Sent-back lifecycle (mobile app spec): when a tech re-closes a
     // job that was sent back from the CRM, reset the flag so the
     // "Action Required" tile stops counting it. Conditionally
@@ -6918,6 +6963,11 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
     }
     if (Number(status) === STATUS.REVISIT && Number(existing.job_status) !== STATUS.REVISIT) {
       await jobLog.logRevisitRequired(jobId, { reasonId: extras?.revisit_reason_id }, actor);
+    }
+    // Feedback & Complete: the technician's rating joins the average that
+    // grades and ranks technicians, as legacy's feedback SP inserts it.
+    if (Number(status) === STATUS.COMPLETED_ALT && Number(existing.job_status) !== STATUS.COMPLETED_ALT && crmUserId) {
+      await require('./job-feedback.service').recordTechnicianRating(jobId);
     }
   } catch (e) {
     logger.warn('Job history write failed (non-fatal) · id=' + jobId + ' · ' + e.message);
@@ -7403,6 +7453,29 @@ async function releaseOwnedJobForReoffer(jobId, preloadedJob, { reasonId, resche
         WHERE job_id = ? AND offer_status = ${OFFER_STATUS.OFFERED}`,
       [new Date(), ...crRelease.params, jobId],
     );
+    /*
+     * The OUTGOING technician's own ACCEPTED row stays ACCEPTED — they did
+     * accept, and acceptance stats count that — but is stamped released, so it
+     * no longer reads as "still holds this job" (job 543336: 11599's row read
+     * accepted after the 2026-09-30 reassign to 4204). Latest row only, as in
+     * applyUnassignLocked; responded_at untouched (it is the first-accept
+     * record). No-op on a deploy without the column.
+     */
+    if (releasedTechId != null && crRelease.params.length) {
+      await conn.query(
+        `UPDATE tbl_job_offer
+            SET closed_reason = ?
+          WHERE job_offer_id = (
+            SELECT latest_id FROM (
+              SELECT MAX(job_offer_id) AS latest_id
+                FROM tbl_job_offer
+               WHERE job_id = ? AND fk_easyfixter_id = ?
+            ) latest_offer
+          )
+            AND offer_status = ${OFFER_STATUS.ACCEPTED}`,
+        [...crRelease.params, jobId, releasedTechId],
+      );
+    }
     await conn.commit();
     return releasedTechId;
   } catch (e) {
