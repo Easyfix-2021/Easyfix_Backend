@@ -45,6 +45,8 @@ const fake = installFakePool([
   }],
   [/FROM tbl_employee_leave_request r WHERE r\.id = \? FOR UPDATE/i, (_s, [id]) => [reqRow(id)]],
   [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.id = \?/i, (_s, [id]) => [{ ...reqRow(id), status: 'APPROVED', user_name: 'U' + reqRow(id).user_id }]],
+  [/COUNT\(\*\) AS total FROM tbl_employee_leave_request r WHERE r\.user_id = \?/i, [{ total: 1 }]],
+  [/LEFT JOIN tbl_user d[\s\S]*WHERE r\.user_id = \?[\s\S]*LIMIT \?, \?/i, [{ ...reqRow(2), status: 'REJECTED', user_name: 'U2' }]],
   [/SELECT user_id, reporting_manager/i, ADJ],
   [/FROM tbl_user u LEFT JOIN tbl_role r/i, (_s, p) => p.map((id) => ({ user_id: id, user_name: 'U' + id, user_code: null, role_name: 'Ops' }))],
   [/FROM tbl_user u\s+LEFT JOIN tbl_role r ON r\.role_id = u\.user_role\s+WHERE/i, () => [2, 3].map((id) => ({ user_id: id, user_name: 'U' + id }))],
@@ -121,6 +123,25 @@ test('params / query / decide body are validated', async () => {
     assert.equal(r.status, 400, label);
     assert.equal(r.body.error, 'Validation failed', label);
   }
+});
+
+test('past requests: the caller\'s own page — Joi defaults reach the service; page < 1 and limit 0 / 101 / junk are 400', async () => {
+  fake.calls.length = 0;
+  const ok = await call(2, '/leave/requests/past');
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.deepEqual([ok.body.data.total, ok.body.data.items.map((i) => [i.id, i.status, i.userId])], [1, [[2, 'REJECTED', 2]]]);
+  const q = fake.calls.findLast((c) => /LIMIT \?, \?/.test(c.sql));
+  assert.deepEqual([q.params[0], ...q.params.slice(-2)], [2, 0, 20], 'the token\'s user, page 1, limit 20');
+  await call(7, '/leave/requests/past?page=3&limit=100');
+  assert.deepEqual(fake.calls.findLast((c) => /LIMIT \?, \?/.test(c.sql)).params.filter((p) => typeof p === 'number'), [7, 200, 100], 'user 7, page 3 → offset 200');
+  assert.equal((await call(2, '/leave/requests/past?limit=100')).status, 200, 'CONTROL — 100 is the cap, allowed');
+  fake.calls.length = 0;
+  for (const qs of ['limit=0', 'limit=101', 'page=0', 'page=abc', 'limit=1.5']) {
+    const r = await call(2, '/leave/requests/past?' + qs);
+    assert.equal(r.status, 400, qs);
+    assert.equal(r.body.error, 'Validation failed', qs);
+  }
+  assert.equal(fake.calls.filter((c) => /tbl_employee_leave_request/.test(c.sql)).length, 0, 'no query ran for a bad request');
 });
 
 test('a submit without a reason is the service\'s 400 (Joi lets it through); nothing is written', async () => {

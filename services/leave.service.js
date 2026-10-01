@@ -416,6 +416,23 @@ async function me({ userId, month }) {
   };
 }
 
+/*
+ * Past Requests (owner, 2026-10-01): the caller's OWN requests that me().requests
+ * leaves out — ended before the current IST month, or REJECTED / WITHDRAWN /
+ * CANCELLED whenever. The exact complement of me()'s filter, newest first.
+ */
+async function pastRequests({ userId, page = 1, limit = 20 }) {
+  const uid = Number(userId);
+  const l = Math.max(1, Math.min(Number(limit) || 20, 100));
+  const offset = (Math.max(1, Number(page) || 1) - 1) * l;
+  const where = "WHERE r.user_id = ? AND (r.to_date < ? OR r.status IN ('REJECTED', 'WITHDRAWN', 'CANCELLED'))";
+  const params = [uid, monthBounds(currentIstMonth()).start];
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM tbl_employee_leave_request r ${where}`, params);
+  const [rows] = await pool.query(`${REQ_SELECT} ${where} ORDER BY r.from_date DESC, r.id DESC LIMIT ?, ?`, [...params, offset, l]);
+  const today = todayIst();
+  return { total: Number(total), items: rows.map((r) => toRow(r, { actorId: uid, today })) };
+}
+
 // ─── SL popup ─────────────────────────────────────────────────────────
 /*
  * Unacked PENDING sick leave I must decide: approver = me, or — for a Roster
@@ -454,5 +471,5 @@ async function ackAlert({ userId, key }) {
 module.exports = {
   KINDS, DURATIONS, STATUS,
   checkRequest, countWorkingDays, composeMail,
-  create, withdraw, cancel, decide, approvals, me, alerts, ackAlert,
+  create, withdraw, cancel, decide, approvals, me, pastRequests, alerts, ackAlert,
 };
