@@ -140,7 +140,26 @@ async function generateBrandErrorsXlsx(res, buffer) {
 
 // ─── Material import ────────────────────────────────────────────────────
 
+/*
+ * The example row is built from REAL reference data. It used to say
+ * "Electrical" — no such category exists (QA/Prod: "Electrician Services") —
+ * so anyone copying the example got "Unknown category" on every row.
+ * Exported for tests.
+ */
+function templateExampleRow(ref) {
+  const byName = (m, key) => [...m.values()].sort((a, b) => String(a[key]).localeCompare(String(b[key])));
+  const category = byName(ref.categoryByKey, 'service_catg_name')[0]?.service_catg_name || '';
+  const uoms = byName(ref.uomByKey, 'uom_name');
+  const uom = (uoms.find((u) => nameKey(u.uom_name) === nameKey('Nos')) || uoms[0])?.uom_name || '';
+  const brands = byName(ref.brandByKey, 'brand_name').filter((b) => !Number(b.is_system)).slice(0, 2).map((b) => b.brand_name);
+  return {
+    material_name: 'Adapter 5A', category, pricing_type: 'Fixed',
+    uom, description: '', brands: brands.join(', '), price: 150,
+  };
+}
+
 async function generateMaterialTemplate(res) {
+  const example = templateExampleRow(await loadImportReferenceData());
   await streamStyledXlsx(res, 'easyfix-material-import-template.xlsx', {
     title: 'EasyFix · Material Import Template',
     meta: 'One row = one brand group. Rows sharing Material Name + Category are the same material.',
@@ -154,10 +173,7 @@ async function generateMaterialTemplate(res) {
       { header: 'Brands', key: 'brands', width: 28 },
       { header: 'Price', key: 'price', width: 12 },
     ],
-    rows: [{
-      material_name: 'Adapter 5A', category: 'Electrical', pricing_type: 'Fixed',
-      uom: 'Nos', description: '', brands: 'Philips, Havells', price: 150,
-    }],
+    rows: [example],
   });
 }
 
@@ -452,5 +468,5 @@ async function generateMaterialErrorsXlsx(res, buffer, { canCreateBrands = false
 module.exports = {
   mkErr,
   generateBrandTemplate, previewBrandImport, commitBrandImport, generateBrandErrorsXlsx,
-  generateMaterialTemplate, previewMaterialImport, commitMaterialImport, generateMaterialErrorsXlsx,
+  generateMaterialTemplate, templateExampleRow, previewMaterialImport, commitMaterialImport, generateMaterialErrorsXlsx,
 };

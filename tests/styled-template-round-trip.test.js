@@ -41,7 +41,10 @@ describe('styled import templates round-trip through their own importer', () => 
       // Manage Materials import (brand + material).
       [/SELECT brand_id, brand_name, brand_key FROM tbl_brand_master$/im, () => []],
       [/SELECT brand_id, brand_name, brand_key FROM tbl_brand_master\s*$/im, () => []],
-      [/FROM tbl_service_catg WHERE service_catg_status = 1/i, () => [{ service_catg_id: 3, service_catg_name: 'Electrical' }]],
+      // Real QA/Prod names (2026-10-01) — there is NO "Electrical" category.
+      [/FROM tbl_service_catg WHERE service_catg_status = 1/i, () => [
+        { service_catg_id: 5, service_catg_name: 'Carpentry Services' }, { service_catg_id: 1, service_catg_name: 'Electrician Services' },
+      ]],
       [/FROM tbl_uom_master WHERE status = 1/i, () => [{ uom_id: 1, uom_name: 'Nos' }]],
       [/SELECT brand_id, brand_name, brand_key, is_system FROM tbl_brand_master/i, () => [
         { brand_id: 1, brand_name: 'Philips', brand_key: 'philips', is_system: 0 },
@@ -76,6 +79,27 @@ describe('styled import templates round-trip through their own importer', () => 
     { name: 'Rate Card · Services', generate: (r) => rc().generateServicesTemplate(r), preview: (b) => rc().previewServicesUpload(b, 900), exampleRows: 1 },
     { name: 'Rate Card · Materials', generate: (r) => rc().generateMaterialRatesTemplate(r), preview: (b) => rc().previewMaterialRatesUpload(b, 900), exampleRows: 2 },
   ];
+
+  it('Manage Materials · Material: the example row itself imports clean (built from real reference data)', async () => {
+    const out = await mi().previewMaterialImport(await templateBuffer((r) => mi().generateMaterialTemplate(r)));
+    assert.deepEqual(out.rows[0].errors, [], 'the example must validate against the same data it was built from');
+    assert.equal(out.rows[0].outcome, 'NEW');
+  });
+
+  it('templateExampleRow: first category A-Z, prefers Nos, two non-system brands, blank brands when none', () => {
+    const { templateExampleRow } = mi();
+    const m = (rows, key) => new Map(rows.map((r) => [String(r[key]).toLowerCase(), r]));
+    const ref = {
+      categoryByKey: m([{ service_catg_name: 'Plumbing Services' }, { service_catg_name: 'Carpentry Services' }], 'service_catg_name'),
+      uomByKey: m([{ uom_name: 'KG' }, { uom_name: 'Nos' }], 'uom_name'),
+      brandByKey: m([{ brand_name: 'Zeta', is_system: 0 }, { brand_name: 'Alpha', is_system: 0 }, { brand_name: 'Beta', is_system: 0 }, { brand_name: 'AAA System', is_system: 1 }], 'brand_name'),
+    };
+    const ex = templateExampleRow(ref);
+    assert.equal(ex.category, 'Carpentry Services');
+    assert.equal(ex.uom, 'Nos');
+    assert.equal(ex.brands, 'Alpha, Beta', 'system brands are never suggested');
+    assert.equal(templateExampleRow({ ...ref, brandByKey: new Map() }).brands, '', 'no brands → blank = No Brand');
+  });
 
   for (const t of TEMPLATES) {
     it(`${t.name}: the template's example row(s) are read as data at Excel row 5+, with no "required" error`, async () => {
