@@ -3,6 +3,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
 const { streamStyledXlsx } = require('../utils/xlsx-styled-export');
+const { rowsBelowHeader } = require('../utils/xlsx-header-rows');
 const brandSvc = require('./brand.service');
 const materialSvc = require('./material.service');
 
@@ -18,11 +19,9 @@ const materialSvc = require('./material.service');
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
-function firstSheet(buffer) {
+function firstSheet(buffer, requiredHeader) {
   const wb = XLSX.read(buffer, { type: 'buffer' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  if (!sheet) return [];
-  return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  return rowsBelowHeader(wb.Sheets[wb.SheetNames[0]], requiredHeader);
 }
 
 // Header lookup tolerant of the trailing "*" required-marker and case.
@@ -49,14 +48,14 @@ async function generateBrandTemplate(res) {
 }
 
 async function parseBrandRows(buffer) {
-  const raw = firstSheet(buffer);
+  const raw = firstSheet(buffer, 'Brand Name');
   const [existingRows] = await pool.query('SELECT brand_id, brand_name, brand_key FROM tbl_brand_master');
   const existingByKey = new Map(existingRows.map((r) => [r.brand_key, r]));
 
   const seenInFile = new Map(); // key -> { rowNumber, brand_name }
   const rows = [];
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2; // header is row 1
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const brand_name = String(cell(r, 'Brand Name') || '').trim();
     const errors = [];
     let outcome = 'NEW';
@@ -186,7 +185,7 @@ async function loadImportReferenceData() {
  * shape) plus the material groups needed by commit() to actually write.
  */
 async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
-  const raw = firstSheet(buffer);
+  const raw = firstSheet(buffer, 'Material Name');
   const ref = await loadImportReferenceData();
   const [existingMaterials] = await pool.query(
     'SELECT material_id, material_key, service_catg_id FROM tbl_material_master'
@@ -197,8 +196,8 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
   const materials = new Map(); // groupKey -> accumulator
   const rows = [];
 
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2;
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const errors = [];
     const material_name = String(cell(r, 'Material Name') || '').trim();
     const categoryName = String(cell(r, 'Category') || '').trim();
