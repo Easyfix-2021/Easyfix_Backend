@@ -18,6 +18,8 @@ const {
   paymentCollectedByCode,
   jobUiStatus,
   legacyJobEntity,
+  resolveReportingContactId,
+  INTEGRATION_CREATED_BY,
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 const logger = require('../../../logger');
@@ -105,8 +107,14 @@ router.post(['/jobs', '/jobs/newJob'], async (req, res, next) => {
       logger.warn('Integration: job created with UNRESOLVED city · "' + unknownName + '" · client=' + req.integrationClient.id);
     }
 
+    const reportingContactId = await resolveReportingContactId(pool, req.integrationClient.id, {
+      reportingContactId: b.reportingContactId, clientSpocEmail: b.clientSpocEmail,
+    });
+
     const created = await jobService.create({
       fk_client_id: req.integrationClient.id,
+      reporting_contact_id: reportingContactId,
+      fk_created_by: INTEGRATION_CREATED_BY,
       job_desc: b.jobDesc,
       job_type: b.jobType || 'Installation',
       source_type: b.sourceType || 'integration',

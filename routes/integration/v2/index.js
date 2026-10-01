@@ -7,6 +7,7 @@ const jobService = require('../../../services/job.service');
 const { legacyError } = require('../../../utils/response');
 const {
   parseLegacyDate, resolveCityId, paymentCollectedByCode, legacyJobEntity,
+  resolveReportingContactId, INTEGRATION_CREATED_BY,
 } = require('../../../services/integration.service');
 const { writeBuffer } = require('../../../utils/file-storage');
 const logger = require('../../../logger');
@@ -132,8 +133,14 @@ router.post('/jobs', acceptImages, async (req, res, next) => {
      * the envelope, never the semantics — a partner moving from v1 to v2 must
      * not have to re-learn what any field does.
      */
+    const reportingContactId = await resolveReportingContactId(pool, req.integrationClient.id, {
+      reportingContactId: b.reportingContactId, clientSpocEmail: b.clientSpocEmail,
+    });
+
     const created = await jobService.create({
       fk_client_id: req.integrationClient.id,
+      reporting_contact_id: reportingContactId,
+      fk_created_by: INTEGRATION_CREATED_BY,
       job_desc: b.jobDesc,
       job_type: b.jobType || 'Installation',
       source_type: b.sourceType || 'integration_v2',

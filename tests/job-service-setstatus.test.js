@@ -172,3 +172,30 @@ test('3 → 5 stamps feedback_date_time and fk_feedback_by, write-once', async (
   assert.match(upd.sql, /feedback_date_time = COALESCE\(feedback_date_time, \?\)/);
   assert.match(upd.sql, /fk_feedback_by = COALESCE\(fk_feedback_by, \?\)/);
 });
+
+/*
+ * Booking (→ 0) stamps fk_created_by with the booking operator, OVERWRITING any
+ * value an integration (e.g. the Decathlon webhook) set on the Unconfirmed row.
+ */
+test('9 → 0 overwrites fk_created_by with the booking CRM user', async () => {
+  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null, fk_created_by: 555 };
+  try {
+    await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 });
+  } catch (e) { if (!e.__stop) throw e; }
+  const upd = lastUpdate();
+  assert.ok(upd, 'an UPDATE tbl_job should have been issued');
+  assert.match(upd.sql, /fk_created_by = \?/);
+  assert.doesNotMatch(upd.sql, /COALESCE\(fk_created_by/, 'must overwrite, not keep the webhook user');
+  assert.ok(upd.params.includes(17), 'the booking operator is bound');
+});
+
+test('0 → 0 re-submit and a technician actor leave fk_created_by alone', async () => {
+  scenario.jobMeta = { ...META, job_status: 0, fk_easyfixter_id: null };
+  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 17 }); } catch (e) { if (!e.__stop) throw e; }
+  assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, 'same-status is not a booking');
+
+  fake.calls.length = 0;
+  scenario.jobMeta = { ...META, job_status: 9, fk_easyfixter_id: null };
+  try { await jobSvc.setStatus(42, { status: 0 }, { user_id: 'efr:88' }); } catch (e) { if (!e.__stop) throw e; }
+  assert.doesNotMatch(lastUpdate().sql, /fk_created_by/, 'a tech has no tbl_user row');
+});

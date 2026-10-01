@@ -5498,7 +5498,9 @@ async function create(input, actor) {
         // identity shape) the implicit coercion silently writes 0 or
         // NULL. Number()-coerce + falsy guard makes the binding
         // explicit and matches the runtime intent.
-        (() => { const n = Number(actor?.user_id); return Number.isFinite(n) && n > 0 ? n : null; })(),
+        // input.fk_created_by is the fallback for actor-less callers (partner API
+        // → 'System-crm'); passing it as the actor instead would also make it job_owner.
+        (() => { const n = Number(actor?.user_id || input.fk_created_by); return Number.isFinite(n) && n > 0 ? n : null; })(),
         // initial_status — legacy footer-button parity. Defaults to
         // BOOKED (0); operators can pick ENQUIRY (7) or CALL_LATER (9)
         // at the booking modal's footer to route the new row to the
@@ -6680,17 +6682,18 @@ async function setStatus(jobId, { status, reasonId, comment, extras }, actor, { 
         values.push(String(generateOtp()));
       }
     }
-    // Stamp fk_created_by on confirmation when the row has none yet — e.g. an
-    // Unconfirmed/integration job, or one created by a technician (no tbl_user
-    // creator). COALESCE preserves a real creator already set by create()
-    // (Book-New-Call). fk_created_by is a tbl_user FK, so coerce the actor id
-    // the same way create() does: a technician actor ("efr:NNN" → NaN) resolves
-    // to null rather than corrupting the column. This also fixes the legacy
-    // "Booking Confirmed" window, which shows the name via
-    // fk_created_by → tbl_user.user_name (so a NULL left the name blank).
+    // Stamp fk_created_by with the CRM user who BOOKS the job (ops 2026-10-01).
+    // Overwrites, not COALESCE: a webhook/integration job (e.g. Decathlon)
+    // arrives in Unconfirmed with fk_created_by already set to the integration
+    // user, and "Booked By" must name the operator who confirmed it. Only on a
+    // real transition INTO Booked — a same-status re-submit is not a booking.
+    // fk_created_by is a tbl_user FK, so coerce the actor id the same way
+    // create() does: a technician actor ("efr:NNN" → NaN) resolves to null and
+    // leaves the column untouched. Legacy "Booking Confirmed" shows the name via
+    // fk_created_by → tbl_user.user_name.
     const bookedActorId = (() => { const n = Number(actorId); return Number.isFinite(n) && n > 0 ? n : null; })();
-    if (bookedActorId) {
-      sets.push('fk_created_by = COALESCE(fk_created_by, ?)');
+    if (bookedActorId && Number(existing.job_status) !== STATUS.BOOKED) {
+      sets.push('fk_created_by = ?');
       values.push(bookedActorId);
     }
     /*
