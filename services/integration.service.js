@@ -511,6 +511,40 @@ async function resolveCityId(pool, city) {
 }
 
 /*
+ * fk_created_by for partner-API jobs. Legacy JobDAO.addJob hardcodes
+ * createdBy = 53 ('System-crm') and ignores any `createdBy` in the payload;
+ * the CRM operator who books the job overwrites it (job.service setStatus).
+ */
+const INTEGRATION_CREATED_BY = 53;
+
+/*
+ * tbl_job.reporting_contact_id — the client SPOC (tbl_client_contacts.id) the
+ * job is attributed to; the client app's hierarchy scope filters on it, so a
+ * NULL hides the job from every scoped SPOC.
+ *
+ * An explicit `reportingContactId` wins (legacy bound it straight off the JSON),
+ * but only if it is an active contact of THIS client — an integrator must not
+ * attribute a job into another client's tree. Otherwise resolve it from
+ * clientSpocEmail: on QA every legacy row that carries one (150/150 Decathlon
+ * API jobs) is exactly the same-client contact with that email. No match → null.
+ */
+async function resolveReportingContactId(pool, clientId, { reportingContactId, clientSpocEmail } = {}) {
+  const id = Number(reportingContactId);
+  if (Number.isInteger(id) && id > 0) {
+    const [[row]] = await pool.query(
+      'SELECT id FROM tbl_client_contacts WHERE id = ? AND client_id = ? AND status = 1', [id, clientId]);
+    if (row) return row.id;
+    logger.warn('Integration: reportingContactId ' + id + ' is not an active contact of client ' + clientId + ' · ignored');
+  }
+  const email = String(clientSpocEmail || '').trim();
+  if (!email) return null;
+  const [[row]] = await pool.query(
+    'SELECT id FROM tbl_client_contacts WHERE client_id = ? AND status = 1 AND contact_email = ? ORDER BY id ASC LIMIT 1',
+    [clientId, email]);
+  return row ? row.id : null;
+}
+
+/*
  * `paymentCollectedBy` is a STRING on the wire and an int in the column.
  * Verbatim from EasyfixAPIUtils.getPaymentCollectByByString (:459-473),
  * including the silent fall-through to 0 for anything unrecognised.
@@ -537,6 +571,8 @@ module.exports = {
   catalogShapeForRole,
   CATALOG_SHAPES,
   resolveCityId,
+  resolveReportingContactId,
+  INTEGRATION_CREATED_BY,
   paymentCollectedByCode,
   PAYMENT_COLLECTED_BY,
 };
