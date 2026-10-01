@@ -121,8 +121,9 @@ const EXPECTED = {
     'job_escalated_by',
     /*
      * The technician app's reschedule / cancel ask stores its requested time
-     * here (services/mobile-job-lifecycle.js recordRequestComment INSERTs it
-     * unconditionally), and listComments selects it so those rows are not
+     * here (recordRequestComment in services/mobile-job-lifecycle.service.js —
+     * inside a non-fatal try/catch, so a missing column there is swallowed
+     * rather than reported), and listComments selects it so those rows are not
      * rendered dateless. Unlike job_stage — which is column-probed at runtime
      * and therefore needs no entry here — this one is named by a live query
      * with no guard, which is exactly what this list is for.

@@ -124,19 +124,19 @@ async function storedRow(payload) {
   return Object.fromEntries(cols.map((c, i) => [c, ins.params[i]]));
 }
 
-test('the two rows differ in EXACTLY the three ways a reschedule is different', async () => {
+test('the two rows differ in EXACTLY the two ways a reschedule is different', async () => {
   /*
    * The reschedule payload is what the test above captured off the service.
    * The Add Remarks payload is what the route builds: the dialog's body
-   * (comments + comment_on + the reason) plus commented_by from req.user —
-   * routes/admin/jobs.js spreads `...req.body` and stamps the actor. The CRM's
-   * AddRemarksDialog sends no job_stage and has no appointment, so that side is
-   * unchanged by any of this.
+   * (comments + comment_on + the reason), plus commented_by from req.user and
+   * job_stage from req.scopedJob.job_status — routes/admin/jobs.js spreads
+   * `...req.body` and stamps both (pinned in admin-job-comment-stage.test.js).
+   * So for the same job at the same status, the two stages AGREE.
    *
    * The POINT of asserting the difference set exactly, rather than just the
-   * three fields: it still catches the two paths drifting apart on any OTHER
-   * axis (the actor, the reason, the text), which was the original reason this
-   * file was written and is still worth keeping.
+   * two fields: it still catches the two paths drifting apart on any OTHER
+   * axis (the actor, the reason, the text, the stage), which was the original
+   * reason this file was written and is still worth keeping.
    */
   const rescheduleRow = await storedRow({
     comments: 'Customer asked for Saturday',
@@ -151,13 +151,14 @@ test('the two rows differ in EXACTLY the three ways a reschedule is different', 
     comment_on: 1,
     commented_by: ACTOR.user_id,
     enum_reason_id: REASON_ID,
+    job_stage: 20,
   });
 
   const differing = Object.keys(rescheduleRow)
     .filter((k) => String(rescheduleRow[k]) !== String(addRemarksRow[k]))
     .sort();
-  assert.deepEqual(differing, ['appointment_on', 'comment_on', 'job_stage'].sort(),
-    'a reschedule differs by its bucket, its promise and its stage — and nothing else');
+  assert.deepEqual(differing, ['appointment_on', 'comment_on'],
+    'a reschedule differs by its bucket and its promise — and nothing else');
 
   assert.equal(rescheduleRow.comment_on, 21, "the 'ReScheduled' bucket");
   assert.equal(addRemarksRow.comment_on, 1, 'an ordinary remark stays in the generic bucket');
@@ -165,10 +166,7 @@ test('the two rows differ in EXACTLY the three ways a reschedule is different', 
   assert.equal(addRemarksRow.appointment_on, null, 'a remark makes no promise about a date');
 });
 
-test('the reschedule row carries the stage; an Add Remarks row still does not', async () => {
-  // The asymmetry is the feature. "Which stage was this rescheduled in" is a
-  // question only the reschedule can answer — the CRM's Add Remarks dialog
-  // sends no job_stage and is untouched by this change.
+test('the writer stores the stage it is given — and stores NULL only when given none', async () => {
   const rescheduleRow = await storedRow({
     comments: 'x', comment_on: 21, commented_by: 77,
     enum_reason_id: REASON_ID, job_stage: 20,
@@ -176,8 +174,19 @@ test('the reschedule row carries the stage; an Add Remarks row still does not', 
   assert.match(commentInsert().sql, /job_stage/, 'the column IS written when the deploy has it');
   assert.equal(rescheduleRow.job_stage, 20, 'the status the job was rescheduled from');
 
-  const addRemarksRow = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, enum_reason_id: REASON_ID });
-  assert.equal(addRemarksRow.job_stage, null, 'nobody supplied one, so it stays NULL');
+  const unstamped = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, enum_reason_id: REASON_ID });
+  assert.equal(unstamped.job_stage, null, 'nobody supplied one, so it stays NULL');
+});
+
+test('status 0 is a stage, not "not recorded" — and "" still is', async () => {
+  // job_status 0 = Pending for Scheduling, the commonest status to reschedule
+  // FROM. The writer used `|| null`, which stored every one of those as NULL.
+  const zero = await storedRow({ comments: 'x', comment_on: 21, commented_by: 77, job_stage: 0 });
+  assert.equal(zero.job_stage, 0, 'a reschedule from Pending for Scheduling keeps its stage');
+
+  // The Add Remarks schema admits '' — that one IS "not recorded".
+  const blank = await storedRow({ comments: 'x', comment_on: 1, commented_by: 77, job_stage: '' });
+  assert.equal(blank.job_stage, null);
 });
 
 test('addComment ACCEPTS 21 — without it the audit row vanishes silently', async () => {

@@ -161,8 +161,11 @@ async function listComments(jobId) {
    * not just the one cell. NULL AS job_stage keeps the row shape identical
    * either way, so shapeRow needs no branch.
    *
-   * requested_date_time needs no probe: recordRequestComment INSERTs it
-   * unconditionally, so any deploy the technician app writes to has it.
+   * requested_date_time is NOT probed: it is a required column in
+   * scripts/schema-verify.js (tbl_job_comment), which is what guarantees it.
+   * recordRequestComment (services/mobile-job-lifecycle.service.js) writing it
+   * is no proof on its own — that INSERT sits in a non-fatal try/catch, so a
+   * missing column there would be swallowed, not reported.
    */
   const withJobStage = await hasJobStageColumn();
   const [rows] = await pool.query(
@@ -267,7 +270,8 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
   }
   const stage = Number(comment_on);
   if (!STAGES[stage]) {
-    const e = new Error('comment_on must be one of: 1 (created/schedule), 2 (check_in), 3 (check_out), 4 (in_progress), 16 (call_later), 17 (enquiry)');
+    const e = new Error('comment_on must be one of: '
+      + Object.entries(STAGES).map(([k, v]) => k + ' (' + v + ')').join(', '));
     e.status = 400;
     throw e;
   }
@@ -302,7 +306,10 @@ async function addComment(jobId, { comments, comment_on, commented_by, appointme
       commented_by || null,
       enum_reason_id || null,
       efr_id || null,
-      effectiveJobStage || null,
+      // ?? not ||: job_status 0 (Pending for Scheduling) is a real stage — the
+      // commonest one to reschedule from — and `|| null` was storing it as
+      // "not recorded". '' (the Add Remarks schema allows it) still maps to NULL.
+      effectiveJobStage === '' ? null : (effectiveJobStage ?? null),
     ];
   } else {
     insertSql = `INSERT INTO tbl_job_comment
