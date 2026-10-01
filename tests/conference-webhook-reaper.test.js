@@ -394,8 +394,8 @@ test('a ringing event moves initiated → ringing ONLY', async () => {
 // startRoomRecording is once-per-room for the process, so each test uses its
 // own room id. It runs off the response path — let it finish.
 let nextRecConf = 9000;
-async function joinIn(kind, confId = nextRecConf++) {
-  conferencesById[confId] = conference({ id: confId });
+async function joinIn(kind, confId = nextRecConf++, over = {}) {
+  conferencesById[confId] = conference({ id: confId, ...over });
   participants = [participant({ conference_id: confId, target_kind: kind })];
   const res = await postForm({ Event: 'ParticipantJoined', MPCName: CONF_NAME, MemberID: 'member-42', To: CUSTOMER_E164 }, token({ confId }));
   await new Promise((r) => setTimeout(r, 25));
@@ -444,6 +444,31 @@ test('a failed start is logged, released for a later join to retry, and the webh
   plivoHandler = () => ({ status: 202, body: '{}' });
   await joinIn('technician', confId);
   assert.equal(recStarts().length, 2, 'the later join retried');
+});
+
+test('a join that lands AFTER the room ended starts nothing (conf 8902: answered as the operator hung up)', async () => {
+  await joinIn('customer', undefined, { status: 'ended' });
+  assert.equal(recStarts().length, 0);
+});
+
+test('a 404 because the room ended DURING the start is not an alert — the fallback covers that call', async () => {
+  let confId;
+  plivoHandler = (u) => {
+    if (!/\/Record\/$/.test(u)) return { status: 200, body: '{}' };
+    conferencesById[confId].status = 'ended';            // the END webhook landed meanwhile
+    return { status: 404, body: '{"error":"MPC: efxctestconf01 not found"}' };
+  };
+  confId = nextRecConf;
+  await joinIn('customer');
+  assert.equal(recStarts().length, 1);
+  assert.doesNotMatch(logText(), /room recording NOT started/, 'no warning, so no email');
+  assert.match(logText(), /room already ended \(404\)/);
+});
+
+test('…but a 404 on a room that is still LIVE is a real failure — warned (and emailed)', async () => {
+  plivoHandler = (u) => (/\/Record\/$/.test(u) ? { status: 404, body: '{"error":"MPC: x not found"}' } : { status: 200, body: '{}' });
+  await joinIn('customer');
+  assert.match(logText(), /room recording NOT started[^\n]*http=404/);
 });
 
 /* ═════════ 2. THE WEBHOOK — the events that end things ══════════════════ */

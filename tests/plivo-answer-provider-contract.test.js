@@ -87,6 +87,7 @@ const real = {
   setRecordingRequested: plivoLog.setRecordingRequested,
   setRecording: plivoLog.setRecording,
   getPrimaryRecording: plivoLog.getPrimaryRecording,
+  replaceRecording: plivoLog.replaceRecording,
   recordingEnabled: plivo.recordingEnabled,
   addParticipant: conference.addParticipant,
   pruneConferenceFallback: conference.pruneConferenceFallback,
@@ -104,6 +105,7 @@ beforeEach(async () => {
     setRecordingRequested: real.setRecordingRequested,
     setRecording: real.setRecording,
     getPrimaryRecording: real.getPrimaryRecording,
+    replaceRecording: real.replaceRecording,
   });
   plivo.recordingEnabled = real.recordingEnabled;
   Object.assign(conference, {
@@ -466,44 +468,51 @@ test('/recording-callback stores the recording against the jci from the token', 
     'keyed by jci, not by call_uuid — that is what makes web/WebRTC legs populate');
 });
 
-test('/recording-callback: <Record> is the safety net (fill-if-empty); the ROOM recording wins on Completed', async () => {
-  const stored = [];
-  plivoLog.setRecording = async (jci, payload, opts) => { stored.push({ jci, payload, opts }); };
+test('/recording-callback: <Record> is the safety net (fill-if-empty); the ROOM recording REPLACES on Completed', async () => {
+  const filled = [];
+  const replaced = [];
+  plivoLog.setRecording = async (jci, payload, opts) => { filled.push({ jci, payload, opts }); return 1; };
+  plivoLog.replaceRecording = async (jci, payload) => { replaced.push({ jci, payload }); return { previousId: null, conferenceId: 77 }; };
   const post = (body) => call('/recording-callback', 'post', { query: { t: recToken() }, body });
 
   assertPlainOk(await post({ RecordUrl: 'https://rec.plivo.com/x.mp3', RecordingID: 'rid-1', RecordingDuration: '42' }));
-  assert.deepEqual(stored.pop().opts, { onlyIfEmpty: true }, 'the <Record> file must never clobber the room recording');
+  assert.deepEqual(filled.pop().opts, { onlyIfEmpty: true }, 'the <Record> file must never clobber the room recording');
 
   const mpc = (EventName) => post({ EventName, RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'ruuid-1', RecordingDuration: '95' });
   for (const e of ['MPCRecordingInitiated', 'MPCRecordingPaused', 'MPCRecordingFailed']) assertPlainOk(await mpc(e));
-  assert.equal(stored.length, 0, 'only a COMPLETED room recording is a finished file');
+  assert.equal(filled.length + replaced.length, 0, 'only a COMPLETED room recording is a finished file');
   assertPlainOk(await mpc('MPCRecordingCompleted'));
-  assert.deepEqual(stored, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' }, opts: undefined }],
-    'stored with overwrite — it replaces the ringback-laden <Record> file');
+  assert.deepEqual(replaced, [{ jci: JCI, payload: { url: 'https://media.plivo.com/r.mp3', id: 'ruuid-1', duration: '95' } }]);
 });
 
-test('/recording-callback names the redundant FALLBACK to prune — whichever file lands second', async () => {
+test('/recording-callback names the redundant FALLBACK from each WRITE\'s own result — whichever lands second', async () => {
   const pruned = [];
-  plivoLog.setRecording = async () => {};
   conference.pruneConferenceFallback = async (a) => { pruned.push(a); return { deleted: true }; };
   const post = (body) => call('/recording-callback', 'post', { query: { t: recToken() }, body });
-  const settle = () => new Promise((r) => setImmediate(r));
+  const fb = (RecordingID) => post({ RecordUrl: 'https://media.plivo.com/fb.mp3', RecordingID });
+  const room = (RecordingUUID) => post({ EventName: 'MPCRecordingCompleted', RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID });
 
-  // Fallback first (row empty) → nothing to prune yet.
-  plivoLog.getPrimaryRecording = async () => ({ recording_id: null, conference_id: 77 });
-  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb.mp3', RecordingID: 'fb-1' }));
-  // …then the room recording lands over it → the fallback is the one to go.
-  plivoLog.getPrimaryRecording = async () => ({ recording_id: 'fb-1', conference_id: 77 });
-  assertPlainOk(await post({ EventName: 'MPCRecordingCompleted', RecordingURL: 'https://media.plivo.com/r.mp3', RecordingUUID: 'room-1' }));
-  // Room first, fallback second → still the fallback.
+  // Fallback lands first (row empty → written) → nothing to prune yet.
+  let reads = 0;
+  plivoLog.setRecording = async () => 1;
+  plivoLog.getPrimaryRecording = async () => { reads += 1; return null; };
+  assertPlainOk(await fb('fb-1'));
+  assert.equal(reads, 0, 'a WRITTEN fallback is first — no read needed');
+  // …then the room recording REPLACES it: the replaced id is the fallback.
+  plivoLog.replaceRecording = async () => ({ previousId: 'fb-1', conferenceId: 77 });
+  assertPlainOk(await room('room-1'));
+  // Room first: the fallback's fill-if-empty write finds the row TAKEN (0 rows).
+  plivoLog.setRecording = async () => 0;
   plivoLog.getPrimaryRecording = async () => ({ recording_id: 'room-2', conference_id: 78 });
-  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb2.mp3', RecordingID: 'fb-2' }));
-  // A 1:1 bridge call (no conference) and a repeat of the same file → never.
+  assertPlainOk(await fb('fb-2'));
+  // Never: a 1:1 call (no conference), a repeat of the same file, a room with nothing before it.
   plivoLog.getPrimaryRecording = async () => ({ recording_id: 'x-1', conference_id: null });
-  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/x.mp3', RecordingID: 'x-2' }));
+  assertPlainOk(await fb('x-2'));
   plivoLog.getPrimaryRecording = async () => ({ recording_id: 'fb-3', conference_id: 79 });
-  assertPlainOk(await post({ RecordUrl: 'https://media.plivo.com/fb3.mp3', RecordingID: 'fb-3' }));
-  await settle();
+  assertPlainOk(await fb('fb-3'));
+  plivoLog.replaceRecording = async () => ({ previousId: null, conferenceId: 80 });
+  assertPlainOk(await room('room-4'));
+  await new Promise((r) => setImmediate(r));
 
   assert.deepEqual(pruned, [
     { roomId: 'room-1', fallbackId: 'fb-1', jci: JCI },
@@ -514,7 +523,8 @@ test('/recording-callback names the redundant FALLBACK to prune — whichever fi
 test('/recording-callback raises the recording alert on MPCRecordingFailed — and stores nothing', async () => {
   const alerted = [];
   let stored = 0;
-  plivoLog.setRecording = async () => { stored += 1; };
+  plivoLog.setRecording = async () => { stored += 1; return 1; };
+  plivoLog.replaceRecording = async () => { stored += 1; return null; };
   conference.alertRecordingProblem = async (m) => { alerted.push(m); return { sent: true }; };
   assertPlainOk(await call('/recording-callback', 'post', {
     query: { t: recToken() }, body: { EventName: 'MPCRecordingFailed', RecordingUUID: 'room-9' },
