@@ -9,9 +9,10 @@ const logger = require('../../logger');
 
 /*
  * Employee Hub — leave. /api/admin/leave; the mount inherits requireAuth +
- * role(['admin']). EVERY CRM user — no action key: who may approve is data
- * (the request's approver snapshot, or isRosterAdmin), decided in
- * services/leave.service.js.
+ * role(['admin']). EVERY CRM user — no action key: who may approve is data —
+ * anyone ABOVE the requester in the reporting hierarchy, never the requester;
+ * isRosterAdmin only adds requests with no Reporting Head. Decided in
+ * services/leave.service.js (isApprover / teamOf).
  */
 
 const ymd = Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/);

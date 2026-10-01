@@ -113,30 +113,43 @@ async function loadRequest(id) {
   return row || null;
 }
 
+const EMPTY = new Set();
 // Who may do what — the same predicates gate the writes and feed the can* flags.
+//
+// Approver scope (owner, 2026-10-01): requests from people in YOUR reporting
+// hierarchy (any level below you — `team`, from findDescendantUserIds), never
+// your own. A Roster Admin additionally covers requests with no Reporting Head
+// (approver_user_id NULL), so those are never stranded. Roster Admin is NOT
+// "see everything" any more.
 const isRequester = (r, actorId) => Number(r.user_id) === Number(actorId);
-const isApprover = (r, actorId, isAdmin) => !isRequester(r, actorId) && (Number(r.approver_user_id) === Number(actorId) || Boolean(isAdmin));
-function cancelVerdict(r, actorId, isAdmin, today) {
+const isApprover = (r, actorId, isAdmin, team = EMPTY) => !isRequester(r, actorId)
+  && (team.has(Number(r.user_id)) || (Boolean(isAdmin) && r.approver_user_id == null));
+async function teamOf(actorId) {
+  const { findDescendantUserIds } = require('./user.service');
+  const { descendants } = await findDescendantUserIds(actorId);
+  return new Set(descendants.map(Number).filter((id) => id !== Number(actorId)));
+}
+function cancelVerdict(r, actorId, isAdmin, today, team = EMPTY) {
   if (r.status !== STATUS.APPROVED) return { ok: false, status: 409, message: 'Only an approved leave can be cancelled' };
   if (r.to_date < today) return { ok: false, status: 409, message: 'This leave is already over' };
   if (isRequester(r, actorId)) {
     return r.from_date > today ? { ok: true }
       : { ok: false, status: 403, message: 'Your leave has already started — ask your Reporting Head to end it early' };
   }
-  return isApprover(r, actorId, isAdmin) ? { ok: true } : { ok: false, status: 403, message: 'Only the requester, their Reporting Head or a Roster Admin can cancel this leave' };
+  return isApprover(r, actorId, isAdmin, team) ? { ok: true } : { ok: false, status: 403, message: 'Only the requester or a manager in their reporting line can cancel this leave' };
 }
 
 /** RequestRow (+ the ApprovalRow fields — a superset, so one shape serves every endpoint). */
-function toRow(r, { actorId, isAdmin = false, today = todayIst() }) {
+function toRow(r, { actorId, isAdmin = false, today = todayIst(), team = EMPTY }) {
   return {
     id: Number(r.id), kind: r.kind, fromDate: r.from_date, toDate: r.to_date, duration: r.duration,
     days: Number(r.days), reason: r.reason || null, status: r.status, createdAt: r.created_at,
     decidedByName: r.decided_by_name || null, decidedAt: r.decided_at || null, decisionNote: r.decision_note || null,
     endedEarly: r.status === STATUS.APPROVED && Boolean(r.cancelled_at),
     canWithdraw: r.status === STATUS.PENDING && isRequester(r, actorId),
-    canCancel: cancelVerdict(r, actorId, isAdmin, today).ok,
+    canCancel: cancelVerdict(r, actorId, isAdmin, today, team).ok,
     userId: Number(r.user_id), userName: r.user_name || null, empCode: r.user_code || null, roleName: r.role_name || null,
-    canDecide: r.status === STATUS.PENDING && isApprover(r, actorId, isAdmin),
+    canDecide: r.status === STATUS.PENDING && isApprover(r, actorId, isAdmin, team),
   };
 }
 
@@ -255,6 +268,9 @@ async function updateRequest(conn, id, fields) {
 
 /** Create (dryRun → { days } after every rule). */
 async function create({ userId, kind, fromDate, toDate, duration, reason, dryRun = false }) {
+  // Reason is mandatory (owner, 2026-10-01) — but only on submit: the dialog's
+  // live working-day count dry-runs before a reason has been typed.
+  if (!dryRun && !String(reason || '').trim()) throw mkErr(400, 'Enter a reason for the leave');
   const uid = Number(userId);
   if (dryRun) return { days: await checkRequest({ userId: uid, kind, fromDate, toDate, duration }) };
   const approver = await findApprover(uid);
@@ -292,10 +308,11 @@ async function withdraw({ actorId, id }) {
  */
 async function cancel({ actorId, isAdmin, id, note }) {
   const today = todayIst();
+  const team = await teamOf(actorId);
   let event;
   await roster.inTransaction(async (conn) => {
     const r = await lockRequest(conn, id);
-    const v = cancelVerdict(r, actorId, isAdmin, today);
+    const v = cancelVerdict(r, actorId, isAdmin, today, team);
     if (!v.ok) throw mkErr(v.status, v.message);
     const now = new Date();
     const who = { cancelled_by: Number(actorId), cancelled_at: now, cancel_note: note ? String(note).slice(0, 500) : null, updated_at: now };
@@ -311,7 +328,7 @@ async function cancel({ actorId, isAdmin, id, note }) {
   const row = await loadRequest(id);
   logger.info('Leave ' + (event === 'CANCELLED' ? 'cancelled' : 'ended early') + ' · id=' + id + ' · actor=' + actorId);
   await notify(event, row, { note });
-  return { request: toRow(row, { actorId, isAdmin, today }) };
+  return { request: toRow(row, { actorId, isAdmin, today, team }) };
 }
 
 /** Approve / reject. Approve re-counts the working days on the current roster. */
@@ -319,10 +336,11 @@ async function decide({ actorId, isAdmin, id, decision, note }) {
   const approve = decision === 'APPROVE';
   if (!approve && decision !== 'REJECT') throw mkErr(400, 'decision must be APPROVE or REJECT');
   if (!approve && !String(note || '').trim()) throw mkErr(400, 'A note is required to reject');
+  const team = await teamOf(actorId);
   await roster.inTransaction(async (conn) => {
     const r = await lockRequest(conn, id);
     if (isRequester(r, actorId)) throw mkErr(403, 'You cannot decide your own leave');
-    if (!isApprover(r, actorId, isAdmin)) throw mkErr(403, 'This request is not yours to decide');
+    if (!isApprover(r, actorId, isAdmin, team)) throw mkErr(403, 'This request is not from your team');
     if (r.status !== STATUS.PENDING) throw mkErr(409, `This request is already ${r.status.toLowerCase()}`);
     const now = new Date();
     const fields = { status: approve ? STATUS.APPROVED : STATUS.REJECTED, decided_by: Number(actorId), decided_at: now, decision_note: note ? String(note).slice(0, 500) : null, updated_at: now };
@@ -335,17 +353,19 @@ async function decide({ actorId, isAdmin, id, decision, note }) {
   const row = await loadRequest(id);
   logger.info('Leave ' + (approve ? 'approved' : 'rejected') + ' · id=' + id + ' · actor=' + actorId);
   await notify(approve ? 'APPROVED' : 'REJECTED', row, { note });
-  return { request: toRow(row, { actorId, isAdmin }) };
+  return { request: toRow(row, { actorId, isAdmin, team }) };
 }
 
 // ─── Lists ────────────────────────────────────────────────────────────
 async function approvals({ actorId, isAdmin, status = 'pending', page = 1, limit = 20 }) {
-  const where = [status === 'history' ? "r.status <> 'PENDING'" : "r.status = 'PENDING'"];
-  const params = [];
-  if (!isAdmin) {
-    if (status === 'history') { where.push('(r.approver_user_id = ? OR r.decided_by = ?)'); params.push(Number(actorId), Number(actorId)); }
-    else { where.push('r.approver_user_id = ?'); params.push(Number(actorId)); }
-  }
+  const team = await teamOf(actorId);
+  const ids = [...team];
+  const scope = [];
+  if (ids.length) scope.push(`r.user_id IN (${ids.map(() => '?').join(',')})`);
+  if (isAdmin) scope.push('r.approver_user_id IS NULL');
+  if (!scope.length) return { total: 0, items: [] };
+  const where = [status === 'history' ? "r.status <> 'PENDING'" : "r.status = 'PENDING'", `(${scope.join(' OR ')})`, 'r.user_id <> ?'];
+  const params = [...ids, Number(actorId)];
   const clause = 'WHERE ' + where.join(' AND ');
   const l = Math.max(1, Math.min(Number(limit) || 20, 100));
   const offset = (Math.max(1, Number(page) || 1) - 1) * l;
@@ -355,7 +375,7 @@ async function approvals({ actorId, isAdmin, status = 'pending', page = 1, limit
     [...params, offset, l]
   );
   const today = todayIst();
-  return { total: Number(total), items: rows.map((r) => toRow(r, { actorId, isAdmin, today })) };
+  return { total: Number(total), items: rows.map((r) => toRow(r, { actorId, isAdmin, today, team })) };
 }
 
 /** The Attendance & Leaves page: one month of resolved days, its summary, my requests. */
@@ -381,7 +401,13 @@ async function me({ userId, month }) {
     return { date: d, type: c.type, holiday: hol.get(d) || null, leave: c.leave || null };
   });
 
-  const [rows] = await pool.query(`${REQ_SELECT} WHERE r.user_id = ? ORDER BY r.id DESC LIMIT 50`, [uid]);
+  // My Requests (owner, 2026-10-01): Pending + Approved requests that touch the
+  // CURRENT month or later — independent of the month being viewed.
+  const [rows] = await pool.query(
+    `${REQ_SELECT} WHERE r.user_id = ? AND r.status IN ('PENDING', 'APPROVED') AND r.to_date >= ?
+      ORDER BY r.from_date, r.id LIMIT 100`,
+    [uid, monthBounds(currentIstMonth()).start]
+  );
   return {
     month: m, today,
     rules: { lvEarliest: shiftYmd(today, LV_LEAD_DAYS), slDate: today },

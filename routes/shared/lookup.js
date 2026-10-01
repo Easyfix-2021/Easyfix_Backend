@@ -305,7 +305,14 @@ router.get('/easyfixers',       role(['admin']),                                
 router.get('/menus',                                                                       async (req, res, next) => {
   try {
     logger.info('Lookup sidebar menus');
-    modernOk(res, await lookup.menus({ userEmail: req.user?.official_email }));
+    let rows = await lookup.menus({ userEmail: req.user?.official_email });
+    // Employee Hub → Approvals only for someone with at least one active
+    // direct report (owner, 2026-10-01). The API itself is hierarchy-scoped
+    // too (services/leave.service.js approvals), so a pasted URL shows nothing.
+    if (req.user?.user_id && !(await lookup.hasDirectReports(req.user.user_id))) {
+      rows = rows.filter((m) => m.url !== 'employeeLeaveApprovals');
+    }
+    modernOk(res, rows);
   } catch (e) { next(e); }
 });
 
