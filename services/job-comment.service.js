@@ -93,8 +93,11 @@ function shapeRow(r) {
      * the remark was filed — which is what answers "at which stage was this
      * rescheduled". Same word, two domains; do not collapse them.
      *
-     * Null on every row written before 2026-09-30 (nothing stamped it) and on
-     * any deploy whose tbl_job_comment predates the column — listComments only
+     * Null means "not recorded" — never status 0, which is a real status. The
+     * legacy CRM stamped it on every reschedule and remark, so legacy history
+     * has it; the Node backend mostly stored NULL from the 2026-04-29 cutover
+     * until reschedule and Add Remarks resumed (2026-10-01). Also null on any
+     * deploy whose tbl_job_comment predates the column — listComments only
      * selects it when the probe says it is there.
      */
     job_stage: r.job_stage ?? null,

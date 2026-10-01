@@ -51,8 +51,11 @@ const EXISTING = {
 };
 
 const fake = installFakePool([
+  // Answers hasJobStageColumn's INFORMATION_SCHEMA probe with one row, i.e.
+  // "this deploy HAS tbl_job_comment.job_stage" — the line every job_stage
+  // assertion below depends on. (The probe is not a SHOW COLUMNS query; a
+  // matcher written for one would never fire.)
   [/INFORMATION_SCHEMA/i, [{ n: 0 }]],
-  [/SHOW COLUMNS FROM tbl_job_comment LIKE 'job_stage'/i, [{ Field: 'job_stage' }]],
   [/SHOW COLUMNS/i, []],
   // Tolerant of added columns on purpose: this matcher broke when job_status
   // joined the SELECT, and the failure mode was a silent 'job not found'
