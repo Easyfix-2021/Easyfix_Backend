@@ -3,6 +3,7 @@ const { pool } = require('../db');
 const logger = require('../logger');
 const { nameKey } = require('../utils/name-key');
 const { streamStyledXlsx } = require('../utils/xlsx-styled-export');
+const { rowsBelowHeader } = require('../utils/xlsx-header-rows');
 const brandSvc = require('./brand.service');
 const materialSvc = require('./material.service');
 
@@ -18,11 +19,9 @@ const materialSvc = require('./material.service');
 
 function mkErr(status, message) { const e = new Error(message); e.status = status; return e; }
 
-function firstSheet(buffer) {
+function firstSheet(buffer, requiredHeader) {
   const wb = XLSX.read(buffer, { type: 'buffer' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  if (!sheet) return [];
-  return XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  return rowsBelowHeader(wb.Sheets[wb.SheetNames[0]], requiredHeader);
 }
 
 // Header lookup tolerant of the trailing "*" required-marker and case.
@@ -49,14 +48,14 @@ async function generateBrandTemplate(res) {
 }
 
 async function parseBrandRows(buffer) {
-  const raw = firstSheet(buffer);
+  const raw = firstSheet(buffer, 'Brand Name');
   const [existingRows] = await pool.query('SELECT brand_id, brand_name, brand_key FROM tbl_brand_master');
   const existingByKey = new Map(existingRows.map((r) => [r.brand_key, r]));
 
   const seenInFile = new Map(); // key -> { rowNumber, brand_name }
   const rows = [];
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2; // header is row 1
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const brand_name = String(cell(r, 'Brand Name') || '').trim();
     const errors = [];
     let outcome = 'NEW';
@@ -141,7 +140,26 @@ async function generateBrandErrorsXlsx(res, buffer) {
 
 // ─── Material import ────────────────────────────────────────────────────
 
+/*
+ * The example row is built from REAL reference data. It used to say
+ * "Electrical" — no such category exists (QA/Prod: "Electrician Services") —
+ * so anyone copying the example got "Unknown category" on every row.
+ * Exported for tests.
+ */
+function templateExampleRow(ref) {
+  const byName = (m, key) => [...m.values()].sort((a, b) => String(a[key]).localeCompare(String(b[key])));
+  const category = byName(ref.categoryByKey, 'service_catg_name')[0]?.service_catg_name || '';
+  const uoms = byName(ref.uomByKey, 'uom_name');
+  const uom = (uoms.find((u) => nameKey(u.uom_name) === nameKey('Nos')) || uoms[0])?.uom_name || '';
+  const brands = byName(ref.brandByKey, 'brand_name').filter((b) => !Number(b.is_system)).slice(0, 2).map((b) => b.brand_name);
+  return {
+    material_name: 'Adapter 5A', category, pricing_type: 'Fixed',
+    uom, description: '', brands: brands.join(', '), price: 150,
+  };
+}
+
 async function generateMaterialTemplate(res) {
+  const example = templateExampleRow(await loadImportReferenceData());
   await streamStyledXlsx(res, 'easyfix-material-import-template.xlsx', {
     title: 'EasyFix · Material Import Template',
     meta: 'One row = one brand group. Rows sharing Material Name + Category are the same material.',
@@ -155,10 +173,7 @@ async function generateMaterialTemplate(res) {
       { header: 'Brands', key: 'brands', width: 28 },
       { header: 'Price', key: 'price', width: 12 },
     ],
-    rows: [{
-      material_name: 'Adapter 5A', category: 'Electrical', pricing_type: 'Fixed',
-      uom: 'Nos', description: '', brands: 'Philips, Havells', price: 150,
-    }],
+    rows: [example],
   });
 }
 
@@ -186,7 +201,7 @@ async function loadImportReferenceData() {
  * shape) plus the material groups needed by commit() to actually write.
  */
 async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
-  const raw = firstSheet(buffer);
+  const raw = firstSheet(buffer, 'Material Name');
   const ref = await loadImportReferenceData();
   const [existingMaterials] = await pool.query(
     'SELECT material_id, material_key, service_catg_id FROM tbl_material_master'
@@ -197,8 +212,8 @@ async function parseMaterialRows(buffer, { canCreateBrands = false } = {}) {
   const materials = new Map(); // groupKey -> accumulator
   const rows = [];
 
-  raw.forEach((r, i) => {
-    const rowNumber = i + 2;
+  raw.forEach((r) => {
+    const rowNumber = r._rowNumber;
     const errors = [];
     const material_name = String(cell(r, 'Material Name') || '').trim();
     const categoryName = String(cell(r, 'Category') || '').trim();
@@ -453,5 +468,5 @@ async function generateMaterialErrorsXlsx(res, buffer, { canCreateBrands = false
 module.exports = {
   mkErr,
   generateBrandTemplate, previewBrandImport, commitBrandImport, generateBrandErrorsXlsx,
-  generateMaterialTemplate, previewMaterialImport, commitMaterialImport, generateMaterialErrorsXlsx,
+  generateMaterialTemplate, templateExampleRow, previewMaterialImport, commitMaterialImport, generateMaterialErrorsXlsx,
 };
